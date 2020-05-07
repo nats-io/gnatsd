@@ -40,7 +40,7 @@ const (
 	authErrorEventSubj       = "$SYS.SERVER.%s.CLIENT.AUTH.ERR"
 	serverStatsSubj          = "$SYS.SERVER.%s.STATSZ"
 	serverStatsReqSubj       = "$SYS.REQ.SERVER.%s.STATSZ"
-	serverStatsPingReqSubj   = "$SYS.REQ.SERVER.PING"
+	serverStatsPingReqSubj   = "$SYS.REQ.SERVER.%sPING"
 	leafNodeConnectEventSubj = "$SYS.ACCOUNT.%s.LEAFNODE.CONNECT"
 	remoteLatencyEventSubj   = "$SYS.LATENCY.M2.%s"
 	inboxRespSubj            = "$SYS._INBOX.%s.%s"
@@ -566,6 +566,22 @@ func (s *Server) initEventTracking() {
 	if _, err := s.sysSubscribe(serverStatsPingReqSubj, s.statszReq); err != nil {
 		s.Errorf("Error setting up internal tracking: %v", err)
 	}
+
+	name := ""
+	if _, err := s.sysSubscribe(fmt.Sprintf(serverStatsPingReqSubj, name), s.statszReq); err != nil {
+		s.Errorf("Error setting up internal tracking: %v", err)
+	}
+
+	if s.info.Name != s.info.ID {
+		for _, x := range strings.Split(s.info.Name, ".") {
+			name = fmt.Sprintf("%s%s.", name, x)
+			sub := fmt.Sprintf(serverStatsPingReqSubj, name)
+			if _, err := s.sysSubscribe(sub, s.statszReq); err != nil {
+				s.Errorf("Error setting up internal tracking: %v", err)
+			}
+		}
+	}
+
 	// Listen for updates when leaf nodes connect for a given account. This will
 	// force any gateway connections to move to `modeInterestOnly`
 	subject = fmt.Sprintf(leafNodeConnectEventSubj, "*")
