@@ -15,6 +15,7 @@ package server
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -215,6 +216,8 @@ type Server struct {
 
 	// Websocket structure
 	websocket srvWebsocket
+
+	accCleanupChan chan string // accounts to clean up, by name
 }
 
 // Make sure all are 64bits for atomic use
@@ -1241,6 +1244,9 @@ func (s *Server) Start() {
 	s.grRunning = true
 	s.grMu.Unlock()
 
+	s.accCleanupChan = make(chan string, MAX_UNUSED_ACCOUNTS)
+	s.startGoRoutine(s.accountCleanup)
+
 	// Snapshot server options.
 	opts := s.getOpts()
 
@@ -1378,6 +1384,56 @@ func (s *Server) Start() {
 	s.AcceptLoop(clientListenReady)
 }
 
+func (s *Server) accountCleanup() {
+	defer s.grWG.Done()
+	accCleanupChan := s.accCleanupChan
+	cleanupQueue := list.New()
+	accounts := make(map[string]*list.Element) //index cleanupQueue
+	for {
+		var accName string
+		select {
+		case accName = <-accCleanupChan:
+		case <-s.quitCh:
+			return
+		}
+		if e := accounts[accName]; e != nil {
+			cleanupQueue.Remove(e)
+		}
+		accounts[accName] = cleanupQueue.PushBack(&accName)
+		s.Tracef("Schedule cleanup of: %s total: %d/%d",
+			accName, len(accounts), cleanupQueue.Len())
+		for cleanupQueue.Len() > MAX_UNUSED_ACCOUNTS {
+			front := cleanupQueue.Front()
+			accName := *(front.Value).(*string)
+			cleanupQueue.Remove(front)
+			delete(accounts, accName)
+			var acc *Account
+			if v, ok := s.accounts.Load(accName); ok {
+				acc = v.(*Account)
+			} else {
+				// account deleted already
+				continue
+			}
+			acc.mu.Lock()
+			remove := len(acc.clients) == 0 && acc.claimJWT != ""
+			acc.mu.Unlock()
+			// account has clients again
+			if !remove {
+				continue
+			}
+			s.mu.Lock()
+			acc.mu.Lock()
+			if len(acc.clients) == 0 {
+				s.accounts.Delete(accName)
+				s.tmpAccounts.Delete(accName)
+				s.Debugf("Cleaned up account %s", accName)
+			}
+			acc.mu.Unlock()
+			s.mu.Unlock()
+		}
+	}
+}
+
 // Shutdown will shutdown the server instance by kicking out the AcceptLoop
 // and closing all associated clients.
 func (s *Server) Shutdown() {
@@ -1502,6 +1558,10 @@ func (s *Server) Shutdown() {
 
 	// Wait for go routines to be done.
 	s.grWG.Wait()
+
+	if s.accCleanupChan != nil {
+		close(s.accCleanupChan)
+	}
 
 	if opts.PortsFileDir != _EMPTY_ {
 		s.deletePortsFile(opts.PortsFileDir)

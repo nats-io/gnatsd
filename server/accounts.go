@@ -559,14 +559,24 @@ func (a *Account) removeClient(c *client) int {
 			a.removeLeafNode(c)
 		}
 	}
+	jwt := a.claimJWT
+	name := a.Name
 	a.mu.Unlock()
 
 	if c != nil && c.srv != nil && removed {
 		c.srv.mu.Lock()
+		var cleanupChan chan string
 		doRemove := a != c.srv.gacc
+		if n <= 1 && doRemove && jwt != "" && c.srv.sys != nil &&
+			a != c.srv.sys.account && c.srv.accCleanupChan != nil {
+			cleanupChan = c.srv.accCleanupChan
+		}
 		c.srv.mu.Unlock()
 		if doRemove {
 			c.srv.accConnsUpdate(a)
+			if cleanupChan != nil {
+				cleanupChan <- name
+			}
 		}
 	}
 	return n
