@@ -1635,7 +1635,8 @@ func TestLeafNodeOriginClusterInfo(t *testing.T) {
 
 	// Now make sure that if we update our cluster name, simulating the settling
 	// of dynamic cluster names between competing servers.
-	s.setClusterName("xyz")
+	s.setClusterName("xyz", false)
+
 	// Make sure we disconnect and reconnect.
 	checkLeafNodeConnectedCount(t, s, 0)
 	checkLeafNodeConnected(t, s)

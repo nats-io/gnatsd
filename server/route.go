@@ -81,6 +81,11 @@ type route struct {
 	gatewayURL   string
 	leafnodeURL  string
 	hash         string
+
+	// Remember the last cluster name and cluster dynamic state
+	// from a route in case it has been announced to us.
+	clusterName    string
+	clusterDynamic bool
 }
 
 type connectInfo struct {
@@ -491,6 +496,7 @@ func (c *client) processRouteInfo(info *Info) {
 
 	supportsHeaders := c.srv.supportsHeaders()
 	clusterName := c.srv.ClusterName()
+	isSusceptible := c.srv.isClusterNameSusceptibleToChanges()
 
 	c.mu.Lock()
 	// Connection can be closed at any time (by auth timeout, etc).
@@ -514,13 +520,75 @@ func (c *client) processRouteInfo(info *Info) {
 	// Detect if we have a mismatch of cluster names.
 	if info.Cluster != "" && info.Cluster != clusterName {
 		c.mu.Unlock()
-		// If we are dynamic we may update our cluster name.
-		// Use other if remote is non dynamic or their name is "bigger"
-		if s.isClusterNameDynamic() && (!info.Dynamic || (strings.Compare(clusterName, info.Cluster) < 0)) {
-			s.setClusterName(info.Cluster)
+
+		isDynamic := s.isClusterNameDynamic()
+		remoteIsDynamic := info.Dynamic
+		if isDynamic && !remoteIsDynamic {
+			// The remote INFO sent to this node contains what should be the name of the cluster.
+			// Update the name marking that no longer susceptible to dynamic cluster updates since
+			// there is an explicit name in the cluster and cause other nodes to reconnect to
+			// this node using the explicit name.
+			s.setClusterName(info.Cluster, false)
 			s.removeAllRoutesExcept(c)
 			c.mu.Lock()
+
+			c.route.clusterName = info.Cluster
+			c.route.clusterDynamic = info.Dynamic
+		} else if !isDynamic && remoteIsDynamic {
+			c.srv.mu.Lock()
+			routeInfoJSON := s.routeInfoJSON
+			c.srv.mu.Unlock()
+
+			c.mu.Lock()
+
+			// In case there is a mismatch with what we know about this route,
+			// we will send it another INFO message with the explicit cluster name
+			// so that the remote dynamic node uses our cluster name.
+			if c.route.clusterName != info.Cluster {
+				c.enqueueProto(routeInfoJSON)
+			}
+
+			// Override the cluster name from this route with ours since it should win.
+			c.route.clusterName = s.info.Cluster
+			c.route.clusterDynamic = info.Dynamic
+		} else if isDynamic && remoteIsDynamic {
+			if isSusceptible {
+				// Ignore the message unless we are susceptible to dynamic cluster updates and their
+				// dynamic cluster name is a better fit than what we have. If we are not susceptible,
+				// it means that there is an explicit name in the cluster and eventually nodes with the
+				// explicit cluster name will make this node use the explicit cluster name via INFO messages.
+				if strings.Compare(clusterName, info.Cluster) < 0 {
+					s.setClusterName(info.Cluster, true)
+					s.removeAllRoutesExcept(c)
+				}
+			} else if !s.nonDynamicClusterNameRoutePresent(info.ID) {
+				// If the route moved from being static to dynamic (thus also changing its name),
+				// then only use their name if no other static, non dynamic nodes exist and it beats
+				// this node's default unique cluster name.  This can happen for example when the last node
+				// from a cluster of nodes has its config reloaded to remove the name and go back to dynamic mode.
+
+				// Find any other route with an explicit name but the one that just went back to dynamic mode.
+				// NOTE: Sometimes nodes with dynamic names can also send their INFOs but due to races,
+				// by the time others have received it they have already changed its name to an explicit one
+				// due to a CONNECT message that was sent.  This check also covers that scenario.
+
+				// Use the correct name and recluster with that name.
+				if strings.Compare(s.defaultClusterName, info.Cluster) < 0 {
+					// Use theirs, let other nodes reconnect using their cluster name.
+					s.setClusterName(info.Cluster, true)
+					s.removeAllRoutesExcept(c)
+				} else {
+					// Use ours, let other nodes reconnect using our cluster name.
+					s.setClusterName(s.defaultClusterName, true)
+					s.removeAllRoutesExcept(c)
+				}
+			}
+
+			c.mu.Lock()
+			c.route.clusterName = info.Cluster
+			c.route.clusterDynamic = info.Dynamic
 		} else {
+			// We have an explicit cluster name and reject explicit cluster name changes.
 			c.closeConnection(ClusterNameConflict)
 			return
 		}
@@ -1920,23 +1988,35 @@ func (c *client) processRouteConnect(srv *Server, arg []byte, lang string) error
 	}
 
 	clusterName := srv.ClusterName()
+	isSusceptible := srv.isClusterNameSusceptibleToChanges()
 
 	// If we have a cluster name set, make sure it matches ours.
 	if proto.Cluster != clusterName {
-		shouldReject := true
 		// If we have a dynamic name we will do additional checks.
-		if srv.isClusterNameDynamic() {
-			if !proto.Dynamic || strings.Compare(clusterName, proto.Cluster) < 0 {
-				// We will take on their name since theirs is configured or higher then ours.
-				srv.setClusterName(proto.Cluster)
-				if !proto.Dynamic {
-					srv.getOpts().Cluster.Name = proto.Cluster
-				}
+		isDynamic := srv.isClusterNameDynamic()
+		remoteIsDynamic := proto.Dynamic
+
+		if isDynamic && !remoteIsDynamic {
+			// c.Noticef("Updating the explicit name from the CONNECT message: ", proto.Cluster)
+			// Use the explicit name and mark current node as not susceptible
+			// to dynamic cluster name changes.
+			srv.setClusterName(proto.Cluster, false)
+			srv.removeAllRoutesExcept(c)
+		} else if !isDynamic && remoteIsDynamic {
+			// Do nothing since the remote may use this node's cluster name
+			// when it is sent an INFO message. Also override the cluster name
+			// from this route with ours since should win.
+			c.mu.Lock()
+			c.route.clusterName = srv.info.Cluster
+			c.mu.Unlock()
+		} else if isDynamic && remoteIsDynamic {
+			// If we haven't learned an explicit name, we will take on their name if theirs is higher then ours.
+			if isSusceptible && strings.Compare(clusterName, proto.Cluster) < 0 {
+				srv.setClusterName(proto.Cluster, isSusceptible)
 				srv.removeAllRoutesExcept(c)
-				shouldReject = false
 			}
-		}
-		if shouldReject {
+		} else {
+			// We have an explicit cluster name and reject explicit cluster name changes.
 			errTxt := fmt.Sprintf("Rejecting connection, cluster name %q does not match %q", proto.Cluster, srv.info.Cluster)
 			c.Errorf(errTxt)
 			c.sendErr(errTxt)
@@ -1953,6 +2033,10 @@ func (c *client) processRouteConnect(srv *Server, arg []byte, lang string) error
 	c.route.lnoc = proto.LNOC
 	c.setRoutePermissions(perms)
 	c.headers = supportsHeaders && proto.Headers
+
+	// Remember their cluster name.
+	c.route.clusterName = proto.Cluster
+	c.route.clusterDynamic = proto.Dynamic
 	c.mu.Unlock()
 	return nil
 }
@@ -1973,6 +2057,23 @@ func (s *Server) removeAllRoutesExcept(c *client) {
 	}
 }
 
+// Called when we update our cluster name during negotiations with remotes.
+func (s *Server) nonDynamicClusterNameRoutePresent(remoteID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.routes {
+		// Check all routes but this one.
+		if r.route.remoteID == remoteID {
+			continue
+		}
+		if r.route.clusterName != "" && !r.route.clusterDynamic {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (s *Server) removeRoute(c *client) {
 	var rID string
 	var lnURL string
@@ -1989,6 +2090,25 @@ func (s *Server) removeRoute(c *client) {
 	}
 	c.mu.Unlock()
 	s.mu.Lock()
+
+	// Check whether we do not have any other routes that are not using explicit names,
+	// since in that case this node should go back to using a dynamic cluster name
+	// that will be negotiated among the remaining members of the cluster.
+	var revertClusterName bool
+	if s.isClusterNameDynamic() && !s.susceptible {
+		var nonDynamicRouteFound bool
+		for _, r := range s.routes {
+			if r.route.clusterName != "" && !r.route.clusterDynamic {
+				nonDynamicRouteFound = true
+			}
+		}
+
+		// Check whether there are no more routes, if so go back to use the original dynamic cluster name.
+		if len(s.routes) <= 1 && nonDynamicRouteFound {
+			revertClusterName = true
+		}
+	}
+
 	delete(s.routes, cid)
 	if r != nil {
 		rc, ok := s.remotes[rID]
@@ -2010,4 +2130,14 @@ func (s *Server) removeRoute(c *client) {
 	}
 	s.removeFromTempClients(cid)
 	s.mu.Unlock()
+
+	// When the last route to this cluster is disconnected
+	// and we were in dynamic mode, then we will go back
+	// to using the original dynamic name that we had.
+	if revertClusterName {
+		s.mu.Lock()
+		name := s.defaultClusterName
+		s.mu.Unlock()
+		s.setClusterName(name, true)
+	}
 }

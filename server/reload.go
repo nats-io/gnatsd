@@ -54,9 +54,13 @@ type option interface {
 	// cluster permissions.
 	IsClusterPermsChange() bool
 
-	// IsJetStreamChange inidicates a change in the servers config for JetStream.
+	// IsJetStreamChange indicates a change in the servers config for JetStream.
 	// Account changes will be handled separately in reloadAuthorization.
 	IsJetStreamChange() bool
+
+	// IsClusterNameChange indicates that the cluster name has changed which might
+	// implicate changes in the cluster membership of the server.
+	IsClusterNameChange() bool
 }
 
 // noopOption is a base struct that provides default no-op behaviors.
@@ -79,6 +83,10 @@ func (n noopOption) IsClusterPermsChange() bool {
 }
 
 func (n noopOption) IsJetStreamChange() bool {
+	return false
+}
+
+func (n noopOption) IsClusterNameChange() bool {
 	return false
 }
 
@@ -292,8 +300,10 @@ func (u *nkeysOption) Apply(server *Server) {
 // clusterOption implements the option interface for the `cluster` setting.
 type clusterOption struct {
 	authOption
+	oldValue     ClusterOpts
 	newValue     ClusterOpts
 	permsChanged bool
+	nameChanged  bool
 }
 
 // Apply the cluster change.
@@ -313,8 +323,17 @@ func (c *clusterOption) Apply(s *Server) {
 	}
 	s.setRouteInfoHostPortAndIP()
 	s.mu.Unlock()
-	if c.newValue.Name != "" && c.newValue.Name != s.ClusterName() {
-		s.setClusterName(c.newValue.Name)
+
+	// Check whether the cluster name has been removed or changed
+	// as that could affect a cluster membership.
+	switch {
+	case c.oldValue.Name != "" && c.newValue.Name == "":
+		s.setClusterName(s.defaultClusterName, true)
+		c.nameChanged = true
+	case c.newValue.Name != "" && c.oldValue.Name != c.newValue.Name:
+		// Use the new explicit cluster name from the config.
+		s.setClusterName(c.newValue.Name, false)
+		c.nameChanged = true
 	}
 	s.Noticef("Reloaded: cluster")
 	if tlsRequired && c.newValue.TLSConfig.InsecureSkipVerify {
@@ -324,6 +343,10 @@ func (c *clusterOption) Apply(s *Server) {
 
 func (c *clusterOption) IsClusterPermsChange() bool {
 	return c.permsChanged
+}
+
+func (c *clusterOption) IsClusterNameChange() bool {
+	return c.nameChanged
 }
 
 // routesOption implements the option interface for the cluster `routes`
@@ -847,7 +870,7 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 				return nil, err
 			}
 			permsChanged := !reflect.DeepEqual(newClusterOpts.Permissions, oldClusterOpts.Permissions)
-			diffOpts = append(diffOpts, &clusterOption{newValue: newClusterOpts, permsChanged: permsChanged})
+			diffOpts = append(diffOpts, &clusterOption{oldValue: oldClusterOpts, newValue: newClusterOpts, permsChanged: permsChanged})
 		case "routes":
 			add, remove := diffRoutes(oldValue.([]*url.URL), newValue.([]*url.URL))
 			diffOpts = append(diffOpts, &routesOption{add: add, remove: remove})
@@ -1018,6 +1041,7 @@ func (s *Server) applyOptions(ctx *reloadContext, opts []option) {
 		reloadAuth         = false
 		reloadClusterPerms = false
 		reloadClientTrcLvl = false
+		reloadClusterName  = false
 	)
 	for _, opt := range opts {
 		opt.Apply(s)
@@ -1033,6 +1057,9 @@ func (s *Server) applyOptions(ctx *reloadContext, opts []option) {
 		if opt.IsClusterPermsChange() {
 			reloadClusterPerms = true
 		}
+		if opt.IsClusterNameChange() {
+			reloadClusterName = true
+		}
 	}
 
 	if reloadLogging {
@@ -1046,6 +1073,9 @@ func (s *Server) applyOptions(ctx *reloadContext, opts []option) {
 	}
 	if reloadClusterPerms {
 		s.reloadClusterPermissions(ctx.oldClusterPerms)
+	}
+	if reloadClusterName {
+		s.reloadClusterName()
 	}
 
 	s.Noticef("Reloaded server configuration")
@@ -1098,6 +1128,24 @@ func (s *Server) reloadClientTraceLevel() {
 		c.setTraceLevel()
 		c.mu.Unlock()
 	}
+}
+
+// reloadClusterName detects cluster membership changes triggered
+// due to a reload where the name changes.
+func (s *Server) reloadClusterName() {
+	s.mu.Lock()
+	// Get all connected routes and notify the cluster rename.
+	infoJSON := s.routeInfoJSON
+	for _, route := range s.routes {
+		route.mu.Lock()
+		route.enqueueProto(infoJSON)
+		route.mu.Unlock()
+	}
+
+	// Reloading without an explicit cluster name makes a server
+	// be susceptible to dynamic cluster name changes.
+	s.susceptible = s.opts.Cluster.Name == ""
+	s.mu.Unlock()
 }
 
 // reloadAuthorization reconfigures the server authorization settings,

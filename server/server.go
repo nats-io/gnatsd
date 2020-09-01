@@ -218,6 +218,14 @@ type Server struct {
 
 	// Websocket structure
 	websocket srvWebsocket
+
+	// susceptible is to mark whether this node is susceptible
+	// to dynamic cluster name INFO/CONNECT proto updates.
+	susceptible bool
+
+	// defaultClusterName is the default cluster name used
+	// in case dynamic clustering name is used.
+	defaultClusterName string
 }
 
 // Make sure all are 64bits for atomic use
@@ -289,17 +297,19 @@ func NewServer(opts *Options) (*Server, error) {
 	now := time.Now()
 
 	s := &Server{
-		kp:           kp,
-		configFile:   opts.ConfigFile,
-		info:         info,
-		prand:        rand.New(rand.NewSource(time.Now().UnixNano())),
-		opts:         opts,
-		done:         make(chan bool, 1),
-		start:        now,
-		configTime:   now,
-		gwLeafSubs:   NewSublistWithCache(),
-		httpBasePath: httpBasePath,
-		eventIds:     nuid.New(),
+		kp:                 kp,
+		configFile:         opts.ConfigFile,
+		info:               info,
+		prand:              rand.New(rand.NewSource(time.Now().UnixNano())),
+		opts:               opts,
+		done:               make(chan bool, 1),
+		start:              now,
+		configTime:         now,
+		gwLeafSubs:         NewSublistWithCache(),
+		httpBasePath:       httpBasePath,
+		eventIds:           nuid.New(),
+		susceptible:        opts.Cluster.Name == "",
+		defaultClusterName: nuid.Next(),
 	}
 
 	// Trusted root operator keys.
@@ -325,9 +335,11 @@ func NewServer(opts *Options) (*Server, error) {
 		return nil, err
 	}
 
-	// If we have a cluster definition but do not have a cluster name, create one.
+	// If we have a cluster definition but do not have a cluster name,
+	// use the default dynamic cluster name for the node.
 	if opts.Cluster.Port != 0 && opts.Cluster.Name == "" {
-		s.info.Cluster = nuid.Next()
+		s.info.Cluster = s.defaultClusterName
+		s.susceptible = true
 	}
 
 	// This is normally done in the AcceptLoop, once the
@@ -449,7 +461,7 @@ func (s *Server) ClusterName() string {
 }
 
 // setClusterName will update the cluster name for this server.
-func (s *Server) setClusterName(name string) {
+func (s *Server) setClusterName(name string, susceptible bool) {
 	s.mu.Lock()
 	var resetCh chan struct{}
 	if s.sys != nil && s.info.Cluster != name {
@@ -458,8 +470,16 @@ func (s *Server) setClusterName(name string) {
 	}
 	s.info.Cluster = name
 	s.routeInfo.Cluster = name
+
+	// Marks whether this is a dynamic name change that is
+	// susceptible to changes due to INFO/CONNECT messages
+	// from other nodes in the cluster.
+	s.susceptible = susceptible
+	s.routeInfo.Dynamic = susceptible
+
 	// Regenerate the info byte array
 	s.generateRouteInfoJSON()
+
 	// Need to close solicited leaf nodes. The close has to be done outside of the server lock.
 	var leafs []*client
 	for _, c := range s.leafs {
@@ -477,12 +497,18 @@ func (s *Server) setClusterName(name string) {
 		resetCh <- struct{}{}
 	}
 	s.Noticef("Cluster name updated to %s", name)
-
 }
 
 // Return whether the cluster name is dynamic.
 func (s *Server) isClusterNameDynamic() bool {
 	return s.getOpts().Cluster.Name == ""
+}
+
+// Return whether the cluster name is susceptible to cluster name changes.
+func (s *Server) isClusterNameSusceptibleToChanges() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.susceptible
 }
 
 // ClientURL returns the URL used to connect clients. Helpful in testing
@@ -2543,6 +2569,16 @@ func (s *Server) ProfilerAddr() *net.TCPAddr {
 		return nil
 	}
 	return s.profiler.Addr().(*net.TCPAddr)
+}
+
+// LeafnodeAddr returns the net.Addr object for the leafnode listener.
+func (s *Server) LeafnodeAddr() *net.TCPAddr {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.leafNodeListener == nil {
+		return nil
+	}
+	return s.leafNodeListener.Addr().(*net.TCPAddr)
 }
 
 // ReadyForConnections returns `true` if the server is ready to accept clients
