@@ -5,8 +5,7 @@
 //
 // http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
+// Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
@@ -2581,6 +2580,115 @@ func TestJetStreamPublishDeDupe(t *testing.T) {
 	if !pa.Duplicate {
 		t.Fatalf("Expected duplicate to be set")
 	}
+}
+
+func TestJetStreamPublishExpSeq(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer os.RemoveAll(config.StoreDir)
+	}
+
+	mname := "ExpSeq"
+	mset, err := s.GlobalAccount().AddStream(&server.StreamConfig{Name: mname, Storage: server.FileStorage, MaxAge: time.Hour, Subjects: []string{"foo.*"}})
+	if err != nil {
+		t.Fatalf("Unexpected error adding stream: %v", err)
+	}
+	defer mset.Delete()
+
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+
+	sendMsg := func(sub string, exp string, ok bool) {
+		t.Helper()
+		m := nats.NewMsg(sub)
+		if exp != "" {
+			m.Header.Add(server.JSExpSeq, exp)
+		}
+		m.Data = []byte("Hello exp seq")
+		resp, _ := nc.RequestMsg(m, 100*time.Millisecond)
+		if resp == nil {
+			t.Fatalf("No response for %q, possible timeout?", string(m.Data))
+		}
+		if bytes.HasPrefix(resp.Data, []byte("+OK {")) {
+			if !ok {
+				t.Fatalf("Expected conflict, but OK")
+			}
+		} else if string(resp.Data) == "-ERR 'exp-seq conflict'" {
+			if ok {
+				t.Fatalf("expected OK, not conflict")
+			}
+			return // expected don't inspect pubAck
+		}
+		var pubAck server.PubAck
+		if err := json.Unmarshal(resp.Data[3:], &pubAck); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+	}
+
+	expect := func(n uint64) {
+		t.Helper()
+		state := mset.State()
+		if state.Msgs != n {
+			t.Fatalf("Expected %d messages, got %d", n, state.Msgs)
+		}
+	}
+
+	// No exp-seq, works as normal.
+	sendMsg("foo.1", "", true) // 1
+	sendMsg("foo.2", "", true) // 2
+	expect(2)
+
+	// Set stream-scoped sequence
+	sendMsg("foo.1", "!2", true) // 3
+	sendMsg("foo.2", "!3", true) // 4
+	expect(4)
+
+	// Wrong stream-scoped sequence.
+	sendMsg("foo.1", "!1", false)
+	sendMsg("foo.2", "!2", false)
+	expect(4)
+
+	// Subject-level sequence.
+	// foo.1 at 3, jump to 5
+	sendMsg("foo.1", "3", true) // 5
+	sendMsg("foo.1", "5", true) // 6
+
+	// Fail
+	sendMsg("foo.1", "3", false) // 5
+	sendMsg("foo.1", "5", false) // 6
+
+	// foo.2 at 4, jump to 7
+	sendMsg("foo.2", "4", true) // 7
+	sendMsg("foo.2", "7", true) // 8
+	expect(8)
+
+	// Delete all messages.
+	mset.Purge()
+
+	// Subject-level zero value for subject.
+	sendMsg("foo.1", "8", true) // 9
+	sendMsg("foo.2", "9", true) // 10
+	expect(2)
+
+	// Stop current server.
+	sd := s.JetStreamConfig().StoreDir
+	s.Shutdown()
+	// Restart.
+	s = RunJetStreamServerOnPort(-1, sd)
+	defer s.Shutdown()
+
+	nc = clientConnectToServer(t, s)
+	defer nc.Close()
+
+	mset, _ = s.GlobalAccount().LookupStream(mname)
+	expect(2)
+
+	// Sequence should work.
+	sendMsg("foo.1", "9", true)
+	sendMsg("foo.2", "10", true)
+	expect(4)
 }
 
 func TestJetStreamPullConsumerRemoveInterest(t *testing.T) {
