@@ -184,6 +184,7 @@ type Options struct {
 	HTTPHost              string        `json:"http_host"`
 	HTTPPort              int           `json:"http_port"`
 	HTTPBasePath          string        `json:"http_base_path"`
+	MonitorToken          string        `json:"-"`
 	HTTPSPort             int           `json:"https_port"`
 	AuthTimeout           float64       `json:"auth_timeout"`
 	MaxControlLine        int32         `json:"max_control_line"`
@@ -366,6 +367,17 @@ type netResolver interface {
 
 // Clone performs a deep copy of the Options struct, returning a new clone
 // with all values copied.
+func (o *Options) IsMonitoringAllowed(token string) bool {
+	if o.MonitorToken == "" {
+		return true
+	}
+	return o.MonitorToken == token
+}
+
+func (o *Options) IsSecureMonitoring() bool {
+	return o.MonitorToken != ""
+}
+
 func (o *Options) Clone() *Options {
 	if o == nil {
 		return nil
@@ -721,6 +733,8 @@ func (o *Options) processConfigFileLine(k string, v interface{}, errors *[]error
 		}
 		o.HTTPHost = hp.host
 		o.HTTPSPort = hp.port
+	case "monitor_token", "monitortoken":
+		o.MonitorToken = v.(string)
 	case "http_port", "monitor_port":
 		o.HTTPPort = int(v.(int64))
 	case "https_port":
