@@ -227,6 +227,7 @@ type Options struct {
 	AllowNonTLS           bool          `json:"-"`
 	WriteDeadline         time.Duration `json:"-"`
 	MaxClosedClients      int           `json:"-"`
+	MaxUnusedAccounts     int           `json:"-"`
 	LameDuckDuration      time.Duration `json:"-"`
 	LameDuckGracePeriod   time.Duration `json:"-"`
 
@@ -3983,6 +3984,9 @@ func setBaselineOptions(opts *Options) {
 	}
 	if opts.MaxClosedClients == 0 {
 		opts.MaxClosedClients = DEFAULT_MAX_CLOSED_CLIENTS
+	}
+	if opts.MaxUnusedAccounts == 0 {
+		opts.MaxUnusedAccounts = MAX_UNUSED_ACCOUNTS
 	}
 	if opts.LameDuckDuration == 0 {
 		opts.LameDuckDuration = DEFAULT_LAME_DUCK_DURATION

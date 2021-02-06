@@ -61,6 +61,7 @@ func TestDefaultOptions(t *testing.T) {
 		MaxPending:          MAX_PENDING_SIZE,
 		WriteDeadline:       DEFAULT_FLUSH_DEADLINE,
 		MaxClosedClients:    DEFAULT_MAX_CLOSED_CLIENTS,
+		MaxUnusedAccounts:   MAX_UNUSED_ACCOUNTS,
 		LameDuckDuration:    DEFAULT_LAME_DUCK_DURATION,
 		LameDuckGracePeriod: DEFAULT_LAME_DUCK_GRACE_PERIOD,
 		LeafNode: LeafNodeOpts{

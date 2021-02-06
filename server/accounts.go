@@ -184,6 +184,7 @@ type streamExport struct {
 // serviceExport holds additional information for exported services.
 type serviceExport struct {
 	exportAuth
+	// back pointer to account containing this serviceExport
 	acc        *Account
 	respType   ServiceRespType
 	latency    *serviceLatency
@@ -865,14 +866,26 @@ func (a *Account) removeClient(c *client) int {
 			a.removeLeafNode(c)
 		}
 	}
+	jwt := a.claimJWT
+	name := a.Name
 	a.mu.Unlock()
 
 	if c != nil && c.srv != nil && removed {
 		c.srv.mu.Lock()
+		var cleanupChan chan string
 		doRemove := a != c.srv.gacc
+		if n <= 1 && doRemove && jwt != "" && c.srv.accResolver != nil && c.srv.accCleanupChan != nil {
+			_, ok := c.srv.accResolver.(*MemAccResolver)
+			if !ok && (c.srv.sys == nil || c.srv.sys.account != a) {
+				cleanupChan = c.srv.accCleanupChan
+			}
+		}
 		c.srv.mu.Unlock()
 		if doRemove {
 			c.srv.accConnsUpdate(a)
+			if cleanupChan != nil {
+				cleanupChan <- name
+			}
 		}
 	}
 	return n

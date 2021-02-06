@@ -25,6 +25,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -5428,4 +5429,163 @@ func TestJWTAccountProtectedImport(t *testing.T) {
 		}
 		require_True(t, len(msgChan) == 0)
 	})
+}
+
+func TestJWTAccountCleanup(t *testing.T) {
+	// This test connects with different account over and over again and make sure memory does not grow
+	jwtChan := make(chan string, 1)
+	defer close(jwtChan)
+	// usa http based resolver so we don't have to worry about account accumulation in resolver
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/A/" {
+			w.Write(nil)
+			return
+		}
+		theJwt := <-jwtChan
+		if theJwt == "" {
+			return
+		}
+		w.Write([]byte(theJwt))
+	}))
+	defer ts.Close()
+	// To inspect inuse objects include: 	_ "net/http/pprof"
+	// Here add: go func() { log.Println(http.ListenAndServe("localhost:6060", nil)) }()
+	// Query with: go tool pprof -sample_index=inuse_objects -web http://localhost:6060/debug/pprof/heap
+
+	// long text to use in jwt / subscriptions such that account/client/subscription leaks are more apparent
+	longText := `01234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901` +
+		`0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789` +
+		`0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789` +
+		`0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789` +
+		`0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789` +
+		`0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789` +
+		`012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678923456789`
+	dirSrv := createDir(t, "srv")
+	defer os.RemoveAll(dirSrv)
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: -1
+		http: 50505
+		operator: %s
+		resolver: URL("%s/A/")
+    `, ojwt, ts.URL)))
+	defer os.Remove(conf)
+	opts := LoadConfig(conf)
+	opts.MaxClosedClients = 1  // reduce so we do not observe growth from that
+	opts.MaxUnusedAccounts = 4 // reduce to not observe growth of unused but still buffered accounts
+	srv := RunServer(opts)
+	defer srv.Shutdown()
+
+	lenClientsAndAccounts := func() int {
+		accCnt := 0
+		srv.accounts.Range(func(key, value interface{}) bool {
+			accCnt++
+			return true
+		})
+		srv.mu.Lock()
+		clientCnt := len(srv.clients) + len(srv.clients) + len(srv.nkeys) +
+			len(srv.grTmpClients) + len(srv.leafs) + len(srv.remotes) + len(srv.routes)
+
+		srv.mu.Unlock()
+		return accCnt + clientCnt
+	}
+
+	// create export account
+	aExpKp, aExpPub := createKey(t)
+	aExpClaim := jwt.NewAccountClaims(aExpPub)
+	aExpClaim.Exports.Add(&jwt.Export{
+		Name:    "bar.stream",
+		Subject: "bar.stream",
+		Type:    jwt.Stream,
+	}, &jwt.Export{
+		Name:    "bar.service",
+		Subject: "bar.service",
+		Type:    jwt.Service,
+	})
+	aExpJwt := encodeClaim(t, aExpClaim, aExpPub)
+	jwtChan <- aExpJwt
+	nc := natsConnect(t, srv.ClientURL(), createUserCreds(t, srv, aExpKp))
+	nc.Close()
+
+	testIteration := func(i int) {
+		aKp, aPub := createKey(t)
+		aClaim := jwt.NewAccountClaims(aPub)
+		aClaim.Description = longText[:200]
+		aClaim.Imports.Add(&jwt.Import{
+			Name:         "bar.stream",
+			Subject:      "bar.stream",
+			Account:      aExpPub,
+			LocalSubject: "stream",
+			Type:         jwt.Stream,
+		}, &jwt.Import{
+			Name:         "bar.service",
+			Subject:      "bar.service",
+			Account:      aExpPub,
+			LocalSubject: "service",
+			Type:         jwt.Service,
+		})
+		aJwt := encodeClaim(t, aClaim, aPub)
+		// make jwt available to http server
+		jwtChan <- aJwt
+		// test initial connect as well as a re connect
+		for j := 0; j < 2; j++ {
+			kp, _ := nkeys.CreateUser()
+			pub, _ := kp.PublicKey()
+			seed, _ := kp.Seed()
+			nuc := jwt.NewUserClaims(pub)
+			nuc.Name = longText
+			ujwt, err := nuc.Encode(aKp)
+			require_NoError(t, err)
+			creds := genCredsFile(t, ujwt, seed)
+			defer os.Remove(creds)
+			require_NoError(t, err)
+			nc, err := nats.Connect(srv.ClientURL(), nats.UserCredentials(creds))
+			if err != nil {
+				t.Fatalf("connect issue in iter %d err: %v", i, err)
+			}
+			_, err = nc.Subscribe(longText, func(msg *nats.Msg) {})
+			require_NoError(t, err)
+			_, err = nc.QueueSubscribe("stream", longText, func(msg *nats.Msg) {})
+			require_NoError(t, err)
+			err = nc.Flush()
+			require_NoError(t, err)
+			nc.Close()
+		}
+	}
+	warmUpLimit := 50
+	for i := 0; i < warmUpLimit; i++ {
+		testIteration(i)
+	}
+	// post warm up measurements to compare against
+	cnt := lenClientsAndAccounts()
+	var memStart runtime.MemStats
+	runtime.ReadMemStats(&memStart)
+	for i := warmUpLimit; ; i += warmUpLimit {
+		for j := 0; j < warmUpLimit; j++ {
+			testIteration(i + j)
+		}
+		// check server
+		currCnt := lenClientsAndAccounts()
+		if currCnt > cnt+4 {
+			t.Fatalf("too many accounts %d %d", lenClientsAndAccounts(), cnt)
+		}
+		// check monitoring endpoint
+		aInfo := &Accountz{}
+		body := readBody(t, fmt.Sprintf("http://localhost:%d%s", opts.HTTPPort, AccountzPath))
+		err := json.Unmarshal(body, aInfo)
+		require_NoError(t, err)
+		require_True(t, len(aInfo.Accounts) > opts.MaxUnusedAccounts)
+		require_True(t, len(aInfo.Accounts) < 2*opts.MaxUnusedAccounts)
+		require_Contains(t, fmt.Sprintf("%v", aInfo.Accounts), "$SYS", "$G", aExpPub)
+		// check memory usage
+		runtime.GC()
+		var memNow runtime.MemStats
+		runtime.ReadMemStats(&memNow)
+		if memNow.Alloc > memStart.Alloc+memStart.Alloc>>1 {
+			t.Fatalf("memory usage %d exceeds %d (more than 1.5 times)", memNow.Alloc, memStart.Alloc)
+		}
+		// exit after sufficient (4 times) churn
+		if memNow.TotalAlloc > memStart.TotalAlloc<<2 {
+			break
+		}
+	}
 }

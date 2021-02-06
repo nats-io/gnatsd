@@ -15,6 +15,7 @@ package server
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -241,6 +242,8 @@ type Server struct {
 	// For mapping from a node name back to a server name and cluster.
 	nodeToName    sync.Map
 	nodeToCluster sync.Map
+	// accounts to inspect for clean up, by name
+	accCleanupChan chan string
 }
 
 // Make sure all are 64bits for atomic use
@@ -1432,6 +1435,9 @@ func (s *Server) Start() {
 	s.grRunning = true
 	s.grMu.Unlock()
 
+	s.accCleanupChan = make(chan string, MAX_UNUSED_ACCOUNTS)
+	s.startGoRoutine(s.accountCleanup)
+
 	// Snapshot server options.
 	opts := s.getOpts()
 
@@ -1620,6 +1626,88 @@ func (s *Server) Start() {
 	s.AcceptLoop(clientListenReady)
 }
 
+func (s *Server) accountCleanup() {
+	defer s.grWG.Done()
+	maxUnusedAcc := s.getOpts().MaxUnusedAccounts
+	accCleanupChan := s.accCleanupChan
+	cleanupQueue := list.New()                 // size limited lru cache
+	accounts := make(map[string]*list.Element) // local index into cleanupQueue
+	for {
+		var accName string
+		select {
+		case accName = <-accCleanupChan:
+		case <-s.quitCh:
+			return
+		}
+		if e := accounts[accName]; e != nil {
+			cleanupQueue.Remove(e)
+		}
+		accounts[accName] = cleanupQueue.PushBack(&accName)
+		s.Tracef("Schedule cleanup of: %s total: %d/%d", accName, len(accounts), cleanupQueue.Len())
+		for cleanupQueue.Len() > maxUnusedAcc {
+			front := cleanupQueue.Front()
+			accName := *(front.Value).(*string)
+			cleanupQueue.Remove(front)
+			delete(accounts, accName)
+			var acc *Account
+			if v, ok := s.accounts.Load(accName); ok {
+				acc = v.(*Account)
+			} else {
+				// account deleted already
+				continue
+			}
+			s.mu.Lock()
+			acc.mu.Lock()
+			exportCnt := (len(acc.exports.services) + len(acc.exports.streams))
+			// Check to remove the client
+			// TODO acc.clients will not be empty when jetstream is enabled. Possible to clean up still?
+			// TODO currently we skip if exports are used
+			if !(len(acc.clients) == 0 && acc.claimJWT != "" && exportCnt == 0) {
+				acc.mu.Unlock()
+				s.mu.Unlock()
+				// not eligible for removal, permanently skip until next last client disconnects
+				continue
+			}
+			s.accounts.Delete(accName)
+			s.tmpAccounts.Delete(accName)
+			s.mu.Unlock()
+			s.Debugf("Cleaned up account %s", accName)
+			acc.mu.Unlock()
+			acc.removeAllServiceImportSubs()
+			acc.mu.Lock()
+			streams := acc.imports.streams
+			acc.imports.streams = []*streamImport{}
+			services := acc.imports.services
+			acc.imports.services = map[string]*serviceImport{}
+			acc.mu.Unlock()
+			// cleanup of config based values
+			for _, si := range streams {
+				si.acc.mu.Lock()
+				if se, ok := si.acc.exports.streams[si.from]; ok && se != nil {
+					// removal from approved (available through config) is not always necessary
+					if a, ok := se.approved[accName]; ok && a == acc {
+						delete(se.approved, accName)
+					}
+				}
+				si.acc.mu.Unlock()
+				si.acc = nil
+			}
+			for _, si := range services {
+				// remove acc from v.acc
+				si.acc.mu.Lock()
+				if se, ok := si.acc.exports.services[si.to]; ok && se != nil {
+					// removal from approved (available through config) is not always necessary
+					if a, ok := se.approved[accName]; ok && a == acc {
+						delete(se.approved, accName)
+					}
+				}
+				si.acc.mu.Unlock()
+				si.acc = nil
+			}
+		}
+	}
+}
+
 // Shutdown will shutdown the server instance by kicking out the AcceptLoop
 // and closing all associated clients.
 func (s *Server) Shutdown() {
@@ -1757,6 +1845,10 @@ func (s *Server) Shutdown() {
 
 	// Wait for go routines to be done.
 	s.grWG.Wait()
+
+	if s.accCleanupChan != nil {
+		close(s.accCleanupChan)
+	}
 
 	if opts.PortsFileDir != _EMPTY_ {
 		s.deletePortsFile(opts.PortsFileDir)

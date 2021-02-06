@@ -199,4 +199,7 @@ const (
 
 	// DEFAULT GLOBAL_ACCOUNT
 	DEFAULT_GLOBAL_ACCOUNT = "$G"
+
+	// MAX_UNUSED_ACCOUNTS is the limit of unused accounts we hold on to prior to cleanup
+	MAX_UNUSED_ACCOUNTS = 1024
 )
