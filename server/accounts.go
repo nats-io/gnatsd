@@ -3371,7 +3371,7 @@ func (*resolverDefaultsOpsImpl) Close() {
 }
 
 func (*resolverDefaultsOpsImpl) Store(_, _ string) error {
-	return fmt.Errorf("Store operation not supported for URL Resolver")
+	return fmt.Errorf("Store operation not supported for the specified Account Resolver")
 }
 
 // MemAccResolver is a memory only resolver.
@@ -3442,6 +3442,23 @@ func (ur *URLAccResolver) Fetch(name string) (string, error) {
 		return _EMPTY_, err
 	}
 	return string(body), nil
+}
+
+// Store will store or update the jwt claim of account `name`
+// to the base url, appending the account name onto the end.
+func (ur *URLAccResolver) Store(name, jwt string) error {
+	url := ur.url + name
+	resp, err := ur.c.Post(url, "application/jwt", strings.NewReader(jwt))
+	if err != nil {
+		return err
+	}
+
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("could not post to <%q>: %v", url, resp.Status)
+	}
+
+	return err
 }
 
 // Resolver based on nats for synchronization and backing directory for storage.
