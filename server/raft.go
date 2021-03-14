@@ -58,7 +58,8 @@ type RaftNode interface {
 	PauseApply()
 	ResumeApply()
 	LeadChangeC() <-chan bool
-	QuitC() <-chan struct{}
+	// returns quit channel to receive quit from and wait group to decrement afterwards
+	QuitC() (<-chan struct{}, *sync.WaitGroup)
 	Created() time.Time
 	Stop()
 	Delete()
@@ -184,6 +185,9 @@ type raft struct {
 	votes    chan *voteResponse
 	leadc    chan bool
 	stepdown chan string
+
+	// wait group to clean up raft specific go routines
+	wgQuit sync.WaitGroup
 }
 
 // cacthupState structure that holds our subscription, and catchup term and index
@@ -338,6 +342,7 @@ func (s *Server) startRaftNode(cfg *RaftConfig) (RaftNode, error) {
 		c:        s.createInternalSystemClient(),
 		sq:       sq,
 		quit:     make(chan struct{}),
+		wgQuit:   sync.WaitGroup{},
 		wtvch:    make(chan struct{}, 1),
 		wpsch:    make(chan struct{}, 1),
 		reqs:     make(chan *voteRequest, 8),
@@ -1132,9 +1137,9 @@ func (n *raft) Peers() []*Peer {
 	return peers
 }
 
-func (n *raft) ApplyC() <-chan *CommittedEntry { return n.applyc }
-func (n *raft) LeadChangeC() <-chan bool       { return n.leadc }
-func (n *raft) QuitC() <-chan struct{}         { return n.quit }
+func (n *raft) ApplyC() <-chan *CommittedEntry            { return n.applyc }
+func (n *raft) LeadChangeC() <-chan bool                  { return n.leadc }
+func (n *raft) QuitC() (<-chan struct{}, *sync.WaitGroup) { return n.quit, &n.wgQuit }
 
 func (n *raft) Created() time.Time {
 	n.RLock()
@@ -1179,6 +1184,8 @@ func (n *raft) shutdown(shouldDelete bool) {
 		os.RemoveAll(path.Join(n.sd, snapshotsDir))
 	}
 	n.Unlock()
+
+	n.wgQuit.Wait()
 
 	s.unregisterRaftNode(g)
 	if shouldDelete {

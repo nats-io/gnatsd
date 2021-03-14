@@ -2536,11 +2536,13 @@ func (mset *stream) stop(deleteFlag, advisory bool) error {
 
 	// Cluster cleanup
 	if n := mset.node; n != nil {
+		mset.mu.Unlock()
 		if deleteFlag {
 			n.Delete()
 		} else {
 			n.Stop()
 		}
+		mset.mu.Lock()
 	}
 
 	// Send stream delete advisory after the consumers.
