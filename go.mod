@@ -3,6 +3,7 @@ module github.com/nats-io/nats-server/v2
 go 1.16
 
 require (
+	github.com/dgrijalva/jwt-go v3.2.0+incompatible
 	github.com/golang/protobuf v1.4.2 // indirect
 	github.com/klauspost/compress v1.11.12
 	github.com/minio/highwayhash v1.0.1

@@ -926,7 +926,7 @@ func (s *Server) wsSetOriginOptions(o *WebsocketOpts) {
 func (s *Server) wsConfigAuth(opts *WebsocketOpts) {
 	ws := &s.websocket
 	// If any of those is specified, we consider that there is an override.
-	ws.authOverride = opts.Username != _EMPTY_ || opts.Token != _EMPTY_ || opts.NoAuthUser != _EMPTY_
+	ws.authOverride = opts.Username != _EMPTY_ || opts.Token != _EMPTY_ || opts.NoAuthUser != _EMPTY_ || opts.BearerAuth != nil
 }
 
 func (s *Server) startWebsocketServer() {

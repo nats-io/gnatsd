@@ -295,9 +295,10 @@ type WebsocketOpts struct {
 
 	// Authentication section. If anything is configured in this section,
 	// it will override the authorization configuration of regular clients.
-	Username string
-	Password string
-	Token    string
+	BearerAuth *BearerAuth
+	Username   string
+	Password   string
+	Token      string
 
 	// Timeout for the authentication process.
 	AuthTimeout float64
