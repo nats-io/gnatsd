@@ -614,7 +614,13 @@ func (s *Server) wsUpgrade(w http.ResponseWriter, r *http.Request) (*wsUpgradeRe
 	}
 	// Point 3.
 	if !wsHeaderContains(r.Header, "Upgrade", "websocket") {
-		return nil, wsReturnHTTPError(w, http.StatusBadRequest, "invalid value for header 'Upgrade'")
+		_, haveUpgrade := r.Header["Upgrade"]
+		if s.opts.Websocket.BrowserRedirectURL != "" && !haveUpgrade {
+			// We still have to return an error, to prevent the connection upgrade.
+			return nil, wsHTTPRedirectAndReturnError(w, s.opts.Websocket.BrowserRedirectURL)
+		} else {
+			return nil, wsReturnHTTPError(w, http.StatusBadRequest, "invalid value for header 'Upgrade'")
+		}
 	}
 	// Point 4.
 	if !wsHeaderContains(r.Header, "Connection", "Upgrade") {
@@ -756,6 +762,15 @@ func wsReturnHTTPError(w http.ResponseWriter, status int, reason string) error {
 	return err
 }
 
+// Send a redirect to a browser and return an error
+func wsHTTPRedirectAndReturnError(w http.ResponseWriter, redirectURL string) error {
+	err := fmt.Errorf("not a websocket request, issued redirect")
+	w.Header().Set("Sec-Websocket-Version", "13")
+	w.Header().Set("Location", redirectURL)
+	http.Error(w, http.StatusText(http.StatusFound), http.StatusFound)
+	return err
+}
+
 // If the server is configured to accept any origin, then this function returns
 // `nil` without checking if the Origin is present and valid. This is also
 // the case if the request does not have the Origin header.
@@ -884,6 +899,13 @@ func validateWebsocketOptions(o *Options) error {
 	if wo.JWTCookie != "" {
 		if len(o.TrustedOperators) == 0 && len(o.TrustedKeys) == 0 {
 			return fmt.Errorf("trusted operators or trusted keys configuration is required for JWT authentication via cookie %q", wo.JWTCookie)
+		}
+	}
+	// Ensure that we're not given random junk which might have us do
+	// non-sensical things later.
+	if wo.BrowserRedirectURL != "" {
+		if _, err := url.Parse(wo.BrowserRedirectURL); err != nil {
+			return fmt.Errorf("unable to parse get redirect URL: %v", err)
 		}
 	}
 	return nil

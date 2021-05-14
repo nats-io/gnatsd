@@ -284,6 +284,12 @@ type WebsocketOpts struct {
 	// The host:port to advertise to websocket clients in the cluster.
 	Advertise string
 
+	// If someone visits the NATS server with a browser, they will send a GET
+	// without the Upgrade header.
+	// For convenience, you can supply a URL to be used as an HTTP redirect,
+	// instead of erroring out.
+	BrowserRedirectURL string
+
 	// If no user name is provided when a client connects, will default to the
 	// matching user from the global list of users in `Options.Users`.
 	NoAuthUser string
@@ -3607,6 +3613,8 @@ func parseWebsocket(v interface{}, o *Options, errors *[]error, warnings *[]erro
 			o.Websocket.JWTCookie = mv.(string)
 		case "no_auth_user":
 			o.Websocket.NoAuthUser = mv.(string)
+		case "browser_redirect_url":
+			o.Websocket.BrowserRedirectURL = mv.(string)
 		default:
 			if !tk.IsUsedVariable() {
 				err := &unknownConfigFieldErr{
