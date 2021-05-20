@@ -9,7 +9,6 @@ jobs:
 
     env:
       GOPATH: /home/runner/work/nats-server
-      GO111MODULE: "off"
 
     runs-on: ubuntu-latest
     steps:
@@ -19,32 +18,15 @@ jobs:
           path: src/github.com/nats-io/nats-server
 
       - name: Setup Go
-        uses: actions/setup-go@v1
+        uses: actions/setup-go@v2
         with:
           go-version: ${{matrix.go}}
 
-      - name: Install deps
-        shell: bash --noprofile --norc -x -eo pipefail {0}
-        run: |
-          go get -u honnef.co/go/tools/cmd/staticcheck
-          go get -u github.com/client9/misspell/cmd/misspell
+      - name: Install tools
+        run: make install-tools
 
       - name: Lint
-        shell: bash --noprofile --norc -x -eo pipefail {0}
-        run: |
-          GO_LIST=$(go list ./...)
-          go build
-          $(exit $(go fmt $GO_LIST | wc -l))
-          go vet $GO_LIST
-          find . -type f -name "*.go" | grep -v "/vendor/" | xargs $GOPATH/bin/misspell -error -locale US
-          $GOPATH/bin/staticcheck $GO_LIST
+        run: make lint
 
       - name: Run tests
-        shell: bash --noprofile --norc -x -eo pipefail {0}
-        run: |
-          set -e
-          go test -i ./...
-          go test -v -run=TestNoRace --failfast -p=1 ./...
-          # coverage via cov.sh disabled while just testing the waters
-          go test -v -race -p=1 --failfast ./...
-          set +e
+        run: make test-no-race test
