@@ -37,7 +37,8 @@ func (s *Server) nonceRequired() bool {
 }
 
 // Generate a nonce for INFO challenge.
-// Assumes server lock is held
+// Assumes server lock is held.
+// Per ADR-0005, must not start with 0x7B (`{`).
 func (s *Server) generateNonce(n []byte) {
 	var raw [nonceRawLen]byte
 	data := raw[:]
