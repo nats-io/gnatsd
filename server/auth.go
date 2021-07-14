@@ -274,31 +274,31 @@ func (s *Server) buildNkeysAndUsersFromOptions(nko []*NkeyUser, uo []*User) (map
 	if nko != nil {
 		nkeys = make(map[string]*NkeyUser, len(nko))
 		for _, u := range nko {
-			copy := u.clone()
+			copyUser := u.clone()
 			if u.Account != nil {
 				if v, ok := s.accounts.Load(u.Account.Name); ok {
-					copy.Account = v.(*Account)
+					copyUser.Account = v.(*Account)
 				}
 			}
-			if copy.Permissions != nil {
-				validateResponsePermissions(copy.Permissions)
+			if copyUser.Permissions != nil {
+				validateResponsePermissions(copyUser.Permissions)
 			}
-			nkeys[u.Nkey] = copy
+			nkeys[u.Nkey] = copyUser
 		}
 	}
 	if uo != nil {
 		users = make(map[string]*User, len(uo))
 		for _, u := range uo {
-			copy := u.clone()
+			copyUser := u.clone()
 			if u.Account != nil {
 				if v, ok := s.accounts.Load(u.Account.Name); ok {
-					copy.Account = v.(*Account)
+					copyUser.Account = v.(*Account)
 				}
 			}
-			if copy.Permissions != nil {
-				validateResponsePermissions(copy.Permissions)
+			if copyUser.Permissions != nil {
+				validateResponsePermissions(copyUser.Permissions)
 			}
-			users[u.Username] = copy
+			users[u.Username] = copyUser
 		}
 	}
 	s.assignGlobalAccountToOrphanUsers(nkeys, users)

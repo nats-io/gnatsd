@@ -557,7 +557,7 @@ func (a *Account) AddMapping(src, dest string) error {
 	return a.AddWeightedMappings(src, NewMapDest(dest, 100))
 }
 
-// AddWeightedMapping will add in a weighted mappings for the destinations.
+// AddWeightedMappings will add in a weighted mappings for the destinations.
 // TODO(dlc) - Allow cluster filtering
 func (a *Account) AddWeightedMappings(src string, dests ...*MapDest) error {
 	a.mu.Lock()
@@ -1516,7 +1516,7 @@ func (a *Account) NumPendingAllResponses() int {
 	return a.NumPendingResponses("")
 }
 
-// NumResponsesPending returns the number of responses outstanding for service exports
+// NumPendingResponses returns the number of responses outstanding for service exports
 // on this account. An empty filter string returns all responses regardless of which export.
 // If you specify the filter we will only return ones that are for that export.
 // NOTE this is only for what this server is tracking.
@@ -2850,7 +2850,7 @@ func (a *Account) isClaimAccount() bool {
 	return a.claimJWT != ""
 }
 
-// updateAccountClaims will update an existing account with new claims.
+// UpdateAccountClaims will update an existing account with new claims.
 // This will replace any exports or imports previously defined.
 // Lock MUST NOT be held upon entry.
 func (s *Server) UpdateAccountClaims(a *Account, ac *jwt.AccountClaims) {

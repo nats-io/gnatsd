@@ -799,8 +799,8 @@ func (s *Server) JetStreamConfig() *JetStreamConfig {
 	var c *JetStreamConfig
 	s.mu.Lock()
 	if s.js != nil {
-		copy := s.js.config
-		c = &(copy)
+		copyConf := s.js.config
+		c = &(copyConf)
 	}
 	s.mu.Unlock()
 	return c
@@ -1740,10 +1740,10 @@ type streamTemplate struct {
 }
 
 func (t *StreamTemplateConfig) deepCopy() *StreamTemplateConfig {
-	copy := *t
+	copyTConf := *t
 	cfg := *t.Config
-	copy.Config = &cfg
-	return &copy
+	copyTConf.Config = &cfg
+	return &copyTConf
 }
 
 // addStreamTemplate will add a stream template to this account that allows auto-creation of streams.

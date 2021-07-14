@@ -683,8 +683,8 @@ func TestSystemAccountInternalSubscriptions(t *testing.T) {
 	received := make(chan *nats.Msg)
 	// Create message callback handler.
 	cb := func(sub *subscription, _ *client, subject, reply string, msg []byte) {
-		copy := append([]byte(nil), msg...)
-		received <- &nats.Msg{Subject: subject, Reply: reply, Data: copy}
+		copyMsg := append([]byte(nil), msg...)
+		received <- &nats.Msg{Subject: subject, Reply: reply, Data: copyMsg}
 	}
 
 	// Now create an internal subscription
@@ -757,8 +757,8 @@ func TestSystemAccountConnectionUpdatesStopAfterNoLocal(t *testing.T) {
 	// Listen for updates to the new account connection activity.
 	received := make(chan *nats.Msg, 10)
 	cb := func(sub *subscription, _ *client, subject, reply string, msg []byte) {
-		copy := append([]byte(nil), msg...)
-		received <- &nats.Msg{Subject: subject, Reply: reply, Data: copy}
+		copyMsg := append([]byte(nil), msg...)
+		received <- &nats.Msg{Subject: subject, Reply: reply, Data: copyMsg}
 	}
 	subj := fmt.Sprintf(accConnsEventSubjOld, pub)
 	sub, err := sa.sysSubscribe(subj, cb)
