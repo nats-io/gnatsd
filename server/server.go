@@ -161,6 +161,7 @@ type Server struct {
 	leafRemoteAccounts sync.Map
 
 	quitCh           chan struct{}
+	startupComplete  chan struct{}
 	shutdownComplete chan struct{}
 
 	// Tracking Go routines
@@ -440,6 +441,11 @@ func NewServer(opts *Options) (*Server, error) {
 	// Used to kick out all go routines possibly waiting on server
 	// to shutdown.
 	s.quitCh = make(chan struct{})
+
+	// Closed when startup is complete. ReadyForConnections() will block on
+	// this before checking the presence of listening sockets.
+	s.startupComplete = make(chan struct{})
+
 	// Closed when Shutdown() is complete. Allows WaitForShutdown() to block
 	// waiting for complete shutdown.
 	s.shutdownComplete = make(chan struct{})
@@ -1708,8 +1714,13 @@ func (s *Server) Start() {
 		s.logPorts()
 	}
 
+	// We've finished starting up.
+	close(s.startupComplete)
+
 	// Wait for clients.
-	s.AcceptLoop(clientListenReady)
+	if !opts.DontListen {
+		s.AcceptLoop(clientListenReady)
+	}
 }
 
 // Shutdown will shutdown the server instance by kicking out the AcceptLoop
@@ -1958,6 +1969,23 @@ func (s *Server) AcceptLoop(clr chan struct{}) {
 	// Let the caller know that we are ready
 	close(clr)
 	clr = nil
+}
+
+// InProcessConn returns an in-process connection to the server,
+// avoiding the need to use a TCP listener for local connectivity
+// within the same process. This can be used regardless of the
+// state of the DontListen option.
+func (s *Server) InProcessConn() (net.Conn, error) {
+	pl, pr := net.Pipe()
+	if !s.startGoRoutine(func() {
+		s.createClient(pl)
+		s.grWG.Done()
+	}) {
+		pl.Close()
+		pr.Close()
+		return nil, fmt.Errorf("failed to create connection")
+	}
+	return pr, nil
 }
 
 func (s *Server) acceptConnections(l net.Listener, acceptName string, createFunc func(conn net.Conn), errFunc func(err error) bool) {
@@ -2734,6 +2762,19 @@ func (s *Server) ProfilerAddr() *net.TCPAddr {
 }
 
 func (s *Server) readyForConnections(d time.Duration) error {
+	end := time.Now().Add(d)
+
+	// Wait for startup. At this point AcceptLoop will only just be
+	// starting, so we'll still check for the presence of listeners
+	// after this.
+	select {
+	case <-s.startupComplete:
+	case <-time.After(d):
+		return fmt.Errorf(
+			"failed to be ready for connections after %s", d,
+		)
+	}
+
 	// Snapshot server options.
 	opts := s.getOpts()
 
@@ -2743,10 +2784,9 @@ func (s *Server) readyForConnections(d time.Duration) error {
 	}
 	chk := make(map[string]info)
 
-	end := time.Now().Add(d)
 	for time.Now().Before(end) {
 		s.mu.Lock()
-		chk["server"] = info{ok: s.listener != nil, err: s.listenerErr}
+		chk["server"] = info{ok: s.listener != nil || opts.DontListen, err: s.listenerErr}
 		chk["route"] = info{ok: (opts.Cluster.Port == 0 || s.routeListener != nil), err: s.routeListenerErr}
 		chk["gateway"] = info{ok: (opts.Gateway.Name == "" || s.gatewayListener != nil), err: s.gatewayListenerErr}
 		chk["leafNode"] = info{ok: (opts.LeafNode.Port == 0 || s.leafNodeListener != nil), err: s.leafNodeListenerErr}

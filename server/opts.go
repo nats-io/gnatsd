@@ -184,6 +184,7 @@ type Options struct {
 	ServerName            string        `json:"server_name"`
 	Host                  string        `json:"addr"`
 	Port                  int           `json:"port"`
+	DontListen            bool          `json:"dont_listen"`
 	ClientAdvertise       string        `json:"-"`
 	Trace                 bool          `json:"-"`
 	Debug                 bool          `json:"-"`
@@ -3895,6 +3896,9 @@ func MergeOptions(fileOpts, flagOpts *Options) *Options {
 	}
 	if flagOpts.Host != "" {
 		opts.Host = flagOpts.Host
+	}
+	if flagOpts.DontListen {
+		opts.DontListen = flagOpts.DontListen
 	}
 	if flagOpts.ClientAdvertise != "" {
 		opts.ClientAdvertise = flagOpts.ClientAdvertise
