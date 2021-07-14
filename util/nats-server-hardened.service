@@ -1,0 +1,61 @@
+[Unit]
+Description=NATS Server
+After=network.target ntp.service
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/nats-server -c /etc/nats-server.conf
+ExecReload=/bin/kill -s HUP $MAINPID
+ExecStop=/bin/kill -s SIGINT $MAINPID
+User=nats
+Group=nats
+
+# Hardening
+CapabilityBoundingSet=
+LimitNOFILE=800000 # JetStream requires 2 FDs open per stream.
+LockPersonality=true
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+PrivateUsers=true
+ProcSubset=pid
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadOnlyPaths=
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallFilter=@system-service ~@privileged ~@resources
+UMask=0077
+
+# If you have systemd >= 247
+ProtectProc=invisible
+
+# If you have systemd >= 248
+PrivateIPC=true
+
+# Optional: writable directory for JetStream.
+ReadWritePaths=/var/lib/nats
+
+# Optional: resource control.
+# Replace weights by values that make sense for your situation.
+# For a list of all options see:
+# https://www.freedesktop.org/software/systemd/man/systemd.resource-control.html
+CPUAccounting=true
+CPUWeight=100 # of 10000
+IOAccounting=true
+IOWeight=100 # of 10000
+MemoryAccounting=true
+MemoryMax=1GB
+IPAccounting=true
+
+[Install]
+WantedBy=multi-user.target
