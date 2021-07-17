@@ -1,0 +1,63 @@
+image: golang:latest
+
+variables:
+  GO111MODULE: "off"
+  TRAVIS_TAG: $CI_COMMIT_TAG
+  REPO_NAME: github.com/nats-io/nats-server
+
+before_script:
+  # Workaround for GitLab CI
+  # https://gitlab.com/gitlab-org/gitlab-ce/blob/6f4a5762dacd89508dfbe2e5d8ef91695499f14f/lib/gitlab/ci/templates/Go.gitlab-ci.yml#L7-16
+  - mkdir -p $GOPATH/src/$(dirname $REPO_NAME)
+  - ln -svf $CI_PROJECT_DIR $GOPATH/src/$REPO_NAME
+  - cd $GOPATH/src/$REPO_NAME
+
+  # Go executable
+  - export PATH=$GOPATH/bin:$PATH
+
+  # install
+  - go get github.com/nats-io/nats.go/
+  - go get github.com/nats-io/nkeys
+  - go get github.com/nats-io/jwt
+  - go get -u honnef.co/go/tools/cmd/staticcheck
+  - go get -u github.com/client9/misspell/cmd/misspell
+
+  - EXCLUDE_VENDOR=$(go list ./... | grep -v "/vendor/")
+  - go build
+  - $(exit $(go fmt $EXCLUDE_VENDOR | wc -l))
+  - go vet $EXCLUDE_VENDOR
+  - misspell -error -locale US $EXCLUDE_VENDOR
+  - staticcheck $EXCLUDE_VENDOR
+
+stages:
+  - test
+  - deploy
+
+.test: &test
+  stage: test
+  script:
+    - set -e
+    - go test -i $EXCLUDE_VENDOR
+    - go test -run=TestNoRace --failfast -p=1 $EXCLUDE_VENDOR
+    - if [[ "$TRAVIS_GO_VERSION" =~ 1.12 ]]; then ./scripts/cov.sh TRAVIS; else go test -v -race -p=1 --failfast $EXCLUDE_VENDOR; fi
+    - set +e
+
+go:1.11:
+  <<: *test
+  image: golang:1.11
+  variables:
+    TRAVIS_GO_VERSION: "1.11"
+
+go:1.12:
+  <<: *test
+  image: golang:1.12
+  variables:
+    TRAVIS_GO_VERSION: "1.12"
+
+deploy:
+  image: golang:1.12
+  stage: deploy
+  script:
+    - curl -sL http://git.io/goreleaser | bash
+  only:
+    - tags

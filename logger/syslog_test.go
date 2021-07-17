@@ -29,6 +29,11 @@ import (
 var serverFQN string
 
 func TestSysLogger(t *testing.T) {
+	ci := os.Getenv("GITLAB_CI")
+	if ci != "" {
+		t.SkipNow()
+	}
+
 	logger := NewSysLogger(false, false)
 
 	if logger.debug {
@@ -41,6 +46,11 @@ func TestSysLogger(t *testing.T) {
 }
 
 func TestSysLoggerWithDebugAndTrace(t *testing.T) {
+	ci := os.Getenv("GITLAB_CI")
+	if ci != "" {
+		t.SkipNow()
+	}
+
 	logger := NewSysLogger(true, true)
 
 	if !logger.debug {

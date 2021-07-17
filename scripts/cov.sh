@@ -17,7 +17,7 @@ rm -rf ./cov
 
 # If we have an arg, assume travis run and push to coveralls. Otherwise launch browser results
 if [[ -n $1 ]]; then
-    $HOME/gopath/bin/goveralls -coverprofile=acc.out -service travis-ci
+    $(go env GOPATH | awk 'BEGIN{FS=":"} {print $1}')/bin/goveralls -coverprofile=acc.out -service travis-ci
     rm -rf ./acc.out
 else
     go tool cover -html=acc.out
