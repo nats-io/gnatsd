@@ -3430,6 +3430,30 @@ func TestJetStreamPublishExpect(t *testing.T) {
 		t.Fatalf("Expected an error, got %q", resp.Data)
 	}
 
+	// Check with JS Headers in different cases.
+	m = nats.NewMsg("foo.bar")
+	m.Data = []byte("HI")
+	m.Header[JSExpectedLastSeq] = []string{"5"}
+	resp, err = nc.RequestMsg(m, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if pa := getPubAckResponse(resp.Data); pa == nil || pa.Error == nil {
+		t.Fatalf("Expected an error, got %q", resp.Data)
+	}
+
+	// Try with JS Header in lower case.
+	// nats-expected-last-sequence: 5
+	m = nats.NewMsg("foo.bar")
+	m.Header[strings.ToLower(JSExpectedLastSeq)] = []string{"5"}
+	resp, err = nc.RequestMsg(m, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if pa := getPubAckResponse(resp.Data); pa == nil || pa.Error == nil {
+		t.Fatalf("Expected an error, got %q", resp.Data)
+	}
+
 	// Restart the server and make sure we remember/rebuild last seq and last msgId.
 	// Stop current
 	sd := s.JetStreamConfig().StoreDir

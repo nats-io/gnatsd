@@ -3713,9 +3713,16 @@ func getHeader(key string, hdr []byte) []byte {
 	if len(hdr) == 0 {
 		return nil
 	}
+
+	// Fast-path is for when headers use canonical case.
 	index := bytes.Index(hdr, []byte(key))
 	if index < 0 {
-		return nil
+		// To make JetStream headers case insensitive, do another lookup
+		// with headers in lowercase.
+		index = bytes.Index(hdr, bytes.ToLower([]byte(key)))
+		if index < 0 {
+			return nil
+		}
 	}
 	index += len(key)
 	if index >= len(hdr) {
