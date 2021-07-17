@@ -1,0 +1,25 @@
+name: NATS Server License Analysis
+on: [pull_request]
+
+jobs:
+  license_check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v1
+        with:
+          path: src/github.com/nats-io/nats-server
+
+      - name: Setup Go
+        uses: actions/setup-go@v1
+        with:
+          go-version: 1.14
+
+      - name: Fossa license analysis
+        shell: bash --noprofile --norc -x -eo pipefail {0}
+        run: |
+          curl -fSs -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/fossas/fossa-cli/master/install.sh | sudo bash
+          fossa analyze
+          fossa test
+        env:
+          FOSSA_API_KEY: ${{ secrets.FOSSA_API_KEY }}
