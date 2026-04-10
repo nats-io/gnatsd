@@ -1396,10 +1396,11 @@ func TestAuthCalloutOperatorModeBasics(t *testing.T) {
 	const scopedToken = "--Scoped--"
 	const badScopedToken = "--BADScoped--"
 	const defaultToken = "--Default--"
+	const nonceChallengeToken = "--NonceChallenge--"
 
 	dkp, notAllowAccountPub := createKey(t)
 	handler := func(m *nats.Msg) {
-		user, si, _, opts, _ := decodeAuthRequest(t, m.Data)
+		user, si, client, opts, _ := decodeAuthRequest(t, m.Data)
 		if opts.Token == secretToken {
 			ujwt := createAuthUser(t, user, "dlc", tpub, "", tkp, 0, nil)
 			m.Respond(serviceResponse(t, user, si.ID, ujwt, "", 0))
@@ -1419,6 +1420,16 @@ func TestAuthCalloutOperatorModeBasics(t *testing.T) {
 			m.Respond(serviceResponse(t, user, si.ID, ujwt, "", 0))
 		} else if opts.Token == defaultToken {
 			ujwt := createAuthUser(t, user, "default", tpub, "", tkp, 0, nil)
+			m.Respond(serviceResponse(t, user, si.ID, ujwt, "", 0))
+		} else if opts.Token == nonceChallengeToken {
+			pub, err := nkeys.FromPublicKey(opts.Nkey)
+			require_NoError(t, err)
+			sig, err := base64.RawURLEncoding.DecodeString(opts.SignedNonce)
+			require_NoError(t, err)
+			// validate the signature of the nonce using the user nkey
+			err = pub.Verify([]byte(client.Nonce), sig)
+			require_NoError(t, err)
+			ujwt := createAuthUser(t, user, "nonced", tpub, "", tkp, 0, nil)
 			m.Respond(serviceResponse(t, user, si.ID, ujwt, "", 0))
 		} else {
 			m.Respond(nil)
@@ -1533,6 +1544,26 @@ func TestAuthCalloutOperatorModeBasics(t *testing.T) {
 	err = json.Unmarshal(resp.Data, &response)
 	ui := response.Data.(*UserInfo)
 	require_Equal(t, "default", ui.UserID)
+	require_NoError(t, err)
+
+	// this provides no sentinel (ie. default sentinel used), allowing to provide a nkey that will be used in the nonce challenge
+	// we make sure that the nkey is not rejected, and the connection should succeed if nonce challenge can be verified.
+	nkUsr, err := nkeys.CreateUser()
+	require_NoError(t, err)
+	nkPub, err := nkUsr.PublicKey()
+	require_NoError(t, err)
+	nc = ac.Connect(nats.Token(nonceChallengeToken), nats.Nkey(nkPub, func(nonce []byte) ([]byte, error) {
+		return nkUsr.Sign(nonce)
+	}))
+	require_NoError(t, err)
+	defer nc.Close()
+
+	resp, err = nc.Request(userDirectInfoSubj, nil, time.Second)
+	require_NoError(t, err)
+	response = ServerAPIResponse{Data: &UserInfo{}}
+	err = json.Unmarshal(resp.Data, &response)
+	ui = response.Data.(*UserInfo)
+	require_Equal(t, "nonced", ui.UserID)
 	require_NoError(t, err)
 
 }
