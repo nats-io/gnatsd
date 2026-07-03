@@ -1089,6 +1089,79 @@ func TestAuthCalloutClientTLSCerts(t *testing.T) {
 	require_True(t, userInfo.Account == "FOO")
 }
 
+func TestAuthCalloutOptionalClientTLSCerts(t *testing.T) {
+	conf := `
+		listen: "localhost:-1"
+		tls {
+			cert_file: "../test/configs/certs/tlsauth/server.pem"
+			key_file: "../test/configs/certs/tlsauth/server-key.pem"
+			ca_file: "../test/configs/certs/tlsauth/ca.pem"
+			verify: optional
+		}
+		accounts {
+			AUTH { users [ {user: "auth", password: "pwd"} ] }
+			FOO {}
+		}
+		authorization {
+			timeout: 1s
+			auth_callout {
+				issuer: "ABJHLOVMPA4CI6R5KLNGOB4GSLNIY7IOUPAJC4YFNDLQVIOBYQGUWVLA"
+				account: AUTH
+				auth_users: [ auth ]
+			}
+		}
+	`
+	certPEM, err := os.ReadFile("../test/configs/certs/tlsauth/client2.pem")
+	require_NoError(t, err)
+	certBlock, _ := pem.Decode(certPEM)
+	require_NotNil(t, certBlock)
+
+	for _, withCert := range []bool{true, false} {
+		t.Run(fmt.Sprintf("%v", withCert), func(t *testing.T) {
+			seen := make(chan *jwt.ClientTLS, 1)
+			handler := func(m *nats.Msg) {
+				user, si, _, _, ctls := decodeAuthRequest(t, m.Data)
+				seen <- ctls
+				ujwt := createAuthUser(t, user, "client", "FOO", "", nil, 0, nil)
+				require_NoError(t, m.Respond(serviceResponse(t, user, si.ID, ujwt, "", 0)))
+			}
+			ac := NewAuthTest(t, conf, handler,
+				nats.UserInfo("auth", "pwd"),
+				nats.RootCAs("../test/configs/certs/tlsauth/ca.pem"),
+			)
+			defer ac.Cleanup()
+
+			clientOpts := []nats.Option{
+				nats.RootCAs("../test/configs/certs/tlsauth/ca.pem"),
+				nats.NoReconnect(),
+			}
+			if withCert {
+				clientOpts = append(clientOpts, nats.ClientCert(
+					"../test/configs/certs/tlsauth/client2.pem",
+					"../test/configs/certs/tlsauth/client2-key.pem"),
+				)
+			}
+			nc := ac.Connect(clientOpts...)
+			defer nc.Close()
+
+			ctls := require_ChanRead(t, seen, time.Second)
+			require_NotNil(t, ctls)
+			require_NotEqual(t, ctls.Version, "")
+			require_NotEqual(t, ctls.Cipher, "")
+			require_Equal(t, len(ctls.Certs), 0)
+			if withCert {
+				require_Equal(t, len(ctls.VerifiedChains), 1)
+				require_Equal(t, len(ctls.VerifiedChains[0]), 2)
+				block, _ := pem.Decode([]byte(ctls.VerifiedChains[0][0]))
+				require_NotNil(t, block)
+				require_True(t, bytes.Equal(block.Bytes, certBlock.Bytes))
+			} else {
+				require_Equal(t, len(ctls.VerifiedChains), 0)
+			}
+		})
+	}
+}
+
 func TestAuthCalloutVerifiedUserCalloutsWithSig(t *testing.T) {
 	conf := `
 		listen: "127.0.0.1:-1"
