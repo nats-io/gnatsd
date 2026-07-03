@@ -514,6 +514,7 @@ type Options struct {
 	TLSTimeout                 float64           `json:"tls_timeout"`
 	TLS                        bool              `json:"-"`
 	TLSVerify                  bool              `json:"-"`
+	TLSVerifyOptional          bool              `json:"-"`
 	TLSMap                     bool              `json:"-"`
 	TLSCert                    string            `json:"-"`
 	TLSKey                     string            `json:"-"`
@@ -897,6 +898,7 @@ type TLSConfigOpts struct {
 	KeyFile              string
 	CaFile               string
 	Verify               bool
+	VerifyOptional       bool
 	Insecure             bool
 	Map                  bool
 	TLSCheckKnownURLs    bool
@@ -966,6 +968,9 @@ e.g.
             "CurveP521"
         ]
     }
+
+The verify option accepts "true" (require a valid client certificate),
+"false" (do not request one) or "optional" (verify only if provided).
 
 Available cipher suites include:
 `
@@ -5261,11 +5266,17 @@ func parseTLS(v any, isClientCtx bool) (t *TLSConfigOpts, retErr error) {
 			}
 			tc.Insecure = insecure
 		case "verify":
-			verify, ok := mv.(bool)
-			if !ok {
-				return nil, &configErr{tk, "error parsing tls config, expected 'verify' to be a boolean"}
+			switch verify := mv.(type) {
+			case bool:
+				tc.Verify = verify
+			case string:
+				if !strings.EqualFold(verify, "optional") {
+					return nil, &configErr{tk, "error parsing tls config, expected 'verify' to be a boolean or 'optional'"}
+				}
+				tc.VerifyOptional = true
+			default:
+				return nil, &configErr{tk, "error parsing tls config, expected 'verify' to be a boolean or 'optional'"}
 			}
-			tc.Verify = verify
 		case "verify_and_map":
 			verify, ok := mv.(bool)
 			if !ok {
@@ -5514,6 +5525,10 @@ func parseTLS(v any, isClientCtx bool) (t *TLSConfigOpts, retErr error) {
 	}
 	if len(tc.Certificates) > 0 && tc.CertFile != _EMPTY_ {
 		return nil, &configErr{tk, "error parsing tls config, cannot combine 'cert_file' option with 'certs' option"}
+	}
+
+	if tc.Verify && tc.VerifyOptional {
+		return nil, &configErr{tk, "error parsing tls config, cannot combine 'verify: optional' with options requiring client certificates"}
 	}
 
 	// If cipher suites were not specified then use the defaults
@@ -5967,10 +5982,19 @@ func GenTLSConfig(tc *TLSConfigOpts) (*tls.Config, error) {
 		}
 	}
 
-	// Require client certificates as needed
-	if tc.Verify {
-		config.ClientAuth = tls.RequireAndVerifyClientCert
+	// Optional verification permits clients without certificates, but verifies
+	// any certificate they present (for example, for an auth callout). Technically
+	// a duplicate check but covers caller building TLSConfigOpts directly.
+	if tc.Verify && tc.VerifyOptional {
+		return nil, fmt.Errorf("cannot enable both required and optional client certificate verification")
 	}
+	switch {
+	case tc.Verify:
+		config.ClientAuth = tls.RequireAndVerifyClientCert
+	case tc.VerifyOptional:
+		config.ClientAuth = tls.VerifyClientCertIfGiven
+	}
+
 	// Add in CAs if applicable.
 	if tc.CaFile != _EMPTY_ {
 		rootPEM, err := os.ReadFile(tc.CaFile)
@@ -6384,7 +6408,18 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 	fs.StringVar(&opts.Cluster.Name, "cluster_name", _EMPTY_, "Cluster Name, if not set one will be dynamically generated.")
 	fs.BoolVar(&showTLSHelp, "help_tls", false, "TLS help.")
 	fs.BoolVar(&opts.TLS, "tls", false, "Enable TLS.")
-	fs.BoolVar(&opts.TLSVerify, "tlsverify", false, "Enable TLS with client verification.")
+	fs.BoolFunc("tlsverify", "Enable TLS with client verification (true, false, or optional).", func(value string) error {
+		if strings.EqualFold(value, "optional") {
+			opts.TLSVerify, opts.TLSVerifyOptional = false, true
+			return nil
+		}
+		verify, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("expected true, false, or optional: %w", err)
+		}
+		opts.TLSVerify, opts.TLSVerifyOptional = verify, false
+		return nil
+	})
 	fs.StringVar(&opts.TLSCert, "tlscert", _EMPTY_, "Server certificate file.")
 	fs.StringVar(&opts.TLSKey, "tlskey", _EMPTY_, "Private key for server certificate.")
 	fs.StringVar(&opts.TLSCaCert, "tlscacert", _EMPTY_, "Client certificate CA for verification.")
@@ -6595,12 +6630,16 @@ func overrideTLS(opts *Options) error {
 	if opts.TLSKey == _EMPTY_ {
 		return errors.New("TLS Server private key must be present and valid")
 	}
+	if opts.TLSVerify && opts.TLSVerifyOptional {
+		return errors.New("cannot enable both required and optional client certificate verification")
+	}
 
 	tc := TLSConfigOpts{}
 	tc.CertFile = opts.TLSCert
 	tc.KeyFile = opts.TLSKey
 	tc.CaFile = opts.TLSCaCert
 	tc.Verify = opts.TLSVerify
+	tc.VerifyOptional = opts.TLSVerifyOptional
 	tc.Ciphers = defaultCipherSuites()
 
 	var err error

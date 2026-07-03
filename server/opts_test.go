@@ -967,6 +967,20 @@ func TestTlsPinnedCertificates(t *testing.T) {
 	check(opts.Websocket.TLSPinnedCerts)
 }
 
+func TestTlsVerifyClientCertsIfGiven(t *testing.T) {
+	confFileName := createConfFile(t, []byte(`
+	tls {
+		cert_file: "./configs/certs/server.pem"
+		key_file: "./configs/certs/key.pem"
+		verify: optional
+	}
+	`))
+	opts, err := ProcessConfigFile(confFileName)
+	require_NoError(t, err)
+	require_NotNil(t, opts.TLSConfig)
+	require_Equal(t, opts.TLSConfig.ClientAuth, tls.VerifyClientCertIfGiven)
+}
+
 func TestNkeyUsersDefaultPermissionsConfig(t *testing.T) {
 	confFileName := createConfFile(t, []byte(`
 	authorization {
