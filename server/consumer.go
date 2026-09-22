@@ -6230,7 +6230,7 @@ func (o *consumer) getNextToRedeliver() uint64 {
 		o.rdq = nil
 		o.rdqi.Empty()
 	} else {
-		o.rdq = append(o.rdq[:0], o.rdq[1:]...)
+		o.rdq = o.rdq[1:]
 		o.rdqi.Delete(seq)
 	}
 	return seq
