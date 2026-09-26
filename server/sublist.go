@@ -1331,7 +1331,12 @@ func ValidateMapping(src string, dest string) error {
 		}
 
 		// if it looks like it contains a mapping function, it should be a valid mapping function
-		if length > 4 && t[0] == '{' && t[1] == '{' && t[length-2] == '}' && t[length-1] == '}' {
+		if isMappingFunctionToken(t) {
+			// Account scoped functions must have been resolved before the mapping is validated.
+			// Better error in case some (future) code path builds a transform without expanding it first.
+			if isAccountMappingFunction(t) {
+				return &mappingDestinationErr{t, ErrMappingFunctionNotAvailable}
+			}
 			if !partitionMappingFunctionRegEx.MatchString(t) &&
 				!wildcardMappingFunctionRegEx.MatchString(t) &&
 				!splitFromLeftMappingFunctionRegEx.MatchString(t) &&

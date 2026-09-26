@@ -27521,6 +27521,122 @@ func TestJetStreamDynamicMaxStoreStableAcrossRestart(t *testing.T) {
 	}
 }
 
+func TestJetStreamStreamTransformsAccountFunctionsNotAvailable(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "O", Subjects: []string{"in.>"}})
+	require_NoError(t, err)
+
+	// Account scoped mapping functions are not resolved in stream configurations: the transforms reject them.
+	for _, fn := range []string{"{{account-hash()}}", "{{account-hash-import()}}", "{{account-hash-leaf-remote()}}"} {
+		for _, test := range []struct {
+			name     string
+			cfg      *nats.StreamConfig
+			expected string
+		}{
+			{"subject transform", &nats.StreamConfig{
+				Name: "T", Subjects: []string{"t.>"},
+				SubjectTransform: &nats.SubjectTransformConfig{Source: "t.>", Destination: fn + ".t.>"},
+			}, "not available"},
+			{"republish", &nats.StreamConfig{
+				Name: "T", Subjects: []string{"t.>"},
+				RePublish: &nats.RePublish{Source: ">", Destination: "rp." + fn + ".>"},
+			}, "not valid"},
+			{"mirror", &nats.StreamConfig{
+				Name: "T",
+				Mirror: &nats.StreamSource{Name: "O", SubjectTransforms: []nats.SubjectTransformConfig{
+					{Source: "in.>", Destination: "m." + fn + ".>"},
+				}},
+			}, "not available"},
+			{"source", &nats.StreamConfig{
+				Name: "T",
+				Sources: []*nats.StreamSource{{Name: "O", SubjectTransforms: []nats.SubjectTransformConfig{
+					{Source: "in.>", Destination: "s." + fn + ".>"},
+				}}},
+			}, "not available"},
+		} {
+			t.Run(fn+" "+test.name, func(t *testing.T) {
+				_, err := js.AddStream(test.cfg)
+				require_Error(t, err)
+				require_Contains(t, err.Error(), test.expected)
+			})
+		}
+	}
+}
+
+func TestJetStreamAccountImportAckV2AccountHash(t *testing.T) {
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:-1
+		no_auth_user: rip
+		jetstream: {max_mem_store: 64GB, max_file_store: 10TB, store_dir: %q}
+		feature_flags { js_ack_fc_v2: true }
+		accounts: {
+			JS: {
+				jetstream: enabled
+				users: [ {user: dlc, password: foo} ]
+				exports [
+					{ stream: "deliver.ORDERS" }
+					{ service: "$JS.ACK._.{{account-hash()}}.ORDERS.*.>" }
+					{ service: "$JS.FC._.{{account-hash()}}.ORDERS.*.>" }
+				]
+			},
+			IU: {
+				users: [ {user: rip, password: bar} ]
+				imports [
+					{ stream:  { subject: "deliver.ORDERS", account: JS }, to: "d" }
+					{ service: { subject: "$JS.ACK._.{{account-hash-import()}}.ORDERS.*.>", account: JS } }
+					{ service: { subject: "$JS.FC._.{{account-hash-import()}}.ORDERS.*.>", account: JS } }
+				]
+			},
+		}
+	`, t.TempDir())))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	hash := getHash("JS")
+	acc, err := s.LookupAccount("JS")
+	require_NoError(t, err)
+	acc.mu.RLock()
+	_, hasAck := acc.exports.services["$JS.ACK._."+hash+".ORDERS.*.>"]
+	_, hasFC := acc.exports.services["$JS.FC._."+hash+".ORDERS.*.>"]
+	acc.mu.RUnlock()
+	require_True(t, hasAck)
+	require_True(t, hasFC)
+
+	mset, err := acc.addStream(&StreamConfig{Name: "ORDERS", Subjects: []string{"ORDERS.*"}})
+	require_NoError(t, err)
+	defer mset.delete()
+
+	ncJS := natsConnect(t, s.ClientURL(), nats.UserInfo("dlc", "foo"))
+	defer ncJS.Close()
+	sendStreamMsg(t, ncJS, "ORDERS.foo", "ORDERS-1")
+
+	// This is the rip user, in the account that imports the delivery subject and the ack service.
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+	sub := natsSubSync(t, nc, "d")
+	natsFlush(t, nc)
+
+	o, err := mset.addConsumer(&ConsumerConfig{Durable: "p", DeliverSubject: "deliver.ORDERS", AckPolicy: AckExplicit})
+	require_NoError(t, err)
+	defer o.delete()
+
+	m := natsNexMsg(t, sub, time.Second)
+	require_True(t, strings.HasPrefix(m.Reply, "$JS.ACK._."+hash+".ORDERS.p."))
+	// The ack crosses the account boundary through the imported service, and is acked back.
+	_, err = nc.Request(m.Reply, AckAck, time.Second)
+	require_NoError(t, err)
+	checkFor(t, time.Second, 25*time.Millisecond, func() error {
+		if info := o.info(); info.AckFloor.Consumer != 1 {
+			return fmt.Errorf("ack not processed: %+v", info.AckFloor)
+		}
+		return nil
+	})
+}
+
 func TestJetStreamInterestCheckWithoutConsumersDoesNotCompact(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
