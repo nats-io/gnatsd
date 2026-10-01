@@ -4711,7 +4711,11 @@ func (s *Server) processStreamRestore(ci *ClientInfo, acc *Account, cfg *StreamC
 			case <-notActive.C:
 				err := fmt.Errorf("restore for stream '%s > %s' is stalled", acc.Name, streamName)
 				closeWithError(err)
-				doneCh <- err
+				// Wait for the restore to unwind, it may have created the stream already.
+				if !restoreDone {
+					restoreResult = <-restoreCh
+				}
+				finish(replySubj, err, restoreResult.mset)
 				return
 			}
 		}

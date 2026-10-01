@@ -9520,6 +9520,52 @@ func TestJetStreamClusterStreamRestoreNameMismatch(t *testing.T) {
 	}
 }
 
+// https://github.com/nats-io/nats-server/issues/8687
+func TestJetStreamClusterStreamRestoreStallPublishesAdvisory(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}, Replicas: 3})
+	require_NoError(t, err)
+	for i := 0; i < 100; i++ {
+		sendStreamMsg(t, nc, "foo", "msg")
+	}
+	sc, ss, snapshot := performStreamBackup(t, nc, "TEST")
+	require_NoError(t, js.DeleteStream("TEST"))
+
+	sub, err := nc.SubscribeSync(JSAdvisoryStreamRestoreCompletePre + ".TEST")
+	require_NoError(t, err)
+	defer sub.Unsubscribe()
+
+	// Send the whole archive, but never the empty chunk that ends the transfer.
+	req, err := json.Marshal(struct {
+		StreamState  `json:"state"`
+		StreamConfig `json:"config"`
+	}{StreamState: ss, StreamConfig: sc})
+	require_NoError(t, err)
+	rmsg, err := nc.Request(fmt.Sprintf(JSApiStreamRestoreT, "TEST"), req, 5*time.Second)
+	require_NoError(t, err)
+	var resp JSApiStreamRestoreResponse
+	require_NoError(t, json.Unmarshal(rmsg.Data, &resp))
+	require_True(t, resp.Error == nil)
+	const chunk = 64 * 1024
+	for i := 0; i < len(snapshot); i += chunk {
+		_, err = nc.Request(resp.DeliverSubject, snapshot[i:min(i+chunk, len(snapshot))], time.Second)
+		require_NoError(t, err)
+	}
+
+	// The transfer stalls, and the restore is reported like any other failed restore.
+	msg, err := sub.NextMsg(15 * time.Second)
+	require_NoError(t, err)
+	var adv JSRestoreCompleteAdvisory
+	require_NoError(t, json.Unmarshal(msg.Data, &adv))
+	require_Equal(t, adv.Stream, "TEST")
+	require_Equal(t, adv.Bytes, int64(len(snapshot)))
+}
+
 func TestJetStreamClusterRemoveStatusHeaderOnStreamInbound(t *testing.T) {
 	test := func(t *testing.T, replicas int) {
 		var s *Server
