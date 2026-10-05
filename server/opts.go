@@ -237,6 +237,11 @@ type LeafNodeOpts struct {
 	// If not set (or <= 0), DEFAULT_ROUTE_DIAL is used.
 	DialTimeout time.Duration `json:"-"`
 
+	// PingInterval and MaxPingsOut, if set, override the default PingInterval
+	// and MaxPingsOut for leafnode connections.
+	PingInterval time.Duration `json:"-"`
+	MaxPingsOut  int           `json:"-"`
+
 	// Not exported, for tests.
 	resolver  netResolver
 	connDelay time.Duration
@@ -2931,6 +2936,10 @@ func parseLeafNodes(v any, opts *Options, errors *[]error, warnings *[]error) er
 			opts.LeafNode.WriteDeadline = parseDuration("write_deadline", tk, mv, errors, warnings)
 		case "write_timeout":
 			opts.LeafNode.WriteTimeout = parseWriteDeadlinePolicy(tk, mv.(string), errors)
+		case "ping_interval":
+			opts.LeafNode.PingInterval = parseDuration("ping_interval", tk, mv, errors, warnings)
+		case "ping_max":
+			opts.LeafNode.MaxPingsOut = int(mv.(int64))
 		default:
 			if !tk.IsUsedVariable() {
 				err := &unknownConfigFieldErr{
