@@ -592,6 +592,49 @@ func TestLeafNodeRTT(t *testing.T) {
 	checkRTT(t, sb)
 }
 
+func TestLeafNodeCustomPing(t *testing.T) {
+	pingInterval := 50 * time.Millisecond
+
+	ob := DefaultOptions()
+	ob.LeafNode.Host = "127.0.0.1"
+	ob.LeafNode.Port = -1
+	ob.LeafNode.PingInterval = pingInterval
+	ob.LeafNode.MaxPingsOut = 2
+	sb := RunServer(ob)
+	defer sb.Shutdown()
+
+	lnBURL, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", ob.LeafNode.Port))
+	oa := DefaultOptions()
+	oa.Cluster.Name = "xyz"
+	oa.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{lnBURL}}}
+	oa.LeafNode.PingInterval = pingInterval
+	sa := RunServer(oa)
+	defer sa.Shutdown()
+
+	checkLeafNodeConnected(t, sa)
+
+	var ln *client
+	sa.mu.Lock()
+	for _, l := range sa.leafs {
+		ln = l
+		break
+	}
+	sa.mu.Unlock()
+
+	ch := make(chan struct{}, 1)
+	ln.mu.Lock()
+	ln.nc = &capturePingConn{ln.nc, ch}
+	ln.mu.Unlock()
+
+	for i := 0; i < 5; i++ {
+		select {
+		case <-ch:
+		case <-time.After(250 * time.Millisecond):
+			t.Fatalf("Did not send PING")
+		}
+	}
+}
+
 func TestLeafNodeValidateAuthOptions(t *testing.T) {
 	opts := DefaultOptions()
 	opts.LeafNode.Username = "user1"
