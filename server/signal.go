@@ -78,9 +78,24 @@ func (s *Server) handleSignal(sig os.Signal) {
 	case syscall.SIGUSR2:
 		s.startLameDuckMode()
 	case syscall.SIGHUP:
-		// Config reload.
-		if err := s.Reload(); err != nil {
-			s.Errorf("Failed to reload server configuration: %s", err)
+		// Config reload. A reload must wait until startup has finished. If it
+		// hasn't yet, wait outside of the signal loop, so that other signals
+		// (e.g. SIGTERM) are still handled in the meantime.
+		reload := func() {
+			if err := s.Reload(); err != nil {
+				s.Errorf("Failed to reload server configuration: %s", err)
+			}
+		}
+		select {
+		case <-s.startupComplete:
+			reload()
+		default:
+			s.Noticef("Server is still starting, config reload will run once startup completes")
+			go func() {
+				if err := s.waitForStartup(); err == nil {
+					reload()
+				}
+			}()
 		}
 	}
 }
