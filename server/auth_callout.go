@@ -336,6 +336,9 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 			c.pubKey = _EMPTY_
 			c.opts.Token = _EMPTY_
 		}
+		// Carry the user's tags and name onto the client, as with regular JWT auth.
+		c.tags = arc.Tags
+		c.nameTag = arc.Name
 		c.mu.Unlock()
 
 		// Check if we need to set an auth timer if the user jwt expires.
