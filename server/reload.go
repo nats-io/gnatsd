@@ -1451,12 +1451,31 @@ func (s *Server) Reload() error {
 	return s.ReloadOptions(newOpts)
 }
 
+// waitForStartup blocks until Start() has finished. It returns
+// ErrServerNotRunning if the server shuts down first.
+func (s *Server) waitForStartup() error {
+	select {
+	case <-s.startupComplete:
+		return nil
+	case <-s.quitCh:
+		return ErrServerNotRunning
+	}
+}
+
 // ReloadOptions applies any supported options from the provided Options
 // type. This returns an error if an option which doesn't support
 // hot-swapping was changed.
 // The provided Options type should not be re-used afterwards.
 // Either use Options.Clone() to pass a copy, or make a new one.
 func (s *Server) ReloadOptions(newOpts *Options) error {
+	// If the server is starting, wait for startup to finish;
+	// this avoids racing against the initial setup.
+	if s.isRunning() {
+		if err := s.waitForStartup(); err != nil {
+			return err
+		}
+	}
+
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
 

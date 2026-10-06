@@ -8020,3 +8020,48 @@ func TestCalloutInputsChanged(t *testing.T) {
 		}
 	}
 }
+
+// Readloading the config must not race against startup.
+// A race could cause JetStream to appear un-enabled, and the reload would attempt to start it again.
+// That would make Start() fail ("jetstream already enabled"), or register every JetStream API handler twice.
+func TestConfigReloadDuringStartupWithJetStream(t *testing.T) {
+	for i := 0; i < 50; i++ { // Kinda arbitrary count, based on TestConfigReloadNoPanicOnShutdown
+		func() {
+			opts, _ := newOptionsFromContent(t, []byte(fmt.Sprintf(`
+				listen: 127.0.0.1:-1
+				jetstream { store_dir: %q }
+			`, t.TempDir())))
+			opts.NoLog = true
+			s, err := NewServer(opts)
+			require_NoError(t, err)
+			defer s.Shutdown()
+			l := &captureFatalLogger{fatalCh: make(chan string, 1)}
+			s.SetLogger(l, false, false)
+
+			go s.Start()
+			// Reload as soon as Start() is under way, before it has enabled JetStream.
+			for !s.isRunning() {
+				runtime.Gosched()
+			}
+			require_NoError(t, s.Reload())
+
+			if !s.ReadyForConnections(5 * time.Second) {
+				select {
+				case msg := <-l.fatalCh:
+					t.Fatalf("Iteration %d: server failed to start after a reload during startup: %s", i, msg)
+				default:
+					t.Fatalf("Iteration %d: server did not finish starting after a reload during startup", i)
+				}
+			}
+			nc := natsConnect(t, s.ClientURL())
+			defer nc.Close()
+			resp, err := nc.Request(JSApiAccountInfo, nil, 2*time.Second)
+			require_NoError(t, err)
+			var info JSApiAccountInfoResponse
+			require_NoError(t, json.Unmarshal(resp.Data, &info))
+			if info.Error != nil {
+				t.Fatalf("Iteration %d: JetStream API request failed after a reload during startup: %+v", i, info.Error)
+			}
+		}()
+	}
+}
