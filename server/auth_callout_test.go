@@ -2726,6 +2726,101 @@ func TestAuthCalloutConnectEvents(t *testing.T) {
 	checkConnectEvents("rip", "xxx", "BAR")
 }
 
+// https://github.com/nats-io/nats-server/issues/7917
+func TestAuthCalloutUserTagsAndName(t *testing.T) {
+	conf := `
+		listen: "127.0.0.1:-1"
+		server_name: A
+		accounts {
+			AUTH { users [ {user: "auth", password: "pwd"} ] }
+			FOO {}
+			$SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] }
+		}
+		authorization {
+			auth_callout {
+				issuer: "ABJHLOVMPA4CI6R5KLNGOB4GSLNIY7IOUPAJC4YFNDLQVIOBYQGUWVLA"
+				account: AUTH
+				auth_users: [ auth, admin ]
+			}
+		}
+	`
+
+	akp, err := nkeys.FromSeed([]byte(authCalloutIssuerSeed))
+	require_NoError(t, err)
+
+	handler := func(m *nats.Msg) {
+		user, si, _, opts, _ := decodeAuthRequest(t, m.Data)
+		uc := jwt.NewUserClaims(user)
+		uc.Audience = "FOO"
+		switch {
+		case opts.Username == "dlc" && opts.Password == "zzz":
+			uc.Name = "Derek"
+			uc.Tags.Add("role:admin", "region:us-east")
+		case opts.Username == "rip" && opts.Password == "xxx":
+			// No name or tags.
+		default:
+			m.Respond(serviceResponse(t, user, si.ID, "", "BAD CREDS", 0))
+			return
+		}
+		ujwt, err := uc.Encode(akp)
+		require_NoError(t, err)
+		m.Respond(serviceResponse(t, user, si.ID, ujwt, "", 0))
+	}
+
+	ac := NewAuthTest(t, conf, handler, nats.UserInfo("auth", "pwd"))
+	defer ac.Cleanup()
+
+	snc := ac.Connect(nats.UserInfo("admin", "s3cr3t!"))
+	defer snc.Close()
+
+	// Only watch FOO, so the admin's own (async) connect event can't be picked up.
+	csub, err := snc.SubscribeSync(fmt.Sprintf(connectEventSubj, "FOO"))
+	require_NoError(t, err)
+	dsub, err := snc.SubscribeSync(fmt.Sprintf(disconnectEventSubj, "FOO"))
+	require_NoError(t, err)
+	require_NoError(t, snc.Flush())
+
+	checkTags := func(got jwt.TagList, want []string) {
+		t.Helper()
+		require_Len(t, len(got), len(want))
+		for _, tag := range want {
+			require_True(t, got.Contains(tag))
+		}
+	}
+
+	check := func(user, pass, nameTag string, tags []string) {
+		t.Helper()
+		nc := ac.Connect(nats.UserInfo(user, pass))
+
+		m, err := csub.NextMsg(time.Second)
+		require_NoError(t, err)
+		var cm ConnectEventMsg
+		require_NoError(t, json.Unmarshal(m.Data, &cm))
+		require_Equal(t, cm.Client.Account, "FOO")
+		checkTags(cm.Client.Tags, tags)
+
+		cid, err := nc.GetClientID()
+		require_NoError(t, err)
+		c := ac.srv.getClient(cid)
+		require_NotNil(t, c)
+		ci := c.getClientInfo(true)
+		require_Equal(t, ci.NameTag, nameTag)
+		checkTags(ci.Tags, tags)
+
+		nc.Close()
+
+		m, err = dsub.NextMsg(time.Second)
+		require_NoError(t, err)
+		var dm DisconnectEventMsg
+		require_NoError(t, json.Unmarshal(m.Data, &dm))
+		require_Equal(t, dm.Client.Account, "FOO")
+		checkTags(dm.Client.Tags, tags)
+	}
+
+	check("dlc", "zzz", "Derek", []string{"role:admin", "region:us-east"})
+	check("rip", "xxx", _EMPTY_, nil)
+}
+
 func TestAuthCalloutBadServer(t *testing.T) {
 	conf := `
 		listen: "127.0.0.1:-1"
