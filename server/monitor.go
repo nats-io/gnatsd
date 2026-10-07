@@ -3021,6 +3021,7 @@ type HealthzOptions struct {
 	JSEnabledOnly bool   `json:"js-enabled-only,omitempty"`
 	JSServerOnly  bool   `json:"js-server-only,omitempty"`
 	JSMetaOnly    bool   `json:"js-meta-only,omitempty"`
+	LeafRemotes   bool   `json:"leaf-remotes,omitempty"`
 	Account       string `json:"account,omitempty"`
 	Stream        string `json:"stream,omitempty"`
 	Consumer      string `json:"consumer,omitempty"`
@@ -3598,6 +3599,10 @@ func (s *Server) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	leafRemotes, err := decodeBool(w, r, "leaf-remotes")
+	if err != nil {
+		return
+	}
 
 	includeDetails, err := decodeBool(w, r, "details")
 	if err != nil {
@@ -3609,6 +3614,7 @@ func (s *Server) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 		JSEnabledOnly: jsEnabledOnly,
 		JSServerOnly:  jsServerOnly,
 		JSMetaOnly:    jsMetaOnly,
+		LeafRemotes:   leafRemotes,
 		Account:       r.URL.Query().Get("account"),
 		Stream:        r.URL.Query().Get("stream"),
 		Consumer:      r.URL.Query().Get("consumer"),
@@ -3700,6 +3706,22 @@ func (s *Server) healthz(opts *HealthzOptions) *HealthStatus {
 			})
 		}
 		return health
+	}
+
+	// If requested, make sure every enabled solicited leafnode remote is connected.
+	if opts.LeafRemotes {
+		if errs := s.disconnectedLeafRemotes(); len(errs) > 0 {
+			health.StatusCode = http.StatusServiceUnavailable
+			health.Status = "unavailable"
+			if !details {
+				health.Error = strings.Join(errs, "; ")
+				return health
+			}
+			for _, e := range errs {
+				health.Errors = append(health.Errors, HealthzError{Type: HealthzErrorConn, Error: e})
+			}
+			return health
+		}
 	}
 
 	// If JSServerOnly is true, then do not check further accounts, streams and consumers.
@@ -4390,4 +4412,39 @@ func (s *Server) Raftz(opts *RaftzOptions) *RaftzStatus {
 	}
 
 	return &infos
+}
+
+// disconnectedLeafRemotes returns a description of each enabled solicited
+// leafnode remote that does not currently have an established connection.
+func (s *Server) disconnectedLeafRemotes() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.leafRemoteCfgs) == 0 {
+		return nil
+	}
+	connected := make(map[*leafNodeCfg]struct{}, len(s.leafs))
+	for _, c := range s.leafs {
+		c.mu.Lock()
+		if c.leaf != nil && c.leaf.remote != nil {
+			connected[c.leaf.remote] = struct{}{}
+		}
+		c.mu.Unlock()
+	}
+	var errs []string
+	for cfg := range s.leafRemoteCfgs {
+		if !cfg.stillValid() {
+			continue
+		}
+		if _, ok := connected[cfg]; !ok {
+			// Only report the account and redacted URLs. The remote name also includes
+			// the credentials file path, which should not be exposed on this endpoint.
+			acc := cfg.LocalAccount
+			if acc == _EMPTY_ {
+				acc = globalAccountName
+			}
+			errs = append(errs, fmt.Sprintf("leafnode remote for account %q (urls=%q) is not connected", acc, redactURLList(cfg.URLs)))
+		}
+	}
+	sort.Strings(errs)
+	return errs
 }
