@@ -5061,7 +5061,7 @@ func (s *Server) extendPeerSet(n RaftNode, actual []*Peer, actualPeers, current,
 	if catchingUp {
 		// A heartbeat gets a learner to report its progress sooner.
 		n.SendHeartbeat()
-		return mstat(MigrationStatusCatchup, "waiting for peer to catch up before adding it")
+		return mstat(MigrationStatusCatchup, "waiting for catchup to add peer")
 	}
 	if add == _EMPTY_ {
 		// We haven't heard from any candidates, send a heartbeat now to get them to respond
