@@ -704,6 +704,46 @@ func (fs *fileStore) resetDurabilitySettingsLocked() {
 	fs.updateDurabilitySettingsLocked(fs.cfg.Replicas > 1)
 }
 
+// updateAsyncFlushLocked enables or disables async flush based on replication and persist mode.
+// Lock should be held.
+func (fs *fileStore) updateAsyncFlushLocked() error {
+	lmb := fs.lmb
+	if lmb == nil {
+		return nil
+	}
+	// Enable/disable async flush depending on if it's supported and already initialized.
+	supportsAsyncFlush := !fs.fcfg.SyncAlways && fs.cfg.Replicas > 1
+
+	// Async persist mode opts in to async flushing,
+	// sync always would also be disabled if it was configured.
+	if fs.cfg.PersistMode == AsyncPersistMode {
+		supportsAsyncFlush = true
+		fs.fcfg.SyncAlways = false
+		fs.syncAlways.Store(false)
+	}
+
+	if supportsAsyncFlush && !fs.fcfg.AsyncFlush {
+		fs.fcfg.AsyncFlush = true
+		lmb.spinUpFlushLoop()
+	} else if !supportsAsyncFlush && fs.fcfg.AsyncFlush {
+		fs.fcfg.AsyncFlush = false
+		lmb.mu.Lock()
+		// Quit the flush loop.
+		if lmb.qch != nil {
+			close(lmb.qch)
+			lmb.qch = nil
+		}
+		_, err := lmb.flushPendingMsgsLocked()
+		lmb.mu.Unlock()
+		if err != nil {
+			return err
+		}
+	}
+	// Set flush in place to AsyncFlush which by default is false.
+	fs.fip = !fs.fcfg.AsyncFlush
+	return nil
+}
+
 // flushForScaleDown transitions a SyncOnFlush store back to SyncAlways.
 func (fs *fileStore) flushForScaleDown() error {
 	fs.mu.Lock()
@@ -797,39 +837,9 @@ func (fs *fileStore) UpdateConfig(cfg *StreamConfig) error {
 	}
 
 	fs.resetDurabilitySettingsLocked()
-
-	if lmb := fs.lmb; lmb != nil {
-		// Enable/disable async flush depending on if it's supported and already initialized.
-		supportsAsyncFlush := !fs.fcfg.SyncAlways && cfg.Replicas > 1
-
-		// Async persist mode opts in to async flushing,
-		// sync always would also be disabled if it was configured.
-		if cfg.PersistMode == AsyncPersistMode {
-			supportsAsyncFlush = true
-			fs.fcfg.SyncAlways = false
-			fs.syncAlways.Store(false)
-		}
-
-		if supportsAsyncFlush && !fs.fcfg.AsyncFlush {
-			fs.fcfg.AsyncFlush = true
-			lmb.spinUpFlushLoop()
-		} else if !supportsAsyncFlush && fs.fcfg.AsyncFlush {
-			fs.fcfg.AsyncFlush = false
-			lmb.mu.Lock()
-			// Quit the flush loop.
-			if lmb.qch != nil {
-				close(lmb.qch)
-				lmb.qch = nil
-			}
-			_, err := lmb.flushPendingMsgsLocked()
-			lmb.mu.Unlock()
-			if err != nil {
-				fs.mu.Unlock()
-				return err
-			}
-		}
-		// Set flush in place to AsyncFlush which by default is false.
-		fs.fip = !fs.fcfg.AsyncFlush
+	if err := fs.updateAsyncFlushLocked(); err != nil {
+		fs.mu.Unlock()
+		return err
 	}
 	fs.mu.Unlock()
 
