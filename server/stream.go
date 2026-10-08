@@ -1670,7 +1670,7 @@ func (mset *stream) rebuildDedupe() {
 // Raft log for replaying the tail of stream during
 // recovery.
 func (mset *stream) shouldReplayFromWAL() bool {
-	if mset == nil || mset.raftNode() == nil || mset.store.Type() != FileStorage {
+	if mset == nil || !mset.IsClustered() || mset.store.Type() != FileStorage {
 		return false
 	}
 	fs, ok := mset.store.(*fileStore)
@@ -3615,11 +3615,11 @@ func (mset *stream) processInboundMirrorMsg(m *inMsg) bool {
 	}
 
 	s, js, stype := mset.srv, mset.js, mset.cfg.Storage
-	node, term := mset.node, mset.term
+	isClustered, node, term := mset.isClustered(), mset.node, mset.term
 	mset.mu.Unlock()
 
 	var err error
-	if node != nil {
+	if isClustered {
 		if stype == FileStorage && isFileStoreMsgTooLarge(fileStoreMsgSize(m.subj, m.hdr, m.msg)) {
 			err = ErrMsgTooLarge
 		} else if js.limitsExceeded(stype) {
@@ -3694,10 +3694,9 @@ func (mset *stream) retryMirrorConsumer() error {
 
 // Lock should be held.
 func (mset *stream) skipMsgs(start, end uint64) error {
-	node, store := mset.node, mset.store
 	// If we are not clustered we can short circuit now with store.SkipMsgs
-	if node == nil {
-		if err := store.SkipMsgs(start, end-start+1); err != nil {
+	if !mset.isClustered() {
+		if err := mset.store.SkipMsgs(start, end-start+1); err != nil {
 			return err
 		}
 		mset.lseq = end
@@ -3707,7 +3706,7 @@ func (mset *stream) skipMsgs(start, end uint64) error {
 	// Must only be enabled once every peer in the cluster supports receiving
 	// deleteRangeOp in the normal apply path; older peers panic on unknown ops.
 	if mset.srv.getOpts().getFeatureFlag(FeatureFlagJsRaftDeleteRange) {
-		return node.Propose(mset.term, encodeDeleteRange(&DeleteRange{First: start, Num: end - start + 1}))
+		return mset.node.Propose(mset.term, encodeDeleteRange(&DeleteRange{First: start, Num: end - start + 1}))
 	}
 
 	var entries []*Entry
@@ -3715,7 +3714,7 @@ func (mset *stream) skipMsgs(start, end uint64) error {
 		entries = append(entries, newEntry(EntryNormal, encodeStreamMsg(_EMPTY_, _EMPTY_, nil, nil, seq-1, 0, false)))
 		// So a single message does not get too big.
 		if len(entries) > 10_000 {
-			if err := node.ProposeMulti(mset.term, entries); err != nil {
+			if err := mset.node.ProposeMulti(mset.term, entries); err != nil {
 				return err
 			}
 			// We need to re-create `entries` because there is a reference
@@ -3725,7 +3724,7 @@ func (mset *stream) skipMsgs(start, end uint64) error {
 	}
 	// Send all at once.
 	if len(entries) > 0 {
-		return node.ProposeMulti(mset.term, entries)
+		return mset.node.ProposeMulti(mset.term, entries)
 	}
 	return nil
 }
@@ -4951,7 +4950,7 @@ func (mset *stream) processInboundSourceMsg(si *sourceInfo, m *inMsg) bool {
 	}
 	// Receiving messages means we are not stalled on flow control.
 	mset.clearStalledFlowControl(si)
-	node, ident := mset.node, si.ident
+	isClustered, ident := mset.isClustered(), si.ident
 	mset.mu.Unlock()
 
 	hdr, msg := m.hdr, m.msg
@@ -4984,7 +4983,7 @@ func (mset *stream) processInboundSourceMsg(si *sourceInfo, m *inMsg) bool {
 
 	var err error
 	// If we are clustered we need to propose this message to the underlying raft group.
-	if node != nil {
+	if isClustered {
 		err = mset.processClusteredInboundMsg(m.subj, _EMPTY_, hdr, msg, nil, true)
 	} else {
 		err = mset.processJetStreamMsg(m.subj, _EMPTY_, hdr, msg, 0, 0, nil, true, true)

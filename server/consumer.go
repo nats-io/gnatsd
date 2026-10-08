@@ -1680,8 +1680,8 @@ func (o *consumer) setLeader(isLeader bool, term uint64) error {
 	o.term = term
 
 	if skipTeardown {
-		movingToClustered := o.node != nil && o.pch == nil
-		movingToNonClustered := o.node == nil && o.pch != nil
+		movingToClustered := o.isClustered() && o.pch == nil
+		movingToNonClustered := !o.isClustered() && o.pch != nil
 
 		// If we detect we are scaling up, make sure to create clustered routines and channels.
 		if movingToClustered {
@@ -1802,9 +1802,9 @@ func (o *consumer) setLeader(isLeader bool, term uint64) error {
 		// Restore our saved state.
 		// During non-leader status we just update our underlying store when not clustered.
 		// If clustered we need to propose our initial (possibly skipped ahead) o.sseq to the group.
-		if o.node == nil || o.dseq > 1 || (o.store != nil && o.store.HasState()) {
+		if !o.isClustered() || o.dseq > 1 || (o.store != nil && o.store.HasState()) {
 			o.readStoredState()
-		} else if o.node != nil && o.sseq >= 1 {
+		} else if o.isClustered() && o.sseq >= 1 {
 			o.updateSkipped(o.sseq)
 		}
 
@@ -1896,7 +1896,7 @@ func (o *consumer) setLeader(isLeader bool, term uint64) error {
 		qch := o.qch
 		node := o.node
 		var pch chan struct{}
-		if node != nil && o.pch == nil {
+		if o.isClustered() && o.pch == nil {
 			o.pch = make(chan struct{}, 1)
 			pch = o.pch
 		}
@@ -2912,7 +2912,7 @@ func (o *consumer) progressUpdate(seq uint64) {
 // Lock should be held.
 func (o *consumer) updateSkipped(seq uint64) {
 	// Clustered mode and R>1 only.
-	if o.node == nil || !o.isLeader() {
+	if !o.isClustered() || !o.isLeader() {
 		return
 	}
 	var b [1 + 8]byte
@@ -2966,7 +2966,7 @@ VALID:
 		seq = 1
 	}
 	// The replicated path requires quorum first before the reset actually takes effect.
-	if o.node != nil {
+	if o.isClustered() {
 		if !o.isLeader() {
 			return 0, false, nil
 		}
@@ -3093,7 +3093,7 @@ func (o *consumer) propose(entry []byte) {
 // Lock should be held.
 func (o *consumer) updateDelivered(dseq, sseq, dc uint64, ts int64) {
 	// Clustered mode and R>1.
-	if o.node != nil {
+	if o.isClustered() {
 		// Inline for now, use variable compression.
 		var b [4*binary.MaxVarintLen64 + 1]byte
 		b[0] = byte(updateDeliveredOp)
@@ -3143,7 +3143,7 @@ func (o *consumer) addReplicatedQueuedMsg(pmsg *jsPubMsg) {
 
 // Lock should be held.
 func (o *consumer) updateAcks(dseq, sseq uint64, reply string) {
-	if o.node != nil {
+	if o.isClustered() {
 		// Inline for now, use variable compression.
 		var b [2*binary.MaxVarintLen64 + 1]byte
 		b[0] = byte(updateAcksOp)
@@ -3168,7 +3168,7 @@ func (o *consumer) updateAcks(dseq, sseq uint64, reply string) {
 // Communicate to the cluster an addition of a pending request.
 // Lock should be held.
 func (o *consumer) addClusterPendingRequest(reply string) {
-	if o.node == nil || !o.pendingRequestsOk() {
+	if !o.isClustered() || !o.pendingRequestsOk() {
 		return
 	}
 	b := make([]byte, len(reply)+1)
@@ -3180,7 +3180,7 @@ func (o *consumer) addClusterPendingRequest(reply string) {
 // Communicate to the cluster a removal of a pending request.
 // Lock should be held.
 func (o *consumer) removeClusterPendingRequest(reply string) {
-	if o.node == nil || !o.pendingRequestsOk() {
+	if !o.isClustered() || !o.pendingRequestsOk() {
 		return
 	}
 	b := make([]byte, len(reply)+1)
@@ -3792,11 +3792,11 @@ func (o *consumer) processAckMsgLocked(sseq, dseq, dc uint64, reply string, doSa
 	}
 
 	// Let the owning stream know if we are interest or workqueue retention based.
-	// If this consumer is clustered (o.node != nil) this will be handled by
+	// If this consumer is clustered this will be handled by
 	// processReplicatedAck after the ack has propagated.
 	// If we're already holding the lock we can't ack in place, since that will
 	// violate lock ordering with respect to the stream.
-	ackInPlace := o.node == nil && o.retention != LimitsPolicy && needLock
+	ackInPlace := !o.isClustered() && o.retention != LimitsPolicy && needLock
 
 	var ackAllSeqs []uint64
 	var needSignal bool
@@ -4457,7 +4457,7 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 					hdr := fmt.Appendf(nil, "NATS/1.0 423 Nats-Wrong-Pin-Id\r\n%s: %d\r\n%s: %d\r\n\r\n", JSPullRequestPendingMsgs, wr.n, JSPullRequestPendingBytes, wr.b)
 					o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
 					o.waiting.removeCurrent()
-					if o.node != nil {
+					if o.isClustered() {
 						o.removeClusterPendingRequest(wr.reply)
 					}
 					wr.recycle()
@@ -4479,7 +4479,7 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 					hdr := fmt.Appendf(nil, "NATS/1.0 423 Nats-Wrong-Pin-Id\r\n%s: %d\r\n%s: %d\r\n\r\n", JSPullRequestPendingMsgs, wr.n, JSPullRequestPendingBytes, wr.b)
 					o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
 					o.waiting.removeCurrent()
-					if o.node != nil {
+					if o.isClustered() {
 						o.removeClusterPendingRequest(wr.reply)
 					}
 					wr.recycle()
@@ -4525,7 +4525,7 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 					}
 					// Remove the current one, no longer valid due to max bytes limit.
 					o.waiting.removeCurrent()
-					if o.node != nil {
+					if o.isClustered() {
 						o.removeClusterPendingRequest(wr.reply)
 					}
 					wr.recycle()
@@ -4560,7 +4560,7 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 				o.waiting.last = wr.expires
 			}
 			o.waiting.removeCurrent()
-			if o.node != nil {
+			if o.isClustered() {
 				o.removeClusterPendingRequest(wr.reply)
 			}
 			wr.recycle()
@@ -4574,7 +4574,7 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 		}
 		// Remove the current one, no longer valid.
 		o.waiting.removeCurrent()
-		if o.node != nil {
+		if o.isClustered() {
 			o.removeClusterPendingRequest(wr.reply)
 		}
 		wr.recycle()
@@ -4830,7 +4830,7 @@ func (o *consumer) processNextMsgRequest(reply string, msg []byte) {
 	}
 	o.signalNewMessages()
 	// If we are clustered update our followers about this request.
-	if o.node != nil {
+	if o.isClustered() {
 		o.addClusterPendingRequest(wr.reply)
 	}
 }
@@ -5107,7 +5107,7 @@ func (o *consumer) processWaiting(eos bool) (int, int, int, time.Time) {
 	wq := o.waiting
 	remove := func(pre, wr *waitingRequest) *waitingRequest {
 		expired++
-		if o.node != nil {
+		if o.isClustered() {
 			o.removeClusterPendingRequest(wr.reply)
 		}
 		next := wr.next
@@ -5540,7 +5540,7 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 				pmsg.buf = append(pmsg.hdr, pmsg.msg...)
 				sz = len(pmsg.subj) + len(ackReply) + len(pmsg.hdr) + len(pmsg.msg)
 			}
-			if done := wr.recycleIfDone(); done && o.node != nil {
+			if done := wr.recycleIfDone(); done && o.isClustered() {
 				o.removeClusterPendingRequest(dsubj)
 			} else if !done && wr.hb > 0 {
 				wr.hbt = time.Now().Add(wr.hb)
@@ -5874,7 +5874,7 @@ func (o *consumer) deliverMsg(dsubj, ackReply string, pmsg *jsPubMsg, dc uint64,
 
 	// If we are ack none and mset is interest only we should make sure stream removes interest.
 	if ap == AckNone && rp != LimitsPolicy {
-		if mset != nil && mset.ackq != nil && (o.node == nil || o.direct) {
+		if mset != nil && mset.ackq != nil && (!o.isClustered() || o.direct) {
 			mset.ackq.push(seq)
 		} else {
 			o.updateAcks(dseq, seq, _EMPTY_)
@@ -5888,7 +5888,19 @@ func (o *consumer) deliverMsg(dsubj, ackReply string, pmsg *jsPubMsg, dc uint64,
 // We can send immediately if not replicated, not using acks, or using flow control (incompatible).
 // Lock should be held.
 func (o *consumer) replicateDeliveries() bool {
-	return o.node != nil && o.cfg.AckPolicy != AckNone && !o.cfg.FlowControl
+	return o.isClustered() && o.cfg.AckPolicy != AckNone && !o.cfg.FlowControl
+}
+
+// IsClustered returns whether updates are proposed to the node.
+func (o *consumer) IsClustered() bool {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.isClustered()
+}
+
+// Lock should be held.
+func (o *consumer) isClustered() bool {
+	return o.node != nil
 }
 
 func (o *consumer) needFlowControl(sz int) bool {

@@ -9088,7 +9088,7 @@ func (js *jetStream) processConsumerLeaderChangeWithAssignment(o *consumer, ca *
 		// Only log if the consumer is replicated and/or durable.
 		// Logging about R1 ephemerals, like KV watchers, is mostly noise since the leader will always be known.
 		o.mu.RLock()
-		isReplicated, durable := o.node != nil, o.isDurable()
+		isReplicated, durable := o.isClustered(), o.isDurable()
 		o.mu.RUnlock()
 		if isReplicated || durable {
 			s.Noticef("JetStream cluster new consumer leader for '%s > %s > %s'", ca.Client.serviceAccount(), streamName, consumerName)
@@ -13535,7 +13535,7 @@ func (mset *stream) isCatchingUp() bool {
 // Determine if a non-leader is current.
 // Lock should be held.
 func (mset *stream) isCurrent() bool {
-	if mset.node == nil {
+	if !mset.isClustered() {
 		return true
 	}
 	return mset.node.Current() && !mset.catchup.Load()
