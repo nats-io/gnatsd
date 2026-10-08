@@ -4596,6 +4596,122 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 		batch.clearBatchState()
 	}()
 
+	// applyQueued applies committed entries. It returns false if the monitor must exit.
+	applyQueued := func() bool {
+		var ne, nb uint64
+		// If we bump clfs we will want to write out snapshot if within our time window.
+		pclfs := mset.getCLFS()
+
+		ces := aq.pop()
+		for _, ce := range ces {
+			// No special processing needed for when we are caught up on restart.
+			if ce == nil {
+				if !isRecovering {
+					continue
+				}
+				isRecovering = false
+				// If we are interest based make sure to check consumers if interest retention policy.
+				// This is to make sure we process any outstanding acks from all consumers.
+				if mset != nil && mset.isInterestRetention() {
+					fire := time.Duration(rand.IntN(5)+5) * time.Second
+					time.AfterFunc(fire, mset.checkInterestState)
+				}
+				// If we became leader during this time and we need to send a snapshot to our
+				// followers, i.e. as a result of a scale-up from R1, do it now.
+				if sendSnapshot && isLeader && mset != nil && n != nil {
+					n.SendSnapshot(mset.stateSnapshot())
+					sendSnapshot = false
+				}
+				continue
+			} else if len(ce.Entries) == 0 {
+				// If we have a partial batch, it needs to be rejected to ensure CLFS is correct.
+				if mset != nil && batch != nil && batch.id != _EMPTY_ {
+					batch.rejectBatchState(mset)
+				}
+
+				// Entry could be empty on a restore when mset is nil.
+				ne, nb = n.Applied(ce.Index)
+				ce.ReturnToPool()
+				continue
+			}
+
+			// While migrating, react quickly to peer add/remove entries.
+			if mmt != nil {
+				for _, e := range ce.Entries {
+					if e.Type == EntryAddPeer || e.Type == EntryRemovePeer {
+						startMigrationMonitoring()
+						break
+					}
+				}
+			}
+
+			// Apply our entries.
+			if maxApplied, err := js.applyStreamEntries(mset, n, ce, isRecovering, batch); err == nil {
+				// Update our applied.
+				if maxApplied > 0 {
+					// Indicate we've processed (but not applied) everything up to this point.
+					ne, nb = n.Processed(ce.Index, min(maxApplied, ce.Index))
+					// Don't return entry to the pool, this is handled by the in-progress batch.
+				} else {
+					ne, nb = n.Applied(ce.Index)
+					ce.ReturnToPool()
+				}
+			} else {
+				// Make sure to clean up.
+				ce.ReturnToPool()
+				// Our stream was closed out from underneath of us, simply return here.
+				if err == errStreamClosed || err == errCatchupStreamStopped || err == ErrServerNotRunning {
+					aq.recycle(&ces)
+					return false
+				}
+				s.Errorf("Error applying stream entries to '%s > %s': %v", accName, sa.Config.Name, err)
+				if isClusterResetErr(err) {
+					if mset.isMirror() && mset.IsLeader() {
+						mset.retryMirrorConsumer()
+						continue
+					}
+					// If the error signals we timed out of a snapshot, we should try to replay the snapshot
+					// instead of fully resetting the state. Resetting the clustered state may result in
+					// race conditions and should only be used as a last effort attempt.
+					if errors.Is(err, errCatchupAbortedNoLeader) || err == errCatchupTooManyRetries || err == errAlreadyLeader {
+						if n.DrainAndReplaySnapshot() {
+							break
+						} else if n.IsDeleted() {
+							// The only reason we can't replay is our node being deleted, which
+							// means the meta layer is deliberately tearing this monitor down.
+							// Don't fall through to a reset, that would resurrect this group.
+							s.Warnf("Will not reset stream '%s > %s', raft group %q was removed",
+								accName, sa.Config.Name, n.Group())
+							aq.recycle(&ces)
+							return false
+						}
+					}
+					// We will attempt to reset our cluster state.
+					if mset.resetClusteredState(n, err) {
+						aq.recycle(&ces)
+						return false
+					}
+				} else if isOutOfSpaceErr(err) {
+					// If applicable this will tear all of this down, but don't assume so and return.
+					s.handleOutOfSpace(mset)
+				} else {
+					// Encountered an unexpected error, can't continue.
+					mset.setWriteErr(err)
+					aq.recycle(&ces)
+					return false
+				}
+			}
+		}
+		aq.recycle(&ces)
+
+		// Check about snapshotting
+		// If we have at least min entries to compact, go ahead and try to snapshot/compact.
+		if ne >= compactNumMin || nb > compactSizeMin || mset.getCLFS() > pclfs {
+			doSnapshot(false)
+		}
+		return true
+	}
+
 	for {
 		select {
 		case <-s.quitCh:
@@ -4614,116 +4730,8 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 			// Raft node is closed, no use in trying to snapshot.
 			return
 		case <-aq.ch:
-			var ne, nb uint64
-			// If we bump clfs we will want to write out snapshot if within our time window.
-			pclfs := mset.getCLFS()
-
-			ces := aq.pop()
-			for _, ce := range ces {
-				// No special processing needed for when we are caught up on restart.
-				if ce == nil {
-					if !isRecovering {
-						continue
-					}
-					isRecovering = false
-					// If we are interest based make sure to check consumers if interest retention policy.
-					// This is to make sure we process any outstanding acks from all consumers.
-					if mset != nil && mset.isInterestRetention() {
-						fire := time.Duration(rand.IntN(5)+5) * time.Second
-						time.AfterFunc(fire, mset.checkInterestState)
-					}
-					// If we became leader during this time and we need to send a snapshot to our
-					// followers, i.e. as a result of a scale-up from R1, do it now.
-					if sendSnapshot && isLeader && mset != nil && n != nil {
-						n.SendSnapshot(mset.stateSnapshot())
-						sendSnapshot = false
-					}
-					continue
-				} else if len(ce.Entries) == 0 {
-					// If we have a partial batch, it needs to be rejected to ensure CLFS is correct.
-					if mset != nil && batch != nil && batch.id != _EMPTY_ {
-						batch.rejectBatchState(mset)
-					}
-
-					// Entry could be empty on a restore when mset is nil.
-					ne, nb = n.Applied(ce.Index)
-					ce.ReturnToPool()
-					continue
-				}
-
-				// While migrating, react quickly to peer add/remove entries.
-				if mmt != nil {
-					for _, e := range ce.Entries {
-						if e.Type == EntryAddPeer || e.Type == EntryRemovePeer {
-							startMigrationMonitoring()
-							break
-						}
-					}
-				}
-
-				// Apply our entries.
-				if maxApplied, err := js.applyStreamEntries(mset, n, ce, isRecovering, batch); err == nil {
-					// Update our applied.
-					if maxApplied > 0 {
-						// Indicate we've processed (but not applied) everything up to this point.
-						ne, nb = n.Processed(ce.Index, min(maxApplied, ce.Index))
-						// Don't return entry to the pool, this is handled by the in-progress batch.
-					} else {
-						ne, nb = n.Applied(ce.Index)
-						ce.ReturnToPool()
-					}
-				} else {
-					// Make sure to clean up.
-					ce.ReturnToPool()
-					// Our stream was closed out from underneath of us, simply return here.
-					if err == errStreamClosed || err == errCatchupStreamStopped || err == ErrServerNotRunning {
-						aq.recycle(&ces)
-						return
-					}
-					s.Errorf("Error applying stream entries to '%s > %s': %v", accName, sa.Config.Name, err)
-					if isClusterResetErr(err) {
-						if mset.isMirror() && mset.IsLeader() {
-							mset.retryMirrorConsumer()
-							continue
-						}
-						// If the error signals we timed out of a snapshot, we should try to replay the snapshot
-						// instead of fully resetting the state. Resetting the clustered state may result in
-						// race conditions and should only be used as a last effort attempt.
-						if errors.Is(err, errCatchupAbortedNoLeader) || err == errCatchupTooManyRetries || err == errAlreadyLeader {
-							if n.DrainAndReplaySnapshot() {
-								break
-							} else if n.IsDeleted() {
-								// The only reason we can't replay is our node being deleted, which
-								// means the meta layer is deliberately tearing this monitor down.
-								// Don't fall through to a reset, that would resurrect this group.
-								s.Warnf("Will not reset stream '%s > %s', raft group %q was removed",
-									accName, sa.Config.Name, n.Group())
-								aq.recycle(&ces)
-								return
-							}
-						}
-						// We will attempt to reset our cluster state.
-						if mset.resetClusteredState(n, err) {
-							aq.recycle(&ces)
-							return
-						}
-					} else if isOutOfSpaceErr(err) {
-						// If applicable this will tear all of this down, but don't assume so and return.
-						s.handleOutOfSpace(mset)
-					} else {
-						// Encountered an unexpected error, can't continue.
-						mset.setWriteErr(err)
-						aq.recycle(&ces)
-						return
-					}
-				}
-			}
-			aq.recycle(&ces)
-
-			// Check about snapshotting
-			// If we have at least min entries to compact, go ahead and try to snapshot/compact.
-			if ne >= compactNumMin || nb > compactSizeMin || mset.getCLFS() > pclfs {
-				doSnapshot(false)
+			if !applyQueued() {
+				return
 			}
 
 		case lc := <-lch:
@@ -8343,6 +8351,54 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 	var isLeader bool
 	var leaderTerm uint64
 
+	// applyQueued applies committed entries. It returns false if the monitor must exit.
+	applyQueued := func() bool {
+		ces := aq.pop()
+		for _, ce := range ces {
+			// No special processing needed for when we are caught up on restart.
+			if ce == nil {
+				if !recovering {
+					continue
+				}
+				recovering = false
+				if n.NeedSnapshot() {
+					doSnapshot(true)
+				}
+				continue
+			}
+			// While migrating, react quickly to peer add/remove entries.
+			if mmt != nil {
+				for _, e := range ce.Entries {
+					if e.Type == EntryAddPeer || e.Type == EntryRemovePeer {
+						startMigrationMonitoring()
+						break
+					}
+				}
+			}
+			if err := js.applyConsumerEntries(o, ce, isLeader); err == nil {
+				var ne, nb uint64
+				// We can't guarantee writes are flushed while we're shutting down. Just rely on replay during recovery.
+				if !js.isShuttingDown() {
+					ne, nb = n.Applied(ce.Index)
+				}
+				// If we have at least min entries to compact, go ahead and snapshot/compact.
+				if nb > 0 && ne >= compactNumMin || nb > compactSizeMin {
+					doSnapshot(false)
+				}
+			} else if err != errConsumerClosed {
+				s.Errorf("Error applying consumer entries to '%s > %s': %v", ca.Client.serviceAccount(), ca.Name, err)
+				// Encountered an unexpected error, can't continue.
+				o.setWriteErr(err)
+				ce.ReturnToPool()
+				aq.recycle(&ces)
+				return false
+			}
+			ce.ReturnToPool()
+		}
+		aq.recycle(&ces)
+		return true
+	}
+
 	for {
 		select {
 		case <-s.quitCh:
@@ -8361,49 +8417,9 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 			// Raft node is closed, no use in trying to snapshot.
 			return
 		case <-aq.ch:
-			ces := aq.pop()
-			for _, ce := range ces {
-				// No special processing needed for when we are caught up on restart.
-				if ce == nil {
-					if !recovering {
-						continue
-					}
-					recovering = false
-					if n.NeedSnapshot() {
-						doSnapshot(true)
-					}
-					continue
-				}
-				// While migrating, react quickly to peer add/remove entries.
-				if mmt != nil {
-					for _, e := range ce.Entries {
-						if e.Type == EntryAddPeer || e.Type == EntryRemovePeer {
-							startMigrationMonitoring()
-							break
-						}
-					}
-				}
-				if err := js.applyConsumerEntries(o, ce, isLeader); err == nil {
-					var ne, nb uint64
-					// We can't guarantee writes are flushed while we're shutting down. Just rely on replay during recovery.
-					if !js.isShuttingDown() {
-						ne, nb = n.Applied(ce.Index)
-					}
-					// If we have at least min entries to compact, go ahead and snapshot/compact.
-					if nb > 0 && ne >= compactNumMin || nb > compactSizeMin {
-						doSnapshot(false)
-					}
-				} else if err != errConsumerClosed {
-					s.Errorf("Error applying consumer entries to '%s > %s': %v", ca.Client.serviceAccount(), ca.Name, err)
-					// Encountered an unexpected error, can't continue.
-					o.setWriteErr(err)
-					ce.ReturnToPool()
-					aq.recycle(&ces)
-					return
-				}
-				ce.ReturnToPool()
+			if !applyQueued() {
+				return
 			}
-			aq.recycle(&ces)
 
 		case lc := <-lch:
 			// Not a change in leadership, just a nudge about a newly observed peer.
