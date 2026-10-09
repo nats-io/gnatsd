@@ -11604,6 +11604,16 @@ func TestJetStreamConsumerCheckNumPending(t *testing.T) {
 	o := mset.lookupConsumer("DURABLE")
 	require_NotNil(t, o)
 
+	// Wait for the consumer to see all 5 messages
+	checkFor(t, time.Second, time.Millisecond, func() error {
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		if np := o.numPending(); np != 5 {
+			return fmt.Errorf("pending: %d, want 5", np)
+		}
+		return nil
+	})
+
 	// Initial state should point to the first message, with all 5 pending.
 	o.mu.Lock()
 	sseq, np := o.sseq, o.numPending()
