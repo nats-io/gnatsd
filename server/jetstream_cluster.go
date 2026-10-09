@@ -6045,7 +6045,7 @@ func (js *jetStream) applyStreamMsgOp(mset *stream, op entryOp, mbuf []byte, isR
 			// Decrement from pending operations. Once it reaches zero, it can be deleted.
 			if i.ops > 0 {
 				var sz uint64
-				if mset.store.Type() == FileStorage {
+				if mset.stype == FileStorage {
 					sz = fileStoreMsgSizeRaw(len(csubject), len(hdr), len(msg))
 				} else {
 					sz = memStoreMsgSizeRaw(len(csubject), len(hdr), len(msg))
