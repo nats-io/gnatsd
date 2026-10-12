@@ -3822,12 +3822,14 @@ func TestJetStreamClusterNoR1AssetsDuringLameDuck(t *testing.T) {
 	nc, js := jsClientConnect(t, c.servers[2])
 	defer nc.Close()
 
+	// Connect to the third server as the system account.
+	snc, _ := jsClientConnect(t, c.servers[2], nats.UserInfo("admin", "s3cr3t!"))
+	defer snc.Close()
+
 	// Now put the first server into lame duck mode.
 	go s.lameDuckMode()
 
-	// Wait for news to arrive that the first server has gone into
-	// lame duck mode and been marked offline.
-	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+	checkOffline := func() error {
 		id := s.info.ID
 		s := c.servers[2]
 		s.mu.RLock()
@@ -3847,7 +3849,19 @@ func TestJetStreamClusterNoR1AssetsDuringLameDuck(t *testing.T) {
 			return fmt.Errorf("first node is still online unexpectedly")
 		}
 		return nil
-	})
+	}
+
+	// Wait for news to arrive that the first server has gone into
+	// lame duck mode and been marked offline.
+	checkFor(t, 2*time.Second, 50*time.Millisecond, checkOffline)
+
+	// Request a statsz broadcast, it must not mark the first server online again.
+	require_NoError(t, snc.Publish(fmt.Sprintf("$SYS.REQ.SERVER.%s.STATSZ", s.ID()), nil))
+	require_NoError(t, snc.Flush())
+	for range 10 {
+		time.Sleep(50 * time.Millisecond)
+		require_NoError(t, checkOffline())
+	}
 
 	// Create a go routine that will create streams constantly.
 	qch := make(chan bool)
@@ -3884,6 +3898,78 @@ func TestJetStreamClusterNoR1AssetsDuringLameDuck(t *testing.T) {
 		time.Sleep(15 * time.Millisecond)
 	}
 	s.WaitForShutdown()
+}
+
+func TestJetStreamClusterRepliesDuringLameDuck(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	// Grab the meta leader and set lameduck option directly.
+	// It has a leader to transfer, so JetStream stays up for a second in LDM.
+	s := c.leader()
+	s.optsMu.Lock()
+	s.opts.LameDuckDuration = 5 * time.Second
+	s.opts.LameDuckGracePeriod = -5 * time.Second
+	s.optsMu.Unlock()
+
+	// Connect to the server to keep it alive when we go into LDM.
+	dummy, _ := jsClientConnect(t, s)
+	defer dummy.Close()
+
+	// Connect to another server, as a user and as the system account.
+	rs := c.randomNonLeader()
+	nc, js := jsClientConnect(t, rs)
+	defer nc.Close()
+	snc, _ := jsClientConnect(t, rs, nats.UserInfo("admin", "s3cr3t!"))
+	defer snc.Close()
+
+	// Create R1 streams until one is placed on the lameduck server.
+	var stream string
+	var index int
+	checkFor(t, 5*time.Second, time.Millisecond, func() error {
+		index++
+		stream = fmt.Sprintf("TEST_%d", index)
+		_, err := js.AddStream(&nats.StreamConfig{Name: stream, Replicas: 1})
+		require_NoError(t, err)
+		if c.streamLeader(globalAccountName, stream) != s {
+			return fmt.Errorf("Stream not placed on the lameduck server")
+		}
+		return nil
+	})
+
+	// Now put the server into lame duck mode.
+	go s.lameDuckMode()
+
+	// Wait for news to arrive that the server has gone into
+	// lame duck mode and been marked offline.
+	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		id := s.info.ID
+		rs.mu.RLock()
+		defer rs.mu.RUnlock()
+		var isOffline bool
+		rs.nodeToInfo.Range(func(_, v any) bool {
+			ni := v.(nodeInfo)
+			if ni.id == id {
+				isOffline = ni.offline
+				return false
+			}
+			return true
+		})
+		if !isOffline {
+			return fmt.Errorf("Lameduck server is still online unexpectedly")
+		}
+		return nil
+	})
+
+	// The lameduck server must still reply to requests it serves.
+	_, err := js.StreamInfo(stream, nats.MaxWait(250*time.Millisecond))
+	if err != nil {
+		t.Fatalf("No stream info reply from the lameduck server: %v", err)
+	}
+	_, err = snc.Request(fmt.Sprintf("$SYS.REQ.SERVER.%s.VARZ", s.ID()), nil, 250*time.Millisecond)
+	if err != nil {
+		t.Fatalf("No varz reply from the lameduck server: %v", err)
+	}
 }
 
 // If a consumer has not been registered (possible in heavily loaded systems with lots of assets)
