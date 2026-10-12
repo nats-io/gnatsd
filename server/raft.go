@@ -4410,6 +4410,7 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 
 	if isNew && n.leader != ae.leader && n.State() == Follower {
 		n.debug("AppendEntry updating leader to %q", ae.leader)
+		n.lxfer = false
 		n.updateLeader(ae.leader)
 		n.writeTermVote()
 		n.resetElectionTimeout()
@@ -4647,6 +4648,10 @@ CONTINUE:
 						// Here we can become a leader but need to wait for resume of the apply queue.
 						n.lxfer = true
 					}
+				} else if !n.observer {
+					// Campaign early in case the successor is slow to take over.
+					// Randomized so followers don't split the vote.
+					n.resetElect(minElectionTimeout/4 + randCampaignTimeout())
 				}
 			}
 		case EntryAddPeer:
@@ -5614,7 +5619,12 @@ func (n *raft) switchToCandidate() {
 	// If we are catching up or are in observer mode we can not switch.
 	// Avoid petitioning to become leader if we're behind on applies.
 	if n.observer || n.paused || n.processed < n.commit {
-		n.resetElect(minElectionTimeout / 4)
+		if n.lxfer {
+			// A transfer target retries quickly, before the other followers campaign.
+			n.resetElect(minCampaignTimeout)
+		} else {
+			n.resetElect(minElectionTimeout / 4)
+		}
 		return
 	}
 
