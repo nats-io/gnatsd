@@ -2509,8 +2509,13 @@ func (o *consumer) setRateLimit(bps uint64) {
 
 	// TODO(dlc) - Make sane values or error if not sane?
 	// We are configured in bits per sec so adjust to bytes.
-	rl := rate.Limit(bps / 8)
+	// Float division, otherwise below 8 bps the limit is 0 and delivery stalls forever.
+	rl := rate.Limit(float64(bps) / 8)
 	mset := o.mset
+	// The consumer is stopping.
+	if mset == nil {
+		return
+	}
 
 	// Burst should be set to maximum msg size for this account, etc.
 	var burst int
@@ -2529,7 +2534,18 @@ func (o *consumer) setRateLimit(bps uint64) {
 			burst = int(acc.srv.getOpts().MaxPayload)
 		}
 	}
+	// A max_payload of -1 means no limit, but the burst must be positive.
+	if burst <= 0 {
+		burst = MAX_PAYLOAD_SIZE
+	}
 
+	// Update in place to keep the current tokens, so the bucket is not refilled.
+	if o.rlimit != nil {
+		now := time.Now()
+		o.rlimit.SetLimitAt(now, rl)
+		o.rlimit.SetBurstAt(now, burst)
+		return
+	}
 	o.rlimit = rate.NewLimiter(rl, burst)
 }
 
@@ -5569,9 +5585,17 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 		// If we have a rate limit set make sure we check that here.
 		if o.rlimit != nil {
 			now := time.Now()
-			r := o.rlimit.ReserveN(now, sz)
-			delay := r.DelayFrom(now)
-			if delay > 0 {
+			var r *rate.Reservation
+			if burst := o.rlimit.Burst(); sz > burst {
+				// A reservation larger than burst is never allowed, so raise it just for this one.
+				o.rlimit.SetBurstAt(now, sz)
+				r = o.rlimit.ReserveN(now, sz)
+				// The debt carries over after restoring.
+				o.rlimit.SetBurstAt(now, burst)
+			} else {
+				r = o.rlimit.ReserveN(now, sz)
+			}
+			if delay := r.DelayFrom(now); delay > 0 {
 				o.mu.Unlock()
 				select {
 				case <-qch:

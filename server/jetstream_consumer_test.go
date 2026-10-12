@@ -13394,6 +13394,107 @@ func TestJetStreamConsumerSetRateLimitAccountMpayRace(t *testing.T) {
 	wg.Wait()
 }
 
+func TestJetStreamConsumerRateLimitMsgLargerThanBurst(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	// Burst becomes MaxMsgSize (1024 bytes).
+	cfg := &nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}, MaxMsgSize: 1024}
+	_, err := js.AddStream(cfg)
+	require_NoError(t, err)
+
+	// Payload fits MaxMsgSize, but subject+reply+payload exceeds the burst.
+	_, err = js.Publish("foo", make([]byte, 1000))
+	require_NoError(t, err)
+	_, err = js.Publish("foo", []byte("small"))
+	require_NoError(t, err)
+
+	sub, err := nc.SubscribeSync("deliver")
+	require_NoError(t, err)
+	defer sub.Unsubscribe()
+
+	// 1 Mbit/s, so 1 KB should arrive in ~8ms.
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:        "C",
+		DeliverSubject: "deliver",
+		AckPolicy:      nats.AckExplicitPolicy,
+		RateLimit:      1024 * 1024,
+	})
+	require_NoError(t, err)
+
+	for i := range 2 {
+		_, err = sub.NextMsg(2 * time.Second)
+		if err != nil {
+			t.Fatalf("msg %d not delivered: %v", i+1, err)
+		}
+	}
+
+	mset, err := s.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	o := mset.lookupConsumer("C")
+	require_NotNil(t, o)
+	burst := func() int {
+		o.mu.RLock()
+		defer o.mu.RUnlock()
+		return o.rlimit.Burst()
+	}
+	require_Equal(t, burst(), 1024)
+
+	// The burst follows MaxMsgSize updates.
+	for _, size := range []int32{16 * 1024, 2048} {
+		cfg.MaxMsgSize = size
+		_, err = js.UpdateStream(cfg)
+		require_NoError(t, err)
+		require_Equal(t, burst(), int(size))
+	}
+}
+
+func TestJetStreamConsumerRateLimitUnlimitedMaxPayload(t *testing.T) {
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:-1
+		max_payload: -1
+		jetstream: {store_dir: %q}
+	`, t.TempDir())))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+
+	// The Go client refuses to publish with a negative max payload, so work server-side.
+	// Without MaxMsgSize the burst falls back to max_payload.
+	mset, err := s.globalAccount().addStream(&StreamConfig{Name: "TEST", Subjects: []string{"foo"}})
+	require_NoError(t, err)
+	_, _, err = mset.store.StoreMsg("foo", nil, []byte("hello"), 0)
+	require_NoError(t, err)
+
+	sub, err := nc.SubscribeSync("deliver")
+	require_NoError(t, err)
+	defer sub.Unsubscribe()
+	require_NoError(t, nc.Flush())
+
+	// 4 bps is half a byte per second, which must not round down to no rate at all.
+	o, err := mset.addConsumer(&ConsumerConfig{
+		Durable:        "C",
+		DeliverSubject: "deliver",
+		AckPolicy:      AckNone,
+		RateLimit:      4,
+	})
+	require_NoError(t, err)
+
+	// Fits in the initial burst, so it's delivered right away.
+	_, err = sub.NextMsg(2 * time.Second)
+	require_NoError(t, err)
+
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	require_Equal(t, o.rlimit.Limit(), 0.5)
+	require_Equal(t, o.rlimit.Burst(), MAX_PAYLOAD_SIZE)
+}
+
 // https://github.com/nats-io/nats-server/issues/8381
 
 func TestJetStreamConsumerUpdateRejectsStorageChange(t *testing.T) {
