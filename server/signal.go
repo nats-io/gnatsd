@@ -76,7 +76,7 @@ func (s *Server) handleSignal(sig os.Signal) {
 		// File log re-open for rotating file logs.
 		s.ReOpenLogFile()
 	case syscall.SIGUSR2:
-		go s.lameDuckMode()
+		s.startLameDuckMode()
 	case syscall.SIGHUP:
 		// Config reload.
 		if err := s.Reload(); err != nil {

@@ -4473,11 +4473,26 @@ func (s *Server) LameDuckShutdown() {
 // at some interval to avoid a reconnect storm.
 // We will also transfer any raft leaders and shutdown JetStream.
 func (s *Server) lameDuckMode() {
+	if expected, ok := s.enterLameDuckMode(); ok {
+		s.runLameDuckMode(expected)
+	}
+}
+
+// startLameDuckMode enters lame duck mode before returning, and runs the rest of it in a goroutine.
+func (s *Server) startLameDuckMode() {
+	if expected, ok := s.enterLameDuckMode(); ok {
+		go s.runLameDuckMode(expected)
+	}
+}
+
+// enterLameDuckMode sets lame duck mode and closes the listeners.
+// Returns false if lame duck mode was not entered.
+func (s *Server) enterLameDuckMode() (int, bool) {
 	s.mu.Lock()
 	// Check if there is actually anything to do
 	if s.isShuttingDown() || s.ldm || s.listener == nil {
 		s.mu.Unlock()
-		return
+		return 0, false
 	}
 	s.Noticef("Entering lame duck mode, stop accepting new clients")
 	s.ldm = true
@@ -4492,6 +4507,12 @@ func (s *Server) lameDuckMode() {
 		s.leafNodeListener = nil
 	}
 	s.ldmCh = make(chan bool, expected)
+	s.mu.Unlock()
+	return expected, true
+}
+
+// runLameDuckMode transfers leaders, shuts down JetStream and closes the clients.
+func (s *Server) runLameDuckMode(expected int) {
 	opts := s.getOpts()
 	gp := opts.LameDuckGracePeriod
 	// For tests, we want the grace period to be in some cases bigger
@@ -4500,7 +4521,6 @@ func (s *Server) lameDuckMode() {
 	if gp < 0 {
 		gp *= -1
 	}
-	s.mu.Unlock()
 
 	// If we are running any raftNodes transfer leaders.
 	if hadTransfers := s.transferRaftLeaders(); hadTransfers {
@@ -4520,7 +4540,7 @@ func (s *Server) lameDuckMode() {
 
 	// Wait for accept loops to be done to make sure that no new
 	// client can connect
-	for i := 0; i < expected; i++ {
+	for range expected {
 		<-s.ldmCh
 	}
 
@@ -4591,10 +4611,7 @@ func (s *Server) lameDuckMode() {
 		}
 		if batch == 1 || i%batch == 0 {
 			// We pick a random interval which will be at least si/2
-			v := rand.Int64N(si)
-			if v < si/2 {
-				v = si / 2
-			}
+			v := max(rand.Int64N(si), si/2)
 			t.Reset(time.Duration(v))
 			// Sleep for given interval or bail out if kicked by Shutdown().
 			select {
