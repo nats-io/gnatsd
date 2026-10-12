@@ -8287,3 +8287,25 @@ func TestNRGStepDownToStalledPeerElectsQuickly(t *testing.T) {
 		})
 	}
 }
+
+func TestNRGVoteRequestPersistsNewTerm(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	// Granting persists the new term with the vote.
+	require_NoError(t, n.processVoteRequest(&voteRequest{term: 1, lastTerm: 0, lastIndex: 0, candidate: nats0}))
+	term, voted, err := n.readTermVote()
+	require_NoError(t, err)
+	require_Equal(t, term, 1)
+	require_Equal(t, voted, nats0)
+
+	// Denying an outdated candidate still persists the new term.
+	n.pterm, n.pindex = 1, 100
+	require_NoError(t, n.processVoteRequest(&voteRequest{term: 2, lastTerm: 1, lastIndex: 2, candidate: nats0}))
+	term, voted, err = n.readTermVote()
+	require_NoError(t, err)
+	require_Equal(t, term, 2)
+	require_Equal(t, voted, noVote)
+}
