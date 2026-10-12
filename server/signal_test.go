@@ -484,6 +484,23 @@ func TestProcessSignalTermDuringLameDuckMode(t *testing.T) {
 	}
 }
 
+func TestSignalTermRightAfterLameDuckSignal(t *testing.T) {
+	if os.Getenv("IN_TEST") == "1" {
+		s := RunServer(&Options{Host: "127.0.0.1", Port: -1, NoSigs: true, NoLog: true})
+		defer s.Shutdown()
+		// Same calls the signal loop makes, without lame duck mode the SIGTERM would exit.
+		s.handleSignal(syscall.SIGUSR2)
+		s.handleSignal(syscall.SIGTERM)
+		require_True(t, s.isLameDuckMode())
+		return
+	}
+	// Run as separate process, an exit from the SIGTERM must fail the test.
+	cmd := exec.Command(os.Args[0], "-test.run=TestSignalTermRightAfterLameDuckSignal", "-test.paniconexit0")
+	cmd.Env = append(os.Environ(), "IN_TEST=1")
+	err := cmd.Run()
+	require_NoError(t, err)
+}
+
 func TestSignalInterruptHasSuccessfulExit(t *testing.T) {
 	if os.Getenv("IN_TEST") == "1" {
 		s := RunServer(&Options{})

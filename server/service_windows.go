@@ -102,7 +102,7 @@ loop:
 				// File log re-open for rotating file logs.
 				w.server.ReOpenLogFile()
 			case ldmCmd:
-				go w.server.lameDuckMode()
+				w.server.startLameDuckMode()
 			case svc.ParamChange:
 				if err := w.server.Reload(); err != nil {
 					w.server.Errorf("Failed to reload server configuration: %s", err)
