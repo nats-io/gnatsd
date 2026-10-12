@@ -10740,3 +10740,79 @@ func TestNRGPreferredCandidateResendsVoteRequest(t *testing.T) {
 		})
 	}
 }
+
+func TestNRGLeaderTransferTargetRetriesQuickly(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	n.Lock()
+	n.lxfer = true
+	n.commit = n.processed + 1
+	n.Unlock()
+
+	n.switchToCandidate()
+	require_Equal(t, n.State(), Follower)
+	select {
+	case <-n.electTimer().C:
+	case <-time.After(2 * minCampaignTimeout):
+		t.Fatal("Transfer target didn't retry quickly")
+	}
+}
+
+func TestNRGLeaderTransferTargetFollowsNewLeader(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	nats1 := "yrzKKRBu" // "nats-1"
+
+	// The old leader names us as its successor.
+	entries := []*Entry{newEntry(EntryLeaderTransfer, []byte(n.id))}
+	n.processAppendEntry(encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries}), n.aesub)
+	require_True(t, n.lxfer)
+
+	// Granting another candidate our vote moves us to its term.
+	require_NoError(t, n.processVoteRequest(&voteRequest{term: 2, lastTerm: 1, lastIndex: 1, candidate: nats1}))
+	require_Equal(t, n.term, 2)
+	require_True(t, n.lxfer)
+
+	// Following the new leader in that same term clears the transfer.
+	n.processAppendEntry(encode(t, &appendEntry{leader: nats1, term: 2, commit: 0, pterm: 1, pindex: 1, entries: nil}), n.aesub)
+	require_Equal(t, n.leader, nats1)
+	require_False(t, n.lxfer)
+}
+
+func TestNRGStepDownToStalledPeerElectsQuickly(t *testing.T) {
+	for _, replicas := range []int{3, 5} {
+		t.Run(fmt.Sprintf("R%d", replicas), func(t *testing.T) {
+			c := createJetStreamClusterExplicit(t, fmt.Sprintf("R%dS", replicas), replicas)
+			defer c.shutdown()
+
+			rg := c.createRaftGroup("TEST", replicas, newStateAdder)
+			leader := rg.waitOnLeader()
+			require_NotNil(t, leader)
+
+			// Stand-in for a successor stuck in writeTermVote.
+			stalled := rg.nonLeader().node().(*raft)
+			stalled.Lock()
+			unlock := time.AfterFunc(10*time.Second, stalled.Unlock)
+			defer func() {
+				if unlock.Stop() {
+					stalled.Unlock()
+				}
+			}()
+
+			require_NoError(t, leader.node().StepDown(stalled.ID()))
+			// Like in lame duck mode, the old leader only votes.
+			leader.node().SetObserver(true)
+
+			// Without shortening the followers' election timers, this would take at least 1.5s.
+			checkFor(t, minElectionTimeout-100*time.Millisecond, 10*time.Millisecond, func() error {
+				if rg.leader() == nil {
+					return errors.New("no leader yet")
+				}
+				return nil
+			})
+		})
+	}
+}
