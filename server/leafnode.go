@@ -2562,11 +2562,13 @@ func (s *Server) initLeafNodeSmapAndSendSubs(c *client) {
 	}
 
 	// If we are solicited we only send interest for local clients.
+	// Leafnode interest is skipped if isolated, as it would be filtered out below.
+	isIsolated := c.isIsolatedLeafNode()
 	if c.isSpokeLeafNode() {
 		acc.sl.localSubs(&subs, true)
 	} else {
-		// Don't advertise interest from leafnodes to other isolated leafnodes.
-		if c.isIsolatedLeafNode() {
+		// Don't advertise interest from leafnodes to this isolated leafnode connection.
+		if isIsolated {
 			acc.sl.Filter(&subs, func(sub *subscription) bool {
 				return !sub.leaf && sub.client.kind != LEAF
 			})
@@ -2640,6 +2642,10 @@ func (s *Server) initLeafNodeSmapAndSendSubs(c *client) {
 	rc := c.leaf.remoteCluster
 	c.leaf.smap = make(map[string]int64)
 	for _, sub := range subs {
+		// Don't advertise interest from leafnodes to this isolated leafnode connection.
+		if isIsolated && (sub.client.kind == LEAF || sub.leaf) {
+			continue
+		}
 		// Check perms regardless of role.
 		if c.perms != nil && !c.canSubscribe(string(sub.subject)) {
 			c.Debugf("Not permitted to subscribe to %q on behalf of %s%s", sub.subject, accName, accNTag)
@@ -2773,7 +2779,7 @@ func (acc *Account) updateLeafNodesEx(sub *subscription, delta int32, hubOnly bo
 			continue
 		}
 		ln.mu.RLock()
-		// Don't advertise interest from leafnodes to other isolated leafnodes.
+		// Don't advertise interest from leafnodes to this isolated leafnode connection.
 		if (sub.client.kind == LEAF || sub.leaf) && ln.isIsolatedLeafNode() {
 			ln.mu.RUnlock()
 			continue

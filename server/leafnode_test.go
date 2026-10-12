@@ -12057,6 +12057,156 @@ func TestLeafNodeIsolatedLeafSubjectPropagationLocalIsolation(t *testing.T) {
 	}
 }
 
+func TestLeafNodeIsolatedSpokeInitialSubs(t *testing.T) {
+	for tname, test := range map[string]struct{ global, remote, hub, request bool }{
+		"IsolatedGlobal":     {global: true},
+		"IsolatedRemote":     {remote: true},
+		"Normal":             {},
+		"HubIsolatedGlobal":  {hub: true, global: true},
+		"HubIsolatedRequest": {hub: true, request: true},
+		"HubNormal":          {hub: true},
+	} {
+		t.Run(tname, func(t *testing.T) {
+			isolated := test.global || test.remote || test.request
+			topTmpl := `
+				port: -1
+				server_name: "TOP"
+				accounts {
+					HA { users: [{user: HA, password: pwd}] }
+				}
+				leafnodes {
+					port: -1
+					reconnect: "50ms"
+					%s
+				}
+			`
+			midTmpl := `
+				port: -1
+				server_name: "MID"
+				accounts {
+					A { users: [{user: A, password: pwd}] }
+				}
+				leafnodes {
+					port: -1
+					reconnect: "50ms"
+					isolate_leafnode_interest: %v
+					%s
+				}
+			`
+			var (
+				top, mid   *Server
+				otop, omid *Options
+			)
+			if test.hub {
+				// TOP solicits MID as a hub, so MID takes on the spoke role.
+				confMid := createConfFile(t, []byte(fmt.Sprintf(midTmpl, test.global, _EMPTY_)))
+				mid, omid = RunServerWithConfig(confMid)
+				defer mid.Shutdown()
+
+				remotes := fmt.Sprintf(`remotes [
+					{
+						url: "nats://A:pwd@127.0.0.1:%d"
+						local: "HA"
+						hub: true
+						request_isolation: %v
+					}
+				]`, omid.LeafNode.Port, test.request)
+				confTop := createConfFile(t, []byte(fmt.Sprintf(topTmpl, remotes)))
+				top, otop = RunServerWithConfig(confTop)
+				defer top.Shutdown()
+			} else {
+				// MID solicits TOP, so MID is the spoke.
+				confTop := createConfFile(t, []byte(fmt.Sprintf(topTmpl, _EMPTY_)))
+				top, otop = RunServerWithConfig(confTop)
+				defer top.Shutdown()
+
+				remotes := fmt.Sprintf(`remotes [
+					{
+						url: "nats://HA:pwd@127.0.0.1:%d"
+						local: "A"
+						isolate: %v
+					}
+				]`, otop.LeafNode.Port, test.remote)
+				confMid := createConfFile(t, []byte(fmt.Sprintf(midTmpl, test.global, remotes)))
+				mid, omid = RunServerWithConfig(confMid)
+				defer mid.Shutdown()
+			}
+
+			botTmpl := `
+				port: -1
+				server_name: "BOTTOM"
+				accounts {
+					B { users: [{user: B, password: pwd}] }
+				}
+				leafnodes {
+					remotes [
+						{
+							url: "nats://A:pwd@127.0.0.1:%d"
+							local: "B"
+						}
+					]
+				}
+			`
+			confBot := createConfFile(t, []byte(fmt.Sprintf(botTmpl, omid.LeafNode.Port)))
+			bot, _ := RunServerWithConfig(confBot)
+			defer bot.Shutdown()
+
+			checkLeafNodeConnectedCount(t, top, 1)
+			checkLeafNodeConnectedCount(t, mid, 2)
+			checkLeafNodeConnectedCount(t, bot, 1)
+
+			// Stop TOP so that the subscriptions below are only sent in MID's initial subs.
+			top.Shutdown()
+			checkLeafNodeConnectedCount(t, mid, 1)
+
+			ncm := natsConnect(t, mid.ClientURL(), nats.UserInfo("A", "pwd"))
+			defer ncm.Close()
+			natsSubSync(t, ncm, "local")
+			natsFlush(t, ncm)
+
+			ncb := natsConnect(t, bot.ClientURL(), nats.UserInfo("B", "pwd"))
+			defer ncb.Close()
+			lsub := natsSubSync(t, ncb, "leaf")
+			natsFlush(t, ncb)
+			checkSubInterest(t, mid, "A", "leaf", time.Second)
+
+			top = RunServer(otop)
+			defer top.Shutdown()
+			checkLeafNodeConnectedCount(t, top, 1)
+			checkLeafNodeConnectedCount(t, mid, 2)
+
+			// MID's local interest should be visible to TOP in all cases, but BOTTOM's
+			// interest should only be visible if not isolated.
+			checkSubInterest(t, top, "HA", "local", time.Second)
+			if isolated {
+				checkSubNoInterest(t, top, "HA", "leaf", time.Second)
+			} else {
+				checkSubInterest(t, top, "HA", "leaf", time.Second)
+			}
+
+			// New subscriptions from BOTTOM should follow the same rules.
+			natsSubSync(t, ncb, "leaf2")
+			natsFlush(t, ncb)
+			checkSubInterest(t, mid, "A", "leaf2", time.Second)
+			// MID sends updates in order, so "leaf2" would arrive before "local2".
+			natsSubSync(t, ncm, "local2")
+			natsFlush(t, ncm)
+			checkSubInterest(t, top, "HA", "local2", time.Second)
+			if isolated {
+				checkSubNoInterest(t, top, "HA", "leaf2", time.Second)
+			} else {
+				checkSubInterest(t, top, "HA", "leaf2", time.Second)
+			}
+
+			// Once BOTTOM unsubscribes, TOP must not keep stale interest.
+			natsUnsub(t, lsub)
+			natsFlush(t, ncb)
+			checkSubNoInterest(t, mid, "A", "leaf", time.Second)
+			checkSubNoInterest(t, top, "HA", "leaf", time.Second)
+		})
+	}
+}
+
 func TestLeafNodeClusterIsolatedLeafSubjectPropagation(t *testing.T) {
 	spokeTmpl := `
 		port: -1
