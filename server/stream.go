@@ -2826,6 +2826,15 @@ func (mset *stream) updateWithAdvisory(config *StreamConfig, sendAdvisory bool, 
 	mset.ddwin = cfg.Duplicates
 	mset.ddMu.Unlock()
 
+	// Rate limited consumers use the max msg size as their burst.
+	if cfg.MaxMsgSize != ocfg.MaxMsgSize {
+		for _, o := range mset.consumers {
+			o.mu.Lock()
+			o.setRateLimit(o.cfg.RateLimit)
+			o.mu.Unlock()
+		}
+	}
+
 	// If we're changing retention and haven't errored because of consumer
 	// replicas by now, whip through and update the consumer retention.
 	if ocfg.Retention != cfg.Retention {
