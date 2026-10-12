@@ -8309,3 +8309,49 @@ func TestNRGVoteRequestPersistsNewTerm(t *testing.T) {
 	require_Equal(t, term, 2)
 	require_Equal(t, voted, noVote)
 }
+
+func TestNRGStepDownPrefersCaughtUpPeer(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	rg := c.createRaftGroup("TEST", 3, newStateAdder)
+
+	// Repeat, as peers are visited in random order.
+	for range 10 {
+		leader := rg.waitOnLeader()
+		require_NotNil(t, leader)
+		ln := leader.node().(*raft)
+
+		// Followers only count as caught up once they've acked since the election.
+		leader.(*stateAdder).proposeDelta(1)
+		followers := rg.followers()
+		checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+			for _, f := range followers {
+				if !ln.IsFollowerCaughtUp(f.node().ID()) {
+					return fmt.Errorf("follower %s not caught up", f.node().ID())
+				}
+			}
+			return nil
+		})
+
+		// Pretend we're catching up one of the followers.
+		catchingUp := followers[0].node().ID()
+		ln.Lock()
+		if ln.progress == nil {
+			ln.progress = make(map[string]*ipQueue[uint64])
+		}
+		q := newIPQueue[uint64](ln.s, "test")
+		ln.progress[catchingUp] = q
+		ln.Unlock()
+
+		require_NoError(t, ln.StepDown())
+		ln.Lock()
+		delete(ln.progress, catchingUp)
+		ln.Unlock()
+		q.unregister()
+
+		nl := rg.waitOnLeader()
+		require_NotNil(t, nl)
+		require_NotEqual(t, nl.node().ID(), catchingUp)
+	}
+}

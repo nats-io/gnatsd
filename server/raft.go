@@ -2067,19 +2067,30 @@ func (n *raft) StepDown(preferred ...string) error {
 		}
 	}
 
-	// If we do not have a preferred at this point pick the first healthy one.
+	// If we do not have a preferred at this point pick a healthy one.
 	// Make sure not ourselves.
 	if maybeLeader == noLeader {
+		var fallback string
 		for peer, ps := range n.peers {
 			if peer == n.id {
 				continue
 			}
 			si, ok := n.s.nodeToInfo.Load(peer)
 			isHealthy := ok && !si.(nodeInfo).offline && time.Since(ps.ts) < hbInterval*3
-			if isHealthy {
+			if !isHealthy {
+				continue
+			}
+			// Prefer a caught up peer. One we're still catching up is slower to take over.
+			if n.isFollowerCaughtUpLocked(peer) {
 				maybeLeader = peer
 				break
 			}
+			if fallback == noLeader {
+				fallback = peer
+			}
+		}
+		if maybeLeader == noLeader {
+			maybeLeader = fallback
 		}
 	}
 	n.Unlock()
@@ -3919,6 +3930,11 @@ func (n *raft) LastHeardFromFollower(peer string) time.Time {
 func (n *raft) IsFollowerCaughtUp(peer string) bool {
 	n.RLock()
 	defer n.RUnlock()
+	return n.isFollowerCaughtUpLocked(peer)
+}
+
+// Lock should be held.
+func (n *raft) isFollowerCaughtUpLocked(peer string) bool {
 	if peer == n.id {
 		return true
 	}
