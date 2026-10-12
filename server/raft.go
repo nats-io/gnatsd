@@ -6037,9 +6037,9 @@ func (n *raft) processVoteRequest(vr *voteRequest) error {
 			n.stepdownLocked(noLeader)
 		}
 		n.cancelCatchup()
+		// Persisted below, with our vote if granted.
 		n.term = vr.term
 		n.vote = noVote
-		n.writeTermVote()
 		// Clear current Leader since it belonged to an old term.
 		n.updateLeader(noLeader)
 	}
@@ -6068,11 +6068,15 @@ func (n *raft) processVoteRequest(vr *voteRequest) error {
 			vresp.granted = true
 			n.resetElectionTimeout()
 		}
-	} else if newTerm && n.vote == noVote && n.State() != Candidate {
-		// We have a more up-to-date log, and haven't voted yet.
-		// Start campaigning earlier, but only if not candidate already, as that would short-circuit us.
-		// Only on a new term, as re-sent vote requests would otherwise keep postponing our campaign.
-		n.resetElect(randCampaignTimeout())
+	} else if newTerm {
+		// Persist the new term before responding.
+		n.writeTermVote()
+		if n.vote == noVote && n.State() != Candidate {
+			// We have a more up-to-date log, and haven't voted yet.
+			// Start campaigning earlier, but only if not candidate already, as that would short-circuit us.
+			// Only on a new term, as re-sent vote requests would otherwise keep postponing our campaign.
+			n.resetElect(randCampaignTimeout())
+		}
 	}
 
 	// Term might have changed, make sure response has the most current
