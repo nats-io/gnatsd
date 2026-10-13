@@ -12207,6 +12207,51 @@ func TestLeafNodeIsolatedSpokeInitialSubs(t *testing.T) {
 	}
 }
 
+func BenchmarkLeafNodeIsolatedSpokeInitialSubs(b *testing.B) {
+	for _, leafSubs := range []int{0, 10_000, 100_000} {
+		b.Run(fmt.Sprintf("LeafSubs=%d", leafSubs), func(b *testing.B) {
+			s := RunServer(DefaultOptions())
+			defer s.Shutdown()
+			acc, err := s.RegisterAccount("A")
+			require_NoError(b, err)
+
+			newClient := func(kind int, l *leaf) *client {
+				c := &client{srv: s, kind: kind, acc: acc, leaf: l}
+				c.initClient()
+				return c
+			}
+			local := newClient(CLIENT, nil)
+			downstream := newClient(LEAF, &leaf{})
+			for i := range 1_000 {
+				require_NoError(b, acc.sl.Insert(&subscription{client: local, subject: fmt.Appendf(nil, "local.%d", i)}))
+			}
+			for i := range leafSubs {
+				require_NoError(b, acc.sl.Insert(&subscription{client: downstream, subject: fmt.Appendf(nil, "leaf.%d", i), leaf: true}))
+			}
+
+			c := newClient(LEAF, &leaf{isSpoke: true, isolated: true})
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				s.initLeafNodeSmapAndSendSubs(c)
+
+				// Reset state, as there's no write loop or connection.
+				b.StopTimer()
+				c.mu.Lock()
+				for sub := range c.leaf.tsub {
+					require_NotEqual(b, sub.client, downstream)
+				}
+				c.leaf.tsubt.Stop()
+				c.leaf.tsub, c.leaf.tsubt = nil, nil
+				c.out.nb, c.out.pb, c.out.stc = nil, 0, nil
+				s.gwLeafSubs.Remove(c.leaf.gwSub)
+				c.mu.Unlock()
+				b.StartTimer()
+			}
+		})
+	}
+}
+
 func TestLeafNodeClusterIsolatedLeafSubjectPropagation(t *testing.T) {
 	spokeTmpl := `
 		port: -1

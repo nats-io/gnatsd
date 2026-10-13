@@ -2565,7 +2565,7 @@ func (s *Server) initLeafNodeSmapAndSendSubs(c *client) {
 	// Leafnode interest is skipped if isolated, as it would be filtered out below.
 	isIsolated := c.isIsolatedLeafNode()
 	if c.isSpokeLeafNode() {
-		acc.sl.localSubs(&subs, true)
+		acc.sl.localSubs(&subs, !isIsolated)
 	} else {
 		// Don't advertise interest from leafnodes to this isolated leafnode connection.
 		if isIsolated {
