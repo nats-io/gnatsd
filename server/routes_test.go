@@ -6030,3 +6030,26 @@ func TestRouteReconnectAfterDuplicateRouteAdoptsConfiguredURL(t *testing.T) {
 	_, err = nca.Request("pinned.echo", []byte("ping"), time.Second)
 	require_NoError(t, err)
 }
+
+func TestRouteLogsRemoteURL(t *testing.T) {
+	o1 := DefaultOptions()
+	o1.Cluster.Username = remoteURLLogUser
+	o1.Cluster.Password = remoteURLLogPassword
+	s1 := RunServer(o1)
+	defer s1.Shutdown()
+
+	routeHost := fmt.Sprintf("localhost:%d", o1.Cluster.Port)
+	o2 := DefaultOptions()
+	o2.Cluster.resolver = &localhostResolver{}
+	o2.Routes = []*url.URL{{Scheme: "nats", Host: routeHost, User: url.UserPassword(remoteURLLogUser, remoteURLLogPassword)}}
+	s2, l := runServerWithNoticeLogger(t, o2)
+	defer s2.Shutdown()
+
+	checkClusterFormed(t, s1, s2)
+	checkNoticeContains(t, l, "Route connection created ("+routeHost+")")
+
+	s1.Shutdown()
+	checkNoticeContains(t, l, "Router connection closed: "+ClientClosed.String()+" - Remote: "+s1.Name()+", Host: "+routeHost)
+	s2.Shutdown()
+	checkNoticeNotContains(t, l, remoteURLLogUser, remoteURLLogPassword)
+}

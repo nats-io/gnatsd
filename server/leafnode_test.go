@@ -14410,3 +14410,31 @@ func TestLeafNodeInterestLeakOnGatewayClose(t *testing.T) {
 	checkSubInterest(t, ln, globalAccountName, "barrier", time.Second)
 	require_NoError(t, checkInterest(false))
 }
+
+func TestLeafNodeLogsRemoteURL(t *testing.T) {
+	o1 := DefaultOptions()
+	o1.LeafNode.Host = "127.0.0.1"
+	o1.LeafNode.Port = -1
+	o1.LeafNode.Username = remoteURLLogUser
+	o1.LeafNode.Password = remoteURLLogPassword
+	s1 := RunServer(o1)
+	defer s1.Shutdown()
+
+	leafHost := fmt.Sprintf("localhost:%d", o1.LeafNode.Port)
+	o2 := DefaultOptions()
+	o2.Cluster.Name = _EMPTY_
+	o2.Cluster.Port = 0
+	o2.LeafNode.resolver = &localhostResolver{}
+	u := &url.URL{Scheme: "nats-leaf", Host: leafHost, User: url.UserPassword(remoteURLLogUser, remoteURLLogPassword)}
+	o2.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{u}}}
+	s2, l := runServerWithNoticeLogger(t, o2)
+	defer s2.Shutdown()
+
+	checkLeafNodeConnected(t, s2)
+	checkNoticeContains(t, l, "Leafnode connection created for account: $G ("+leafHost+")")
+
+	s1.Shutdown()
+	checkNoticeContains(t, l, "Leafnode connection closed: "+ClientClosed.String()+" - Remote: "+s1.Name()+", Host: "+leafHost)
+	s2.Shutdown()
+	checkNoticeNotContains(t, l, remoteURLLogUser, remoteURLLogPassword)
+}

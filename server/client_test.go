@@ -2748,10 +2748,113 @@ type captureNoticeLogger struct {
 	notices []string
 }
 
+const (
+	remoteURLLogUser     = "log-test-user"
+	remoteURLLogPassword = "log-test-password"
+)
+
 func (l *captureNoticeLogger) Noticef(format string, v ...any) {
 	l.Lock()
 	l.notices = append(l.notices, fmt.Sprintf(format, v...))
 	l.Unlock()
+}
+
+// runServerWithNoticeLogger starts a server with a captureNoticeLogger installed
+// before Start, so that notices emitted during startup and solicitation are captured.
+func runServerWithNoticeLogger(t *testing.T, o *Options) (*Server, *captureNoticeLogger) {
+	t.Helper()
+	s, err := NewServer(o)
+	require_NoError(t, err)
+	l := &captureNoticeLogger{}
+	s.SetLogger(l, true, true)
+	s.Start()
+	if !s.ReadyForConnections(10 * time.Second) {
+		t.Fatal("Server not ready")
+	}
+	return s, l
+}
+
+// checkNoticeContains waits for a captured notice containing expected.
+func checkNoticeContains(t *testing.T, l *captureNoticeLogger, expected string) {
+	t.Helper()
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		l.Lock()
+		defer l.Unlock()
+		for _, n := range l.notices {
+			if strings.Contains(n, expected) {
+				return nil
+			}
+		}
+		return fmt.Errorf("notices do not contain %q: %v", expected, l.notices)
+	})
+}
+
+// checkNoticeNotContains checks captured notices after the server has shut down.
+func checkNoticeNotContains(t *testing.T, l *captureNoticeLogger, unexpected ...string) {
+	t.Helper()
+	l.Lock()
+	defer l.Unlock()
+	for _, n := range l.notices {
+		for _, value := range unexpected {
+			if strings.Contains(n, value) {
+				t.Fatalf("Notice contains unexpected %q: %s", value, n)
+			}
+		}
+	}
+}
+
+// TestCloseConnectionLogsRemoteURLBeforeInfo verifies that early close notices
+// retain the destination hostname without exposing credentials or a remote name.
+func TestCloseConnectionLogsRemoteURLBeforeInfo(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		kind    int
+		created string
+		closed  string
+	}{
+		{"route", ROUTER, "Route connection created (", "Router"},
+		{"gateway", GATEWAY, `Creating outbound gateway connection to "B" (`, "Gateway"},
+		{"leafnode", LEAF, "Leafnode connection created for account: $G (", "Leafnode"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
+			require_NoError(t, err)
+			defer listener.Close()
+
+			host := fmt.Sprintf("localhost:%d", listener.Addr().(*net.TCPAddr).Port)
+			u := &url.URL{Scheme: "nats", Host: host, User: url.UserPassword(remoteURLLogUser, remoteURLLogPassword)}
+			o := DefaultOptions()
+			switch test.kind {
+			case ROUTER:
+				o.Cluster.resolver = &localhostResolver{}
+				o.Routes = []*url.URL{u}
+			case GATEWAY:
+				o = testGatewayOptionsFromToWithURLs(t, "A", "B", []string{u.String()})
+				o.Gateway.resolver = &localhostResolver{}
+			case LEAF:
+				u.Scheme = "nats-leaf"
+				o.Cluster.Name = _EMPTY_
+				o.Cluster.Port = 0
+				o.LeafNode.resolver = &localhostResolver{}
+				o.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{u}}}
+			}
+			s, l := runServerWithNoticeLogger(t, o)
+			defer s.Shutdown()
+
+			require_NoError(t, listener.SetDeadline(time.Now().Add(2*time.Second)))
+			conn, err := listener.AcceptTCP()
+			require_NoError(t, err)
+			defer conn.Close()
+			checkNoticeContains(t, l, test.created+host+")")
+
+			// Send EOF without INFO. Keep the read side open so unread CONNECT
+			// data cannot turn the close into a TCP reset.
+			require_NoError(t, conn.CloseWrite())
+			checkNoticeContains(t, l, test.closed+" connection closed: "+ClientClosed.String()+" - Host: "+host)
+			s.Shutdown()
+			checkNoticeNotContains(t, l, remoteURLLogUser, remoteURLLogPassword, "Remote:")
+		})
+	}
 }
 
 func TestCloseConnectionLogsReason(t *testing.T) {

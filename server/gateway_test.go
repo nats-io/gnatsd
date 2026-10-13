@@ -7922,3 +7922,27 @@ func TestGatewayProcessRSubNoBlockingAccountFetch(t *testing.T) {
 	require_True(t, ok)
 	require_True(t, ei.(*outsie).sl.CacheEnabled())
 }
+
+func TestGatewayLogsRemoteURL(t *testing.T) {
+	o2 := testDefaultOptionsForGateway("B")
+	o2.ServerName = "gw-b"
+	o2.Gateway.Username = remoteURLLogUser
+	o2.Gateway.Password = remoteURLLogPassword
+	s2 := runGatewayServer(o2)
+	defer s2.Shutdown()
+
+	gwHost := fmt.Sprintf("localhost:%d", s2.GatewayAddr().Port)
+	u := &url.URL{Scheme: "nats", Host: gwHost, User: url.UserPassword(remoteURLLogUser, remoteURLLogPassword)}
+	o1 := testGatewayOptionsFromToWithURLs(t, "A", "B", []string{u.String()})
+	o1.Gateway.resolver = &localhostResolver{}
+	s1, l := runServerWithNoticeLogger(t, o1)
+	defer s1.Shutdown()
+
+	waitForOutboundGateways(t, s1, 1, 2*time.Second)
+	checkNoticeContains(t, l, `Creating outbound gateway connection to "B" (`+gwHost+")")
+
+	s2.Shutdown()
+	checkNoticeContains(t, l, "Gateway connection closed: "+ClientClosed.String()+" - Remote: "+s2.Name()+", Host: "+gwHost)
+	s1.Shutdown()
+	checkNoticeNotContains(t, l, remoteURLLogUser, remoteURLLogPassword)
+}

@@ -204,7 +204,7 @@ type gatewayCfg struct {
 type gateway struct {
 	name       string
 	cfg        *gatewayCfg
-	connectURL *url.URL          // Needed when sending CONNECT after receiving INFO from remote
+	connectURL *url.URL          // URL used to solicit this outbound connection (used for CONNECT and logging)
 	outsim     *sync.Map         // Per-account subject interest (or no-interest) (outbound conn)
 	insim      map[string]*insie // Per-account subject no-interest sent or modeInterestOnly mode (inbound conn)
 
@@ -815,7 +815,7 @@ func (s *Server) createGateway(cfg *gatewayCfg, url *url.URL, conn net.Conn) {
 		// the remote's INFO protocol, save the URL we need to connect to.
 		c.gw.connectURL = url
 
-		c.Noticef("Creating outbound gateway connection to %q", cfgName)
+		c.Noticef("Creating outbound gateway connection to %q (%s)", cfgName, url.Host)
 	} else {
 		c.flags.set(expectConnect)
 		// Inbound gateway connection
@@ -940,7 +940,6 @@ func (c *client) sendGatewayConnect(opts *Options) {
 	tlsRequired := c.gw.cfg.TLSConfig != nil
 	c.gw.cfg.RUnlock()
 	url := c.gw.connectURL
-	c.gw.connectURL = nil
 	var user, pass string
 	if userInfo := url.User; userInfo != nil {
 		user = userInfo.Username()
