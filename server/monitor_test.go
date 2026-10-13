@@ -6359,6 +6359,49 @@ func TestMonitorConnzOperatorModeFilterByUser(t *testing.T) {
 	}
 }
 
+func TestMonitorConnzTotalReflectsFilters(t *testing.T) {
+	s := runMonitorServerWithAccounts()
+	defer s.Shutdown()
+
+	ncA := createClientConnWithUserSubscribeAndPublish(t, s, "a", "a")
+	defer ncA.Close()
+	for i := 0; i < 3; i++ {
+		nc := createClientConnWithUserSubscribeAndPublish(t, s, "b", "b")
+		defer nc.Close()
+	}
+	ncSub := createClientConnWithUserSubscribeAndPublish(t, s, "b", "b")
+	defer ncSub.Close()
+	sub, err := ncSub.SubscribeSync("only.here")
+	require_NoError(t, err)
+	defer sub.Unsubscribe()
+	require_NoError(t, ncSub.Flush())
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
+	for _, tc := range []struct {
+		name     string
+		url      string
+		opts     *ConnzOptions
+		expected int
+	}{
+		{"user", "connz?user=a", &ConnzOptions{User: "a"}, 1},
+		{"user no match", "connz?user=nobody", &ConnzOptions{User: "nobody"}, 0},
+		{"user paged", "connz?user=b&limit=1", &ConnzOptions{User: "b", Limit: 1}, 4},
+		// filter_subject is not an HTTP query parameter, only via Connz()/system request.
+		{"filter subject", _EMPTY_, &ConnzOptions{Account: "B", FilterSubject: "only.here"}, 1},
+		{"account", "connz?acc=B", &ConnzOptions{Account: "B"}, 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for mode := 0; mode < 2; mode++ {
+				if mode == 0 && tc.url == _EMPTY_ {
+					continue
+				}
+				c := pollConnz(t, s, mode, url+tc.url, tc.opts)
+				require_Equal(t, c.Total, tc.expected)
+			}
+		})
+	}
+}
+
 func TestMonitorConnzSortByRTT(t *testing.T) {
 	s := runMonitorServer()
 	defer s.Shutdown()

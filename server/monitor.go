@@ -446,6 +446,7 @@ func (s *Server) Connz(opts *ConnzOptions) (*Connz, error) {
 
 	// Just return with empty array if nothing here.
 	if len(openClients) == 0 && len(closedClients) == 0 {
+		c.Total = 0
 		c.Conns = ConnInfos{}
 		return c, nil
 	}
@@ -535,6 +536,8 @@ func (s *Server) Connz(opts *ConnzOptions) (*Connz, error) {
 		pconns = pconns[:i]
 		totalClients = i
 	}
+	// Total reflects all connections that matched the query, before pagination.
+	c.Total = i
 
 	switch sortOpt {
 	case ByCid, ByStart:
