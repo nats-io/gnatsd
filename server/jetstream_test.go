@@ -8277,15 +8277,13 @@ func TestJetStreamMsgHeaders(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Unexpected error getting stored message: %v", err)
 			}
-			// Calculate the []byte version of the headers.
-			var b bytes.Buffer
-			b.WriteString("NATS/1.0\r\n")
-			http.Header(m.Header).Write(&b)
-			b.WriteString("\r\n")
-			hdr := b.Bytes()
-
-			if !bytes.Equal(sm.Header, hdr) {
-				t.Fatalf("Message headers do not match, %q vs %q", hdr, sm.Header)
+			// Compare decoded headers since their wire order is unspecified.
+			hdr, err := nats.DecodeHeadersMsg(sm.Header)
+			if err != nil {
+				t.Fatalf("Error decoding stored headers: %v", err)
+			}
+			if !reflect.DeepEqual(hdr, m.Header) {
+				t.Fatalf("Message headers do not match, %v vs %v", m.Header, hdr)
 			}
 			if !bytes.Equal(sm.Data, m.Data) {
 				t.Fatalf("Message data do not match, %q vs %q", m.Data, sm.Data)
