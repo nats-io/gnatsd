@@ -278,6 +278,102 @@ func (at *authTest) Cleanup() {
 	}
 }
 
+func TestAuthCalloutReloadAuthChanges(t *testing.T) {
+	conf := `
+		listen: "127.0.0.1:-1"
+		authorization {
+			users: [
+				{ user: auth, password: pwd }
+				{ user: other, password: pwd, permissions: { publish: [foo] } }
+			]
+			auth_callout {
+				issuer: "ABJHLOVMPA4CI6R5KLNGOB4GSLNIY7IOUPAJC4YFNDLQVIOBYQGUWVLA"
+				auth_users: [auth]
+			}
+		}
+	`
+	handler := func(m *nats.Msg) {
+		user, si, _, _, _ := decodeAuthRequest(t, m.Data)
+		ujwt := createAuthUser(t, user, "", globalAccountName, "", nil, 0, nil)
+		m.Respond(serviceResponse(t, user, si.ID, ujwt, "", 0))
+	}
+	at := NewAuthTest(t, conf, handler, nats.UserInfo("auth", "pwd"))
+	defer at.Cleanup()
+	require_NoError(t, at.authClient.Flush())
+	closed := make(chan struct{}, 1)
+	nc := at.Connect(nats.UserInfo("external", "pwd"), nats.NoReconnect(),
+		nats.ClosedHandler(func(*nats.Conn) { closed <- struct{}{} }))
+	defer nc.Close()
+
+	// An unchanged reload and non-auth changes must preserve the connection,
+	// even though diffOptions always schedules authorization reloads.
+	for _, suffix := range []string{"", "\nlogtime: false\n"} {
+		changeCurrentConfigContentWithNewContent(t, at.conf, []byte(conf+suffix))
+		require_NoError(t, at.srv.Reload())
+		require_NoError(t, nc.Flush())
+	}
+
+	// Permissions do not change callout authentication.
+	for _, updated := range []string{
+		strings.Replace(conf, "publish: [foo]", "publish: [bar]", 1),
+	} {
+		changeCurrentConfigContentWithNewContent(t, at.conf, []byte(updated))
+		require_NoError(t, at.srv.Reload())
+		require_NoError(t, nc.Flush())
+	}
+
+	// Server tags are inputs to the callout decision.
+	changeCurrentConfigContentWithNewContent(t, at.conf, []byte(conf+"\nserver_tags: [updated]\n"))
+	require_NoError(t, at.srv.Reload())
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Tag change did not disconnect the callout client")
+	}
+}
+
+func TestAuthCalloutReloadDelegatedProxyRequired(t *testing.T) {
+	conf := `
+		listen: "127.0.0.1:-1"
+		accounts {
+			AUTH { users: [{user: auth, password: pwd}] }
+			APP { users: [{user: delegated, password: pwd, proxy_required: false}] }
+		}
+		authorization {
+			auth_callout {
+				issuer: "ABJHLOVMPA4CI6R5KLNGOB4GSLNIY7IOUPAJC4YFNDLQVIOBYQGUWVLA"
+				account: AUTH
+				auth_users: [auth]
+			}
+		}
+	`
+	handler := func(m *nats.Msg) {
+		user, si, _, _, _ := decodeAuthRequest(t, m.Data)
+		ujwt := createAuthUser(t, user, "callout-identity", "APP", "", nil, 0, nil)
+		m.Respond(serviceResponse(t, user, si.ID, ujwt, "", 0))
+	}
+	at := NewAuthTest(t, conf, handler, nats.UserInfo("auth", "pwd"))
+	defer at.Cleanup()
+	require_NoError(t, at.authClient.Flush())
+	closed := make(chan struct{}, 1)
+	nc := at.Connect(nats.UserInfo("delegated", "pwd"), nats.NoReconnect(),
+		nats.ClosedHandler(func(*nats.Conn) { closed <- struct{}{} }))
+	require_NoError(t, nc.Flush())
+
+	updated := strings.Replace(conf, "proxy_required: false", "proxy_required: true", 1)
+	changeCurrentConfigContentWithNewContent(t, at.conf, []byte(updated))
+	require_NoError(t, at.srv.Reload())
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Delegated client remained connected after proxy policy changed")
+	}
+	// The callout still approves, but the static proxy requirement must win.
+	_, err := at.NewClient(nats.UserInfo("delegated", "pwd"), nats.NoReconnect())
+	require_Error(t, err)
+	require_NoError(t, at.authClient.Flush())
+}
+
 func TestAuthCalloutBasics(t *testing.T) {
 	conf := `
 		listen: "127.0.0.1:-1"
@@ -584,6 +680,73 @@ func TestAuthCalloutMultiAccounts(t *testing.T) {
 
 	require_True(t, userInfo.UserID == "dlc")
 	require_True(t, userInfo.Account == "BAZ")
+}
+
+func TestAuthCalloutReloadAccountMaxConnections(t *testing.T) {
+	conf := `
+		listen: "127.0.0.1:-1"
+		accounts {
+			AUTH { users [ {user: "auth", password: "pwd"} ] }
+			FOO { limits { max_connections: 3 } }
+		}
+		authorization {
+			auth_callout {
+				issuer: "ABJHLOVMPA4CI6R5KLNGOB4GSLNIY7IOUPAJC4YFNDLQVIOBYQGUWVLA"
+				account: AUTH
+				auth_users: [ auth ]
+			}
+		}
+	`
+	var callouts atomic.Uint32
+	handler := func(m *nats.Msg) {
+		callouts.Add(1)
+		user, si, _, _, _ := decodeAuthRequest(t, m.Data)
+		ujwt := createAuthUser(t, user, "", "FOO", "", nil, 0, nil)
+		m.Respond(serviceResponse(t, user, si.ID, ujwt, "", 0))
+	}
+	at := NewAuthTest(t, conf, handler, nats.UserInfo("auth", "pwd"))
+	defer at.Cleanup()
+	require_NoError(t, at.authClient.Flush())
+	closed := make(chan *nats.Conn, 2)
+	connect := func() *nats.Conn {
+		return at.Connect(nats.UserInfo("external", "pwd"), nats.NoReconnect(),
+			nats.ClosedHandler(func(nc *nats.Conn) { closed <- nc }))
+	}
+	clients := []*nats.Conn{connect(), connect()}
+	reload := func(limit int) {
+		t.Helper()
+		updated := strings.Replace(conf, "max_connections: 3", fmt.Sprintf("max_connections: %d", limit), 1)
+		changeCurrentConfigContentWithNewContent(t, at.conf, []byte(updated))
+		require_NoError(t, at.srv.Reload())
+	}
+
+	// Existing connections may fill the limit, including on unchanged reloads.
+	for range 2 {
+		reload(2)
+		for _, nc := range clients {
+			require_NoError(t, nc.Flush())
+		}
+	}
+
+	// Lowering the limit below the current count must close only the excess.
+	reload(1)
+	var disconnected *nats.Conn
+	select {
+	case disconnected = <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Reload did not enforce the account connection limit")
+	}
+	require_Error(t, disconnected.LastError())
+	require_Contains(t, disconnected.LastError().Error(), ErrTooManyAccountConnections.Error())
+	for _, nc := range clients {
+		if nc != disconnected {
+			require_NoError(t, nc.Flush())
+		}
+	}
+	acc, err := at.srv.LookupAccount("FOO")
+	require_NoError(t, err)
+	require_Equal(t, acc.NumLocalConnections(), 1)
+	require_Equal(t, callouts.Load(), uint32(2))
 }
 
 func TestAuthCalloutNotInvokedOnAccountMaxConnections(t *testing.T) {

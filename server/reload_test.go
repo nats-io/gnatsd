@@ -4483,7 +4483,7 @@ func TestConfigReloadAuthDoesNotBreakRouteInterest(t *testing.T) {
 	sa.Shutdown()
 
 	// Now force reload on seed server of auth.
-	s.reloadAuthorization()
+	s.reloadAuthorization(false)
 
 	// Restart both server A and client 2.
 	sa = RunServer(optsA)
@@ -7944,5 +7944,79 @@ func TestConfigReloadNoRaceWithServiceImports(t *testing.T) {
 	case err := <-errCh:
 		t.Fatal(err)
 	default:
+	}
+}
+
+func TestCalloutInputsChanged(t *testing.T) {
+	newOptions := func() *Options {
+		return &Options{
+			AuthCallout: &AuthCallout{AuthUsers: []string{"auth", "key"}},
+			Users: []*User{
+				{Username: "auth", Password: "pwd", Account: NewAccount("A")},
+				{Username: "other", Password: "pwd", Account: NewAccount("A")},
+			},
+			Nkeys: []*NkeyUser{
+				{Nkey: "key", Account: NewAccount("A")},
+				{Nkey: "otherkey", Account: NewAccount("A")},
+			},
+		}
+	}
+	for _, test := range []struct {
+		name string
+		edit func(*Options)
+		want bool
+	}{
+		{"unchanged", func(*Options) {}, false},
+		{"tags", func(o *Options) { o.Tags = append(o.Tags, "updated") }, true},
+		{"permissions", func(o *Options) {
+			o.Users[0].Permissions = &Permissions{Publish: &SubjectPermission{Allow: []string{"foo"}}}
+		}, false},
+		{"nkey permissions", func(o *Options) { o.Nkeys[0].Permissions = &Permissions{} }, false},
+		{"password", func(o *Options) { o.Users[0].Password = "changed" }, true},
+		{"other password", func(o *Options) { o.Users[1].Password = "changed" }, true},
+		{"account", func(o *Options) { o.Users[0].Account = NewAccount("B") }, true},
+		{"account limits", func(o *Options) { o.Users[0].Account.mconns = 10 }, false},
+		{"connection types", func(o *Options) { o.Users[0].AllowedConnectionTypes = map[string]struct{}{"STANDARD": {}} }, true},
+		{"empty connection types", func(o *Options) { o.Users[0].AllowedConnectionTypes = map[string]struct{}{} }, false},
+		{"proxy", func(o *Options) { o.Users[0].ProxyRequired = true }, true},
+		{"delegated user deadline", func(o *Options) { o.Users[1].ConnectionDeadline = time.Now().Add(time.Hour) }, true},
+		{"delegated user proxy", func(o *Options) { o.Users[1].ProxyRequired = true }, true},
+		{"delegated nkey proxy", func(o *Options) { o.Nkeys[1].ProxyRequired = true }, true},
+		{"global proxy", func(o *Options) { o.ProxyRequired = true }, true},
+		{"removed user", func(o *Options) { o.Users = o.Users[1:] }, true},
+		{"removed unrelated user", func(o *Options) { o.Users = o.Users[:1] }, true},
+		{"added unrelated nkey", func(o *Options) { o.Nkeys = append(o.Nkeys, &NkeyUser{Nkey: "unrelated"}) }, true},
+		{"added unrelated user", func(o *Options) { o.Users = append(o.Users, &User{Username: "new"}) }, true},
+		{"removed nkey", func(o *Options) { o.Nkeys = nil }, true},
+		{"nkey account", func(o *Options) { o.Nkeys[0].Account = NewAccount("B") }, true},
+		{"identity kind", func(o *Options) {
+			o.Nkeys = nil
+			o.Users = append(o.Users, &User{Username: "key", Account: NewAccount("A")})
+		}, true},
+		{"user order", func(o *Options) { o.Users[0], o.Users[1] = o.Users[1], o.Users[0] }, false},
+		{"single auth user", func(o *Options) { o.Username = "auth" }, true},
+		{"single unrelated user", func(o *Options) { o.Username = "other" }, true},
+		{"single user password", func(o *Options) { o.Password = "changed" }, true},
+		{"token", func(o *Options) { o.Authorization = "changed" }, true},
+		{"TLS mapping", func(o *Options) { o.TLSMap = true }, true},
+	} {
+		for _, allowed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/allowed_accounts=%v", test.name, allowed), func(t *testing.T) {
+				old, updated := newOptions(), newOptions()
+				if allowed {
+					old.AuthCallout.AllowedAccounts = []string{"A"}
+					updated.AuthCallout.AllowedAccounts = []string{"A"}
+				}
+				test.edit(updated)
+				// Match the ordering established by diffOptions.
+				for _, o := range []*Options{old, updated} {
+					require_NoError(t, imposeOrder(o.Users))
+					require_NoError(t, imposeOrder(o.Nkeys))
+				}
+				require_Equal(t, calloutInputsChanged(old, updated), test.want)
+				updated.AuthCallout = nil
+				require_False(t, calloutInputsChanged(old, updated))
+			})
+		}
 	}
 }
