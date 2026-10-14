@@ -1637,6 +1637,13 @@ func TestSublistSubjectCollide(t *testing.T) {
 	require_True(t, SubjectsCollide("foo.*", "foo.foo"))
 	require_True(t, SubjectsCollide("foo.*", "*.foo"))
 	require_True(t, SubjectsCollide("foo.bar.>", "*.bar.foo"))
+
+	// A wildcard char inside a token is a literal.
+	require_False(t, SubjectsCollide("foo.*bar.*", "foo.baz.*"))
+	require_False(t, SubjectsCollide("foo.>bar.*", "foo.baz.*"))
+	require_False(t, SubjectsCollide("foo.**.*", "foo.baz.*"))
+	require_True(t, SubjectsCollide("foo.*bar.*", "foo.*bar.*"))
+	require_True(t, SubjectsCollide("foo.*bar.*", "foo.*.baz"))
 }
 
 func TestSublistAddCacheHitRate(t *testing.T) {

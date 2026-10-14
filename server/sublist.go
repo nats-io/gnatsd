@@ -1382,8 +1382,7 @@ func tokensCanMatch(t1, t2 string) bool {
 	if len(t1) == 0 || len(t2) == 0 {
 		return false
 	}
-	t1c, t2c := t1[0], t2[0]
-	if t1c == pwc || t2c == pwc || t1c == fwc || t2c == fwc {
+	if t1 == pwcs || t2 == pwcs || t1 == fwcs || t2 == fwcs {
 		return true
 	}
 	return t1 == t2
