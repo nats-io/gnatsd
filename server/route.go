@@ -290,6 +290,8 @@ func (c *client) processRoutedHeaderMsgArgs(arg []byte) error {
 		if an = c.route.accName; len(an) > 0 {
 			args = append(args, an)
 		}
+	} else if c.kind == GATEWAY && c.gw.outbound {
+		return fmt.Errorf("processRoutedHeaderMsgArgs received HMSG from gateway on outbound connection")
 	}
 	start := -1
 	for i, b := range arg {
@@ -386,6 +388,8 @@ func (c *client) processRoutedMsgArgs(arg []byte) error {
 		if an = c.route.accName; len(an) > 0 {
 			args = append(args, an)
 		}
+	} else if c.kind == GATEWAY && c.gw.outbound {
+		return fmt.Errorf("processRoutedMsgArgs received RMSG from gateway on outbound connection")
 	}
 	start := -1
 	for i, b := range arg {
