@@ -27388,3 +27388,108 @@ func TestJetStreamInterestCheckWithoutConsumersDoesNotCompact(t *testing.T) {
 	require_Equal(t, state.FirstSeq, 1)
 	require_Equal(t, state.LastSeq, numMsgs)
 }
+
+func TestJetStreamInterestCheckZeroCheckFloorDoesNotPurge(t *testing.T) {
+	for _, st := range []nats.StorageType{nats.FileStorage, nats.MemoryStorage} {
+		t.Run(st.String(), func(t *testing.T) {
+			s := RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+
+			nc, js := jsClientConnect(t, s)
+			defer nc.Close()
+
+			_, err := js.AddStream(&nats.StreamConfig{
+				Name:      "TEST",
+				Subjects:  []string{"foo"},
+				Storage:   st,
+				Retention: nats.InterestPolicy,
+			})
+			require_NoError(t, err)
+
+			// Acks a prefix and still holds interest in every message after it.
+			sub, err := js.PullSubscribe("foo", "lagging")
+			require_NoError(t, err)
+
+			const numMsgs, numAcked = 100, 10
+			for range numMsgs {
+				_, err = js.Publish("foo", nil)
+				require_NoError(t, err)
+			}
+			for _, m := range fetchMsgs(t, sub, numAcked, 5*time.Second) {
+				require_NoError(t, m.AckSync())
+			}
+
+			// Closing while the check runs, before it ever completed a check,
+			// so its check returns early and leaves its check floor at 0.
+			_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+				Durable:       "closing",
+				AckPolicy:     nats.AckNonePolicy,
+				DeliverPolicy: nats.DeliverNewPolicy,
+			})
+			require_NoError(t, err)
+			mset, err := s.GlobalAccount().lookupStream("TEST")
+			require_NoError(t, err)
+			o := mset.lookupConsumer("closing")
+			require_NotNil(t, o)
+			o.mu.Lock()
+			o.closed = true
+			o.mu.Unlock()
+
+			// A zero check floor must not compact the stream. Only the acked
+			// prefix is gone, the lagging consumer still needs the rest.
+			mset.checkInterestState()
+			o.mu.Lock()
+			o.closed = false
+			o.mu.Unlock()
+			state := mset.state()
+			require_Equal(t, state.Msgs, numMsgs-numAcked)
+			require_Equal(t, state.FirstSeq, numAcked+1)
+			require_Equal(t, state.LastSeq, numMsgs)
+		})
+	}
+}
+
+func TestJetStreamInterestCheckConsumerAheadOfStreamCompacts(t *testing.T) {
+	for _, st := range []nats.StorageType{nats.FileStorage, nats.MemoryStorage} {
+		t.Run(st.String(), func(t *testing.T) {
+			s := RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+
+			nc, js := jsClientConnect(t, s)
+			defer nc.Close()
+
+			_, err := js.AddStream(&nats.StreamConfig{
+				Name:      "TEST",
+				Subjects:  []string{"foo"},
+				Storage:   st,
+				Retention: nats.InterestPolicy,
+			})
+			require_NoError(t, err)
+
+			// Starts past the stream's last sequence, so it has no interest in
+			// any message in the stream.
+			const numMsgs = 100
+			_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+				Durable:       "ahead",
+				AckPolicy:     nats.AckNonePolicy,
+				DeliverPolicy: nats.DeliverByStartSequencePolicy,
+				OptStartSeq:   numMsgs + 10,
+			})
+			require_NoError(t, err)
+
+			mset, err := s.GlobalAccount().lookupStream("TEST")
+			require_NoError(t, err)
+			for range numMsgs {
+				_, _, err = mset.store.StoreMsg("foo", nil, []byte("msg"), 0)
+				require_NoError(t, err)
+			}
+
+			// No consumer has interest in these messages, so they are removed.
+			mset.checkInterestState()
+			state := mset.state()
+			require_Equal(t, state.Msgs, 0)
+			require_Equal(t, state.FirstSeq, numMsgs+1)
+			require_Equal(t, state.LastSeq, numMsgs)
+		})
+	}
+}

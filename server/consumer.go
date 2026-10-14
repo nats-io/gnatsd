@@ -7248,7 +7248,13 @@ func (o *consumer) checkStateForInterestStream(ss *StreamState) error {
 
 	// Check if the underlying stream's last sequence is less than our floor.
 	// This can happen if the stream has been reset and has not caught up yet.
+	// We have no interest in any of the stream's messages, so our check floor is our ack floor+1.
 	if asflr > ss.LastSeq {
+		o.mu.Lock()
+		if asflr+1 > o.chkflr {
+			o.chkflr = asflr + 1
+		}
+		o.mu.Unlock()
 		return errAckFloorHigherThanLastSeq
 	}
 
