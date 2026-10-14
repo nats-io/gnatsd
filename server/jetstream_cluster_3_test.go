@@ -1802,7 +1802,7 @@ func TestJetStreamClusterConsumerAssignmentSameIdentity(t *testing.T) {
 		require_NotNil(t, mjs)
 		mjs.mu.RLock()
 		defer mjs.mu.RUnlock()
-		ca := mjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+		ca := mjs.consumerAssignmentOrInflight(globalAccountName, "TEST", "CONSUMER")
 		require_NotNil(t, ca)
 		// Clone so it survives subsequent delete/recreate of the live entry.
 		return ca.clone()
@@ -6212,7 +6212,7 @@ func TestJetStreamClusterConsumerLimitsUpdateGatedAtMetaLeader(t *testing.T) {
 			}
 			sjs := ml.getJetStream()
 			sjs.mu.RLock()
-			sa := sjs.streamAssignment(globalAccountName, "test")
+			sa := sjs.streamAssignmentOrInflight(globalAccountName, "test")
 			if sa == nil || sa.Config == nil {
 				sjs.mu.RUnlock()
 				return errors.New("no stream assignment")
@@ -11459,7 +11459,7 @@ func TestJetStreamClusterStreamScaleDownOfflinePeersHonorsReplicaCount(t *testin
 	// Get the stream peer set from the meta leader.
 	mjs := ml.getJetStream()
 	mjs.mu.RLock()
-	sa := mjs.streamAssignment(globalAccountName, "TEST")
+	sa := mjs.streamAssignmentOrInflight(globalAccountName, "TEST")
 	var streamPeers []string
 	if sa != nil {
 		streamPeers = copyStrings(sa.Group.Peers)
@@ -11611,7 +11611,7 @@ func TestJetStreamClusterConsumerScaleDownPrefersOnlinePeers(t *testing.T) {
 	ml := c.leader()
 	mjs := ml.getJetStream()
 	mjs.mu.RLock()
-	ca := mjs.consumerAssignment(globalAccountName, "TEST", "DUR")
+	ca := mjs.consumerAssignmentOrInflight(globalAccountName, "TEST", "DUR")
 	var consumerPeers []string
 	if ca != nil {
 		consumerPeers = copyStrings(ca.Group.Peers)
@@ -11835,7 +11835,7 @@ func TestJetStreamClusterMetaSnapshotRecoveryScaleStream(t *testing.T) {
 	mljs := ml.getJetStream()
 	mljs.mu.Lock()
 	var osa, nsa *streamAssignment
-	if osa = mljs.streamAssignment(globalAccountName, "TEST"); osa != nil {
+	if osa = mljs.streamAssignmentOrInflight(globalAccountName, "TEST"); osa != nil {
 		nsa = osa.copyGroup()
 	}
 	cc := mljs.cluster
@@ -11954,7 +11954,7 @@ func TestJetStreamClusterMetaSnapshotRecoveryScaleConsumer(t *testing.T) {
 	mljs := ml.getJetStream()
 	mljs.mu.Lock()
 	var oca, nca *consumerAssignment
-	if oca = mljs.consumerAssignment(globalAccountName, "TEST", "DUR"); oca != nil {
+	if oca = mljs.consumerAssignmentOrInflight(globalAccountName, "TEST", "DUR"); oca != nil {
 		nca = oca.copyGroup()
 	}
 	cc := mljs.cluster
@@ -12438,7 +12438,7 @@ func TestJetStreamClusterDesiredOriginRetentionBackToLimits(t *testing.T) {
 	snapshot := func() (retention, effective RetentionPolicy, origin *RetentionPolicy, pending bool) {
 		mjs.mu.RLock()
 		defer mjs.mu.RUnlock()
-		sa := mjs.streamAssignment(globalAccountName, "TEST")
+		sa := mjs.streamAssignmentOrInflight(globalAccountName, "TEST")
 		require_NotNil(t, sa)
 		if d := sa.Group.Desired; d != nil {
 			pending = true
@@ -12572,7 +12572,7 @@ func TestJetStreamClusterDesiredOriginRetentionCancelBackToInterest(t *testing.T
 	snapshot := func() (retention, effective RetentionPolicy, origin *RetentionPolicy, pending bool) {
 		mjs.mu.RLock()
 		defer mjs.mu.RUnlock()
-		sa := mjs.streamAssignment(globalAccountName, "TEST")
+		sa := mjs.streamAssignmentOrInflight(globalAccountName, "TEST")
 		require_NotNil(t, sa)
 		if d := sa.Group.Desired; d != nil {
 			pending = true
@@ -12853,7 +12853,7 @@ func TestJetStreamClusterDesiredOriginRetentionSurvivesConfigEdit(t *testing.T) 
 
 	require_True(t, ml == c.leader())
 	mjs.mu.RLock()
-	sa := mjs.streamAssignment(globalAccountName, "TEST")
+	sa := mjs.streamAssignmentOrInflight(globalAccountName, "TEST")
 	wasPending := sa != nil && sa.Group.Desired != nil
 	mjs.mu.RUnlock()
 	require_True(t, wasPending)
@@ -13339,7 +13339,7 @@ func proposeSelectedScaleDown(t *testing.T, c *cluster, stream, consumer string,
 	mjs := ml.getJetStream()
 	mjs.mu.Lock()
 	cc := mjs.cluster
-	ca := mjs.consumerAssignment(globalAccountName, stream, consumer)
+	ca := mjs.consumerAssignmentOrInflight(globalAccountName, stream, consumer)
 	if ca == nil || cc == nil || cc.meta == nil {
 		mjs.mu.Unlock()
 		t.Fatalf("no consumer assignment for %q", consumer)
@@ -15782,7 +15782,7 @@ func TestJetStreamClusterConsumerScaleDownDesiredAfterMetaLeaderChange(t *testin
 	mjs := ml.getJetStream()
 
 	mjs.mu.RLock()
-	ca := mjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+	ca := mjs.consumerAssignmentOrInflight(globalAccountName, "TEST", "CONSUMER")
 	require_NotNil(t, ca)
 	peers := copyStrings(ca.Group.Peers)
 	mjs.mu.RUnlock()
@@ -15904,6 +15904,16 @@ func TestJetStreamClusterReconcileMigratesConsumerBeforeDroppingStreamPeer(t *te
 	ml := c.leader()
 	require_NotNil(t, ml)
 	mjs := ml.getJetStream()
+
+	// The consumer leader responds to a create, wait for the meta leader to apply it.
+	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+		mjs.mu.RLock()
+		defer mjs.mu.RUnlock()
+		if mjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER") == nil {
+			return errors.New("consumer assignment not applied yet")
+		}
+		return nil
+	})
 
 	// The peer hosting the consumer is the one the scale down drops.
 	cl := c.consumerLeader(globalAccountName, "TEST", "CONSUMER")

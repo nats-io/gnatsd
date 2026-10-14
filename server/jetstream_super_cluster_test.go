@@ -3962,7 +3962,7 @@ func moveTestStreamGroup(t *testing.T, s *Server, account, stream string) (peers
 	}
 	js.mu.RLock()
 	defer js.mu.RUnlock()
-	sa := js.streamAssignment(account, stream)
+	sa := js.streamAssignmentOrInflight(account, stream)
 	if sa == nil || sa.Group == nil || sa.Config == nil {
 		return nil, _EMPTY_, 0
 	}
@@ -3978,11 +3978,7 @@ func moveTestConsumerGroup(t *testing.T, s *Server, account, stream, consumer st
 	}
 	js.mu.RLock()
 	defer js.mu.RUnlock()
-	sa := js.streamAssignment(account, stream)
-	if sa == nil {
-		return nil
-	}
-	ca := sa.consumers[consumer]
+	ca := js.consumerAssignmentOrInflight(account, stream, consumer)
 	if ca == nil || ca.Group == nil {
 		return nil
 	}
@@ -4017,6 +4013,16 @@ func moveTestInjectLegacyMove(t *testing.T, ml *Server, account, stream string, 
 	t.Helper()
 	mjs := ml.getJetStream()
 	require_NotNil(t, mjs)
+
+	// The stream leader responds to a create, wait for the meta leader to have applied it.
+	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		mjs.mu.RLock()
+		defer mjs.mu.RUnlock()
+		if mjs.streamAssignment(account, stream) == nil {
+			return fmt.Errorf("stream assignment for %q not applied yet", stream)
+		}
+		return nil
+	})
 
 	mjs.mu.Lock()
 	osa := mjs.streamAssignment(account, stream)

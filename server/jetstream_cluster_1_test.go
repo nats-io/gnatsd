@@ -3976,7 +3976,7 @@ func TestJetStreamClusterPeerRemovalAndStreamReassignmentOnNewServer(t *testing.
 	sjs := ml.getJetStream()
 	sjs.mu.RLock()
 	defer sjs.mu.RUnlock()
-	sa := sjs.streamAssignment(globalAccountName, "TEST")
+	sa := sjs.streamAssignmentOrInflight(globalAccountName, "TEST")
 	require_NotNil(t, sa)
 	require_Len(t, len(sa.Group.Excluded), 0)
 }
@@ -4178,8 +4178,8 @@ func TestJetStreamClusterUnderReplicatedNotMigrating(t *testing.T) {
 		require_NotNil(t, l)
 		ljs := l.getJetStream()
 		ljs.mu.RLock()
-		sa := ljs.streamAssignment(globalAccountName, "TEST")
-		ca := ljs.consumerAssignment(globalAccountName, "TEST", "dur")
+		sa := ljs.streamAssignmentOrInflight(globalAccountName, "TEST")
+		ca := ljs.consumerAssignmentOrInflight(globalAccountName, "TEST", "dur")
 		streamChurning := sa != nil && sa.Group != nil && sa.Group.Desired != nil
 		consumerChurning := ca != nil && ca.Group != nil && ca.Group.Desired != nil
 		ljs.mu.RUnlock()
@@ -4742,7 +4742,7 @@ func TestJetStreamClusterStreamPeerRemoveNoReplacementIsRejected(t *testing.T) {
 
 			sjs := ml.getJetStream()
 			sjs.mu.RLock()
-			sa := sjs.streamAssignment(globalAccountName, "TEST")
+			sa := sjs.streamAssignmentOrInflight(globalAccountName, "TEST")
 			peers := append([]string(nil), sa.Group.Peers...)
 			sjs.mu.RUnlock()
 			require_Len(t, len(peers), 3)
@@ -4778,6 +4778,16 @@ func TestJetStreamClusterStreamPeerRemoveNoReplacementIsRejected(t *testing.T) {
 				require_True(t, slices.Equal(sa.Group.Peers, peers))
 				require_True(t, sjs.cluster.inflightStreams[globalAccountName]["TEST"] == nil)
 			}
+			// The meta leader could still be applying the create.
+			checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+				sjs := ml.getJetStream()
+				sjs.mu.RLock()
+				defer sjs.mu.RUnlock()
+				if sjs.cluster.inflightStreams[globalAccountName]["TEST"] != nil {
+					return errors.New("stream assignment still inflight")
+				}
+				return nil
+			})
 			checkPeers()
 
 			// A meta leader change runs reconcilePeerAssignments, which must find
@@ -5362,7 +5372,7 @@ func TestJetStreamClusterConsumerPeerRemoveAndEvacuateMatrix(t *testing.T) {
 
 			sjs := ml.getJetStream()
 			sjs.mu.RLock()
-			sa := sjs.streamAssignment(globalAccountName, stream)
+			sa := sjs.streamAssignmentOrInflight(globalAccountName, stream)
 			streamPeers := append([]string(nil), sa.Group.Peers...)
 			sjs.mu.RUnlock()
 			require_Len(t, len(streamPeers), test.streamReplicas)
@@ -5473,7 +5483,7 @@ func TestJetStreamClusterConsumerPeerRemoveNoReplacementIsRejected(t *testing.T)
 
 			sjs := ml.getJetStream()
 			sjs.mu.RLock()
-			ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+			ca := sjs.consumerAssignmentOrInflight(globalAccountName, "TEST", "CONSUMER")
 			peers := append([]string(nil), ca.Group.Peers...)
 			sjs.mu.RUnlock()
 			require_Len(t, len(peers), 3)
@@ -5506,6 +5516,16 @@ func TestJetStreamClusterConsumerPeerRemoveNoReplacementIsRejected(t *testing.T)
 				require_True(t, slices.Equal(ca.Group.Peers, peers))
 				require_True(t, sjs.cluster.inflightConsumers[globalAccountName]["TEST"]["CONSUMER"] == nil)
 			}
+			// The meta leader could still be applying the create.
+			checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+				sjs := ml.getJetStream()
+				sjs.mu.RLock()
+				defer sjs.mu.RUnlock()
+				if sjs.cluster.inflightConsumers[globalAccountName]["TEST"]["CONSUMER"] != nil {
+					return errors.New("consumer assignment still inflight")
+				}
+				return nil
+			})
 			checkPeers()
 
 			// A meta leader change runs reconcilePeerAssignments, which must find
@@ -5564,7 +5584,7 @@ func TestJetStreamClusterConsumerPeerRemoveInvalidRequestIsRejected(t *testing.T
 
 	sjs := ml.getJetStream()
 	sjs.mu.RLock()
-	ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+	ca := sjs.consumerAssignmentOrInflight(globalAccountName, "TEST", "CONSUMER")
 	peers := append([]string(nil), ca.Group.Peers...)
 	sjs.mu.RUnlock()
 	require_Len(t, len(peers), 1)
@@ -5614,7 +5634,7 @@ func TestJetStreamClusterConsumerPeerRemoveInvalidRequestIsRejected(t *testing.T
 			// The consumer that was named is left where it was.
 			sjs.mu.RLock()
 			defer sjs.mu.RUnlock()
-			ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+			ca := sjs.consumerAssignmentOrInflight(globalAccountName, "TEST", "CONSUMER")
 			require_NotNil(t, ca)
 			require_True(t, slices.Equal(ca.Group.Peers, peers))
 		})
@@ -9528,8 +9548,12 @@ func TestJetStreamClusterProcessClusterUpdateStreamNilStreamAssignment(t *testin
 	s := c.randomServer()
 	acc, err := s.lookupAccount(globalAccountName)
 	require_NoError(t, err)
-	mset, err := acc.lookupStream("TEST")
-	require_NoError(t, err)
+	// Only the stream leader is known to have created the stream when it responds.
+	var mset *stream
+	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+		mset, err = acc.lookupStream("TEST")
+		return err
+	})
 
 	// Capture osa and build a sa that reflects the post-restart meta-replay
 	// conditions: a scale-up path where both the old and new raftGroup nodes
@@ -10872,6 +10896,16 @@ func TestJetStreamClusterProcessStreamAssignmentResults(t *testing.T) {
 	require_NoError(t, err)
 	mjs.processStreamAssignmentResults(nil, nil, nil, _EMPTY_, _EMPTY_, badAcc)
 
+	// The stream leader responds to a create, wait for the meta leader to apply it.
+	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+		mjs.mu.RLock()
+		defer mjs.mu.RUnlock()
+		if mjs.streamAssignment(globalAccountName, "TEST") == nil {
+			return errors.New("stream assignment not applied")
+		}
+		return nil
+	})
+
 	// Reset the assignment so it's treated as not-yet-responded, and ensure we're
 	// inside the canDelete window.
 	mjs.mu.Lock()
@@ -10931,6 +10965,16 @@ func TestJetStreamClusterProcessStreamAssignmentResultsRetry(t *testing.T) {
 	ml := sc.leader()
 	require_NotNil(t, ml)
 	mjs := ml.getJetStream()
+
+	// The stream leader responds to a create, wait for the meta leader to apply it.
+	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+		mjs.mu.RLock()
+		defer mjs.mu.RUnlock()
+		if mjs.streamAssignment(globalAccountName, "TEST") == nil {
+			return errors.New("stream assignment not applied")
+		}
+		return nil
+	})
 
 	// Determine the assigned cluster and an alternate to retry into.
 	mjs.mu.Lock()
@@ -11005,6 +11049,16 @@ func TestJetStreamClusterProcessConsumerAssignmentResults(t *testing.T) {
 	badAcc, err := json.Marshal(&consumerAssignmentResult{Account: "DOES_NOT_EXIST", Stream: "TEST", Consumer: "CONSUMER"})
 	require_NoError(t, err)
 	mjs.processConsumerAssignmentResults(nil, nil, nil, _EMPTY_, _EMPTY_, badAcc)
+
+	// The consumer leader responds to a create, wait for the meta leader to apply it.
+	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+		mjs.mu.RLock()
+		defer mjs.mu.RUnlock()
+		if mjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER") == nil {
+			return errors.New("consumer assignment not applied")
+		}
+		return nil
+	})
 
 	mjs.mu.Lock()
 	ca := mjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
@@ -16043,7 +16097,7 @@ func TestJetStreamClusterStreamPeerRemovePeerSetDesync(t *testing.T) {
 	// Get the stream's current peer set from the meta leader.
 	mjs := ml.getJetStream()
 	mjs.mu.RLock()
-	sa := mjs.streamAssignment(globalAccountName, "TEST")
+	sa := mjs.streamAssignmentOrInflight(globalAccountName, "TEST")
 	var origPeers []string
 	if sa != nil {
 		origPeers = copyStrings(sa.Group.Peers)
@@ -16578,7 +16632,7 @@ func TestJetStreamClusterRetentionChangeWaitsForConsumerParity(t *testing.T) {
 		mjs := ml.getJetStream()
 		mjs.mu.RLock()
 		defer mjs.mu.RUnlock()
-		ca := mjs.consumerAssignment(globalAccountName, "TEST", cname)
+		ca := mjs.consumerAssignmentOrInflight(globalAccountName, "TEST", cname)
 		if ca == nil || ca.Group == nil {
 			return 0
 		}
@@ -16774,10 +16828,10 @@ func TestJetStreamClusterRetentionChangeOriginSurvivesScale(t *testing.T) {
 		mjs := ml.getJetStream()
 		mjs.mu.RLock()
 		defer mjs.mu.RUnlock()
-		if sa := mjs.streamAssignment(globalAccountName, "TEST"); sa != nil && sa.Group != nil {
+		if sa := mjs.streamAssignmentOrInflight(globalAccountName, "TEST"); sa != nil && sa.Group != nil {
 			speers = sa.Group.Peers
 		}
-		if ca := mjs.consumerAssignment(globalAccountName, "TEST", cname); ca != nil && ca.Group != nil {
+		if ca := mjs.consumerAssignmentOrInflight(globalAccountName, "TEST", cname); ca != nil && ca.Group != nil {
 			cpeers = ca.Group.Peers
 		}
 		return speers, cpeers
@@ -16891,7 +16945,7 @@ func TestJetStreamClusterScaleStackingMoveExclusion(t *testing.T) {
 	mjs.mu.RLock()
 	var replicas, originReplicas int
 	var hasDesired bool
-	if sa := mjs.streamAssignment(globalAccountName, "TEST"); sa != nil && sa.Config != nil && sa.Group != nil {
+	if sa := mjs.streamAssignmentOrInflight(globalAccountName, "TEST"); sa != nil && sa.Config != nil && sa.Group != nil {
 		replicas = sa.Config.Replicas
 		if sa.Group.Desired != nil {
 			hasDesired = true
@@ -16977,7 +17031,7 @@ func TestJetStreamClusterRetentionChangeMoveExclusion(t *testing.T) {
 	require_NoError(t, err)
 
 	mjs.mu.RLock()
-	sa := mjs.streamAssignment(globalAccountName, "TEST")
+	sa := mjs.streamAssignmentOrInflight(globalAccountName, "TEST")
 	var hasDesired, isMove bool
 	var originReplicas int
 	if sa != nil && sa.Group != nil && sa.Group.Desired != nil {
