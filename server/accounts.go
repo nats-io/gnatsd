@@ -673,6 +673,14 @@ func (a *Account) MaxTotalConnectionsReached() bool {
 	return mtce
 }
 
+// maxTotalConnectionsExceeded returns true if the account has more client
+// connections than its limit, counting connections already registered.
+func (a *Account) maxTotalConnectionsExceeded() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.mconns != jwt.NoLimit && len(a.clients)-int(a.sysclients)+int(a.nrclients) > int(a.mconns)
+}
+
 // MaxActiveConnections return the set limit for the account system
 // wide for total number of active connections.
 func (a *Account) MaxActiveConnections() int {

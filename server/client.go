@@ -153,6 +153,7 @@ const (
 	compressionNegotiated                         // Marks if this connection has negotiated compression level with remote.
 	didTLSFirst                                   // Marks if this connection requested and was accepted doing the TLS handshake first (prior to INFO).
 	isSlowConsumer                                // Marks connection as a slow consumer.
+	authCallout                                   // Marks connection as authorized by the auth callout.
 )
 
 // set the flag (would be equivalent to set the boolean to true)
@@ -6177,6 +6178,13 @@ func (c *client) kindString() string {
 		return kindStringVal
 	}
 	return "Unknown Type"
+}
+
+// isAuthorizedByCallout returns true if the auth callout authorized this client.
+func (c *client) isAuthorizedByCallout() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.flags.isSet(authCallout)
 }
 
 // swapAccountAfterReload will check to make sure the bound account for this client

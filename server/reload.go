@@ -18,6 +18,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"reflect"
 	"slices"
@@ -54,6 +55,9 @@ type option interface {
 	// IsAuthChange indicates if this option requires reloading authorization.
 	IsAuthChange() bool
 
+	// IsAuthCalloutChange indicates if callout clients must authorize again.
+	IsAuthCalloutChange() bool
+
 	// IsTLSChange indicates if this option requires reloading TLS.
 	IsTLSChange() bool
 
@@ -85,6 +89,10 @@ func (n noopOption) IsTraceLevelChange() bool {
 }
 
 func (n noopOption) IsAuthChange() bool {
+	return false
+}
+
+func (n noopOption) IsAuthCalloutChange() bool {
 	return false
 }
 
@@ -306,6 +314,18 @@ type authOption struct {
 }
 
 func (o authOption) IsAuthChange() bool {
+	return true
+}
+
+// authCalloutOption closes callout clients when authentication settings change.
+type authCalloutOption struct {
+	authOption
+}
+
+// Authorization is reloaded after all options have been applied.
+func (o *authCalloutOption) Apply(s *Server) {}
+
+func (o *authCalloutOption) IsAuthCalloutChange() bool {
 	return true
 }
 
@@ -2008,6 +2028,9 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 		}
 	}
 
+	if s.trustedKeys == nil && calloutInputsChanged(oldOpts, newOpts) {
+		diffOpts = append(diffOpts, &authCalloutOption{})
+	}
 	return diffOpts, nil
 }
 
@@ -2030,6 +2053,7 @@ func (s *Server) applyOptions(ctx *reloadContext, opts []option) {
 	var (
 		reloadLogging      = false
 		reloadAuth         = false
+		closeCallouts      = false
 		reloadClusterPerms = false
 		reloadClientTrcLvl = false
 		reloadJetstream    = false
@@ -2047,6 +2071,9 @@ func (s *Server) applyOptions(ctx *reloadContext, opts []option) {
 		}
 		if opt.IsAuthChange() {
 			reloadAuth = true
+		}
+		if opt.IsAuthCalloutChange() {
+			closeCallouts = true
 		}
 		if opt.IsClusterPoolSizeOrAccountsChange() {
 			co = opt.(*clusterOption)
@@ -2070,7 +2097,7 @@ func (s *Server) applyOptions(ctx *reloadContext, opts []option) {
 		s.reloadClientTraceLevel()
 	}
 	if reloadAuth {
-		s.reloadAuthorization()
+		s.reloadAuthorization(closeCallouts)
 	}
 	if reloadClusterPerms {
 		s.reloadClusterPermissions(ctx.oldClusterPerms)
@@ -2185,8 +2212,9 @@ func (s *Server) reloadClientTraceLevel() {
 
 // reloadAuthorization reconfigures the server authorization settings,
 // disconnects any clients who are no longer authorized, and removes any
-// unauthorized subscriptions.
-func (s *Server) reloadAuthorization() {
+// unauthorized subscriptions. Existing callout clients keep their
+// authorization unless closeCallouts is set or their account was removed.
+func (s *Server) reloadAuthorization(closeCallouts bool) {
 	// This map will contain the names of accounts that have their streams
 	// import configuration changed.
 	var awcsti map[string]struct{}
@@ -2269,10 +2297,12 @@ func (s *Server) reloadAuthorization() {
 		routes    = routesa[:0]
 	)
 
-	// Gather clients that changed accounts. We will close them and they
-	// will reconnect, doing the right thing.
+	// Gather clients that changed accounts or need a fresh callout decision.
+	// We will close them and they will reconnect, doing the right thing.
 	for _, client := range s.clients {
 		if s.clientHasMovedToDifferentAccount(client) {
+			cclients = append(cclients, client)
+		} else if closeCallouts && client.isAuthorizedByCallout() {
 			cclients = append(cclients, client)
 		} else {
 			clients = append(clients, client)
@@ -2333,14 +2363,28 @@ func (s *Server) reloadAuthorization() {
 	}
 
 	for _, c := range clients {
+		callout := c.kind == CLIENT && s.trustedKeys == nil && c.isAuthorizedByCallout()
 		// Disconnect any unauthorized clients.
-		// Ignore internal clients.
-		if (c.kind == CLIENT || c.kind == LEAF) && !s.isClientAuthorized(c) {
+		// Ignore internal clients and clients already authorized by callout.
+		if (c.kind == CLIENT || c.kind == LEAF) && !callout && !s.isClientAuthorized(c) {
 			c.authViolation()
 			continue
 		}
 		// Check to make sure account is correct.
 		c.swapAccountAfterReload()
+		if callout {
+			// Refresh account limits for clients that skipped reauthentication.
+			c.mu.Lock()
+			acc := c.acc
+			c.mu.Unlock()
+			if acc.maxTotalConnectionsExceeded() {
+				c.maxAccountConnExceeded()
+				continue
+			}
+			c.mu.Lock()
+			c.applyAccountLimits()
+			c.mu.Unlock()
+		}
 		// Remove any unauthorized subscriptions and check for account imports.
 		c.processSubsOnConfigReload(awcsti)
 	}
@@ -2387,6 +2431,15 @@ func (s *Server) clientHasMovedToDifferentAccount(c *client) bool {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// A client authorized by the auth callout is not in the configured users,
+	// so check only whether its account still exists.
+	if c.flags.isSet(authCallout) {
+		if c.acc == nil {
+			return true
+		}
+		_, ok := s.accounts.Load(c.acc.Name)
+		return !ok
+	}
 	if c.opts.Nkey != _EMPTY_ {
 		if s.nkeys != nil {
 			nu = s.nkeys[c.opts.Nkey]
@@ -2410,6 +2463,48 @@ func (s *Server) clientHasMovedToDifferentAccount(c *client) bool {
 	}
 	// user/nkey no longer exists.
 	return true
+}
+
+// calloutInputsChanged checks server tags and authentication settings that
+// affect which clients use the callout.
+func calloutInputsChanged(curOpts, newOpts *Options) bool {
+	if newOpts.AuthCallout == nil {
+		return false
+	}
+	if !slices.Equal(curOpts.Tags, newOpts.Tags) {
+		return true
+	}
+	if curOpts.Username != newOpts.Username || curOpts.Password != newOpts.Password ||
+		curOpts.Authorization != newOpts.Authorization || curOpts.NoAuthUser != newOpts.NoAuthUser ||
+		curOpts.TLSMap != newOpts.TLSMap || curOpts.TLSVerify != newOpts.TLSVerify ||
+		curOpts.ProxyRequired != newOpts.ProxyRequired {
+		return true
+	}
+	return staticAuthChanged(curOpts.Users, newOpts.Users, curOpts.Nkeys, newOpts.Nkeys)
+}
+
+// staticAuthChanged compares authentication fields, ignoring permissions.
+// diffOptions must sort Users and Nkeys before this comparison.
+func staticAuthChanged(curUsers, newUsers []*User, curNkeys, newNkeys []*NkeyUser) bool {
+	if len(curUsers) != len(newUsers) || len(curNkeys) != len(newNkeys) {
+		return true
+	}
+	for i, u := range curUsers {
+		v := newUsers[i]
+		if u.Username != v.Username || u.Password != v.Password || u.Account.GetName() != v.Account.GetName() ||
+			!u.ConnectionDeadline.Equal(v.ConnectionDeadline) ||
+			u.ProxyRequired != v.ProxyRequired || !maps.Equal(u.AllowedConnectionTypes, v.AllowedConnectionTypes) {
+			return true
+		}
+	}
+	for i, u := range curNkeys {
+		v := newNkeys[i]
+		if u.Nkey != v.Nkey || u.Account.GetName() != v.Account.GetName() || u.ProxyRequired != v.ProxyRequired ||
+			!maps.Equal(u.AllowedConnectionTypes, v.AllowedConnectionTypes) {
+			return true
+		}
+	}
+	return false
 }
 
 // reloadClusterPermissions reconfigures the cluster's permssions

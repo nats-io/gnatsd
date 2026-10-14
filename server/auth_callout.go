@@ -326,16 +326,17 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 			return
 		}
 
+		c.mu.Lock()
+		c.flags.set(authCallout)
 		// See if the response wants to override the username.
 		if arc.Name != _EMPTY_ {
-			c.mu.Lock()
 			c.opts.Username = arc.Name
 			// Clear any others.
 			c.opts.Nkey = _EMPTY_
 			c.pubKey = _EMPTY_
 			c.opts.Token = _EMPTY_
-			c.mu.Unlock()
 		}
+		c.mu.Unlock()
 
 		// Check if we need to set an auth timer if the user jwt expires.
 		c.setExpiration(arc.Claims(), expiration)
