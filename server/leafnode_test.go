@@ -13864,3 +13864,96 @@ func TestLeafNodeImportedRequestReplyAcrossHubCluster(t *testing.T) {
 		})
 	}
 }
+
+// Interest a hub learns over a gateway is propagated to its leafnodes and has
+// to be retracted from them when that gateway connection closes, as
+// removeRemoteSubs does for routes. Interest the hub also holds locally for
+// the same subjects must survive.
+func TestLeafNodeInterestLeakOnGatewayClose(t *testing.T) {
+	const numSubjects, numLocal = 10, 2
+
+	ob := testDefaultOptionsForGateway("B")
+	b := runGatewayServer(ob)
+	defer b.Shutdown()
+
+	// Gateways and leafnodes on one server require a system account. The
+	// leafnode also switches the gateway to interest-only mode, which is
+	// where every RS+ is propagated to leafnodes.
+	oa := testGatewayOptionsFromToWithServers(t, "A", "B", b)
+	oa.NoSystemAccount = false
+	oa.Accounts = []*Account{NewAccount("SYS")}
+	oa.SystemAccount = "SYS"
+	oa.LeafNode.Host = "127.0.0.1"
+	oa.LeafNode.Port = -1
+	a := runGatewayServer(oa)
+	defer a.Shutdown()
+	waitForOutboundGateways(t, a, 1, 2*time.Second)
+	waitForOutboundGateways(t, b, 1, 2*time.Second)
+
+	ln, _ := runSolicitLeafServer(oa)
+	defer ln.Shutdown()
+	checkLeafNodeConnected(t, ln)
+	checkGWInterestOnlyMode(t, a, "B", globalAccountName)
+
+	// A leafnode reconnect rebuilds its interest from scratch and would hide
+	// a leak, so pin the connection being checked.
+	lz, err := ln.Leafz(nil)
+	require_NoError(t, err)
+	require_Equal(t, lz.NumLeafs, 1)
+	leafID := lz.Leafs[0].ID
+
+	// The leafnode must hold every subject if gw is true, otherwise only the
+	// ones also subscribed to on "A".
+	checkInterest := func(gw bool) error {
+		lz, err := ln.Leafz(&LeafzOptions{Subscriptions: true})
+		if err != nil {
+			return err
+		}
+		if lz.NumLeafs != 1 || lz.Leafs[0].ID != leafID {
+			return fmt.Errorf("Leafnode connection changed")
+		}
+		subs := make(map[string]struct{}, len(lz.Leafs[0].Subs))
+		for _, sub := range lz.Leafs[0].Subs {
+			subs[sub] = struct{}{}
+		}
+		for i := range numSubjects {
+			expected := gw || i < numLocal
+			for _, subj := range []string{fmt.Sprintf("foo.%d", i), fmt.Sprintf("bar.%d", i)} {
+				if _, ok := subs[subj]; ok != expected {
+					return fmt.Errorf("Interest on %q is %v, expected %v", subj, ok, expected)
+				}
+			}
+		}
+		return nil
+	}
+
+	// NoReconnect keeps the client from failing over to "A" when "B" shuts
+	// down, where its re-created subscriptions would be real interest.
+	ncb := natsConnect(t, b.ClientURL(), nats.NoReconnect())
+	defer ncb.Close()
+	for i := range numSubjects {
+		natsSubSync(t, ncb, fmt.Sprintf("foo.%d", i))
+		natsQueueSubSync(t, ncb, fmt.Sprintf("bar.%d", i), "workers")
+	}
+	natsFlush(t, ncb)
+
+	nca := natsConnect(t, a.ClientURL())
+	defer nca.Close()
+	for i := range numLocal {
+		natsSubSync(t, nca, fmt.Sprintf("foo.%d", i))
+		natsQueueSubSync(t, nca, fmt.Sprintf("bar.%d", i), "workers")
+	}
+	natsFlush(t, nca)
+	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error { return checkInterest(true) })
+
+	b.Shutdown()
+	waitForOutboundGateways(t, a, 0, 2*time.Second)
+	checkFor(t, time.Second, 25*time.Millisecond, func() error { return checkInterest(false) })
+
+	// Retractions go out in map order, so a wrong one for a local subject may
+	// still be in flight. Check again once a newer subscription has arrived.
+	natsSubSync(t, nca, "barrier")
+	natsFlush(t, nca)
+	checkSubInterest(t, ln, globalAccountName, "barrier", time.Second)
+	require_NoError(t, checkInterest(false))
+}
