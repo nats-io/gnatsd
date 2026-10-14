@@ -5434,7 +5434,7 @@ func TestJetStreamClusterDuplicateMsgIdsOnCatchupAndLeaderTakeover(t *testing.T)
 	require_NoError(t, err)
 	if node := mset.raftNode(); node == nil {
 		t.Fatalf("Could not get stream group name")
-	} else if err := node.InstallSnapshot(mset.stateSnapshot(), false); err != nil {
+	} else if err := node.InstallSnapshot(mset.stateSnapshot(), true); err != nil {
 		t.Fatalf("Error installing snapshot: %v", err)
 	}
 
