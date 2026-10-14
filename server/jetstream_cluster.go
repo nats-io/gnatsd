@@ -6279,6 +6279,9 @@ var (
 
 	// migrateCatchupStall is how long a catching up desired peer may go without progress before we stop waiting for it.
 	migrateCatchupStall = 3 * migratePosAskInterval
+
+	// migrateFirstPeerGrace is how long the only member waits for a learner to catch up before adding it anyway.
+	migrateFirstPeerGrace = 10 * time.Second
 )
 
 // Determines if we should send lost quorum advisory. We throttle these after first one.
@@ -11775,15 +11778,24 @@ func (s *Server) selectPeerToAdd(n RaftNode, ourPeerId string, current []*Peer, 
 		si, ok := s.nodeToInfo.Load(peer)
 		return ok && si != nil && !si.(nodeInfo).offline
 	}
-	// Prefer the caught up candidate we've heard from most recently.
-	add, last, catchingUp := _EMPTY_, time.Time{}, false
+	// As the only member our writes don't wait on anyone, so a learner may never catch up while they continue.
+	soleMember := len(current) == 1 && current[0].ID == ourPeerId
+	// Prefer the most caught up candidate, then the one we've heard from most recently.
+	add, most, last, catchingUp := _EMPTY_, uint64(0), time.Time{}, false
 	for _, peer := range candidates {
 		if ts := n.LastHeardFromFollower(peer); online(peer) && withinLiveWindow(ts) {
+			index, since := n.LearnerProgress(peer)
 			// Only added once caught up as a learner, so a lagging member doesn't hold up quorum.
-			if !n.IsFollowerCaughtUp(peer) {
+			caughtUp := n.IsFollowerCaughtUp(peer)
+			// As the only member, replication may be too slow to catch up with our writes.
+			// So we eventually add the first peer anyway.
+			if !caughtUp && soleMember {
+				caughtUp = index > 0 && !since.IsZero() && time.Since(since) >= migrateFirstPeerGrace
+			}
+			if !caughtUp {
 				catchingUp = true
-			} else if ts.After(last) {
-				add, last = peer, ts
+			} else if add == _EMPTY_ || index > most || (index == most && ts.After(last)) {
+				add, most, last = peer, index, ts
 			}
 		}
 	}

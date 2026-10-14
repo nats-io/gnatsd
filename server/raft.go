@@ -74,6 +74,7 @@ type RaftNode interface {
 	VotingPeerNames() []string
 	LastHeardFromFollower(peer string) time.Time
 	IsFollowerCaughtUp(peer string) bool
+	LearnerProgress(peer string) (index uint64, since time.Time)
 	ProposeAddPeer(peer string) error
 	ProposeRemovePeer(peer string) error
 	EvictPeers(peers []string) ([]string, error)
@@ -305,6 +306,7 @@ type lps struct {
 	ts time.Time // Last timestamp
 	li uint64    // Last index replicated
 	ci uint64    // Index the follower must reach to be caught up
+	fs time.Time // First timestamp, when we started tracking a learner
 }
 
 type membChange struct {
@@ -4250,7 +4252,7 @@ func (n *raft) trackPeer(peer string) error {
 		ps := n.observed[peer]
 		if ps == nil {
 			// A learner must reach what we have on first contact to be caught up.
-			ps = &lps{ci: n.pindex}
+			ps = &lps{ci: n.pindex, fs: time.Now()}
 			n.observed[peer] = ps
 			// On first contact, nudge the upper layer so it can check if this unblocks adding the peer.
 			if n.leaderState.Load() {
@@ -4291,6 +4293,18 @@ func (n *raft) LastHeardFromFollower(peer string) time.Time {
 		return ps.ts
 	}
 	return time.Time{}
+}
+
+// LearnerProgress returns the last index a learner replicated, and since when we track it.
+// Zero if the peer isn't a learner we're tracking.
+// Only known by the leader.
+func (n *raft) LearnerProgress(peer string) (index uint64, since time.Time) {
+	n.RLock()
+	defer n.RUnlock()
+	if ps := n.observed[peer]; ps != nil && n.peers[peer] == nil {
+		return ps.li, ps.fs
+	}
+	return 0, time.Time{}
 }
 
 // progressLocked returns the state of a member, or of a learner if not a member.
