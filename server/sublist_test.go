@@ -1191,6 +1191,14 @@ func TestIsSubsetMatch(t *testing.T) {
 		{"foo.>", "foo.bar", false},
 		{"foo..bar", "foo.*", false}, // Bad subject, we return false
 		{"foo.*", "foo..bar", false}, // Bad subject, we return false
+		// A wildcard char inside a token is a literal.
+		{"foo.bar", "foo.*bar", false},
+		{"foo.bar", "foo.**", false},
+		{"foo.*bar", "foo.*bar", true},
+		{"foo.*bar", "foo.*", true},
+		{"foo.*", "foo.*bar", false},
+		{"foo.bar", "foo.bar*", false},
+		{"foo.bar", "foo.>bar", false},
 	} {
 		t.Run("", func(t *testing.T) {
 			if res := subjectIsSubsetMatch(test.subject, test.test); res != test.result {

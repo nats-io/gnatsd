@@ -1539,7 +1539,7 @@ func isSubsetMatchTokenized(tokens, test []string) bool {
 			}
 			continue
 		}
-		if t2[0] != pwc && strings.Compare(t1, t2) != 0 {
+		if t2 != pwcs && strings.Compare(t1, t2) != 0 {
 			return false
 		}
 	}
