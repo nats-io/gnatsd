@@ -7170,28 +7170,28 @@ func TestMonitorHealthzLeafRemotes(t *testing.T) {
 	}
 
 	// Remote connects.
-	checkStatus("?leaf-remotes=true", http.StatusOK)
-	code, hs := get("?leaf-remotes=true&details=true")
+	checkStatus("?leaf-remotes-connected=true", http.StatusOK)
+	code, hs := get("?leaf-remotes-connected=true&details=true")
 	require_Equal(t, code, http.StatusOK)
 	require_Equal(t, len(hs.Errors), 0)
 
 	// Drop the link and prevent it from coming back.
 	leaf.closeAndDisableLeafnodes()
-	checkStatus("?leaf-remotes=true", http.StatusServiceUnavailable)
+	checkStatus("?leaf-remotes-connected=true", http.StatusServiceUnavailable)
 	// Plain healthz is unaffected by the remote being down.
 	code, _ = get("")
 	require_Equal(t, code, http.StatusOK)
-	code, hs = get("?leaf-remotes=true")
+	code, hs = get("?leaf-remotes-connected=true")
 	require_Equal(t, code, http.StatusServiceUnavailable)
 	require_True(t, strings.Contains(hs.Error, "is not connected"))
-	code, hs = get("?leaf-remotes=true&details=true")
+	code, hs = get("?leaf-remotes-connected=true&details=true")
 	require_Equal(t, code, http.StatusServiceUnavailable)
 	require_Equal(t, len(hs.Errors), 1)
 	require_Equal(t, hs.Errors[0].Type, HealthzErrorConn)
 
 	// Allow it to reconnect.
 	leaf.reEnableLeafnodes()
-	checkStatus("?leaf-remotes=true", http.StatusOK)
+	checkStatus("?leaf-remotes-connected=true", http.StatusOK)
 }
 
 func TestMonitorHealthzLeafRemotesMultipleAndDisabled(t *testing.T) {
@@ -7216,7 +7216,7 @@ func TestMonitorHealthzLeafRemotesMultipleAndDisabled(t *testing.T) {
 	s, _ := RunServerWithConfig(conf)
 	defer s.Shutdown()
 
-	hs := s.Healthz(&HealthzOptions{LeafRemotes: true, Details: true})
+	hs := s.Healthz(&HealthzOptions{LeafRemotesConnected: true, Details: true})
 	require_Equal(t, hs.StatusCode, http.StatusServiceUnavailable)
 	require_Equal(t, hs.Status, "error")
 	// Both enabled remotes are reported, in a stable order, and the disabled one is not.
@@ -7228,11 +7228,11 @@ func TestMonitorHealthzLeafRemotesMultipleAndDisabled(t *testing.T) {
 		require_False(t, strings.Contains(he.Error, `account "C"`))
 	}
 
-	// Without details, a single error string lists them all.
-	hs = s.Healthz(&HealthzOptions{LeafRemotes: true})
+	// Without details, only the first error is returned.
+	hs = s.Healthz(&HealthzOptions{LeafRemotesConnected: true})
 	require_Equal(t, hs.StatusCode, http.StatusServiceUnavailable)
 	require_True(t, strings.Contains(hs.Error, `account "A"`))
-	require_True(t, strings.Contains(hs.Error, `account "B"`))
+	require_False(t, strings.Contains(hs.Error, `account "B"`))
 	require_False(t, strings.Contains(hs.Error, `account "C"`))
 
 	// Same server without the option is healthy.
@@ -7254,7 +7254,7 @@ func TestMonitorHealthzLeafRemotesErrorDoesNotLeakSecrets(t *testing.T) {
 	s, _ := RunServerWithConfig(conf)
 	defer s.Shutdown()
 
-	hs := s.Healthz(&HealthzOptions{LeafRemotes: true})
+	hs := s.Healthz(&HealthzOptions{LeafRemotesConnected: true})
 	require_Equal(t, hs.StatusCode, http.StatusServiceUnavailable)
 	for _, secret := range []string{"s3cr3tpass", "secret-creds-file", "credentials"} {
 		require_False(t, strings.Contains(hs.Error, secret))
@@ -7291,7 +7291,7 @@ func TestMonitorHealthzLeafRemotesSystemAccountRequest(t *testing.T) {
 		return resp.Data
 	}
 
-	hs := request(`{"leaf-remotes":true}`)
+	hs := request(`{"leaf-remotes-connected":true}`)
 	require_Equal(t, hs.StatusCode, http.StatusServiceUnavailable)
 	require_True(t, strings.Contains(hs.Error, "is not connected"))
 

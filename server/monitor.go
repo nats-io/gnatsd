@@ -3017,15 +3017,15 @@ type JSzOptions struct {
 // HealthzOptions are options passed to Healthz
 type HealthzOptions struct {
 	// Deprecated: Use JSEnabledOnly instead
-	JSEnabled     bool   `json:"js-enabled,omitempty"`
-	JSEnabledOnly bool   `json:"js-enabled-only,omitempty"`
-	JSServerOnly  bool   `json:"js-server-only,omitempty"`
-	JSMetaOnly    bool   `json:"js-meta-only,omitempty"`
-	LeafRemotes   bool   `json:"leaf-remotes,omitempty"`
-	Account       string `json:"account,omitempty"`
-	Stream        string `json:"stream,omitempty"`
-	Consumer      string `json:"consumer,omitempty"`
-	Details       bool   `json:"details,omitempty"`
+	JSEnabled            bool   `json:"js-enabled,omitempty"`
+	JSEnabledOnly        bool   `json:"js-enabled-only,omitempty"`
+	JSServerOnly         bool   `json:"js-server-only,omitempty"`
+	JSMetaOnly           bool   `json:"js-meta-only,omitempty"`
+	LeafRemotesConnected bool   `json:"leaf-remotes-connected,omitempty"`
+	Account              string `json:"account,omitempty"`
+	Stream               string `json:"stream,omitempty"`
+	Consumer             string `json:"consumer,omitempty"`
+	Details              bool   `json:"details,omitempty"`
 }
 
 // ProfilezOptions are options passed to Profilez
@@ -3599,7 +3599,7 @@ func (s *Server) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	leafRemotes, err := decodeBool(w, r, "leaf-remotes")
+	leafRemotesConnected, err := decodeBool(w, r, "leaf-remotes-connected")
 	if err != nil {
 		return
 	}
@@ -3610,15 +3610,15 @@ func (s *Server) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 	}
 
 	hs := s.healthz(&HealthzOptions{
-		JSEnabled:     jsEnabled,
-		JSEnabledOnly: jsEnabledOnly,
-		JSServerOnly:  jsServerOnly,
-		JSMetaOnly:    jsMetaOnly,
-		LeafRemotes:   leafRemotes,
-		Account:       r.URL.Query().Get("account"),
-		Stream:        r.URL.Query().Get("stream"),
-		Consumer:      r.URL.Query().Get("consumer"),
-		Details:       includeDetails,
+		JSEnabled:            jsEnabled,
+		JSEnabledOnly:        jsEnabledOnly,
+		JSServerOnly:         jsServerOnly,
+		JSMetaOnly:           jsMetaOnly,
+		LeafRemotesConnected: leafRemotesConnected,
+		Account:              r.URL.Query().Get("account"),
+		Stream:               r.URL.Query().Get("stream"),
+		Consumer:             r.URL.Query().Get("consumer"),
+		Details:              includeDetails,
 	})
 
 	code := hs.StatusCode
@@ -3641,6 +3641,7 @@ func (s *Server) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 // Generate health status.
 func (s *Server) healthz(opts *HealthzOptions) *HealthStatus {
 	var health = &HealthStatus{Status: "ok"}
+	const na = "unavailable"
 
 	// set option defaults
 	if opts == nil {
@@ -3709,12 +3710,12 @@ func (s *Server) healthz(opts *HealthzOptions) *HealthStatus {
 	}
 
 	// If requested, make sure every enabled solicited leafnode remote is connected.
-	if opts.LeafRemotes {
+	if opts.LeafRemotesConnected {
 		if errs := s.disconnectedLeafRemotes(); len(errs) > 0 {
 			health.StatusCode = http.StatusServiceUnavailable
-			health.Status = "unavailable"
+			health.Status = na
 			if !details {
-				health.Error = strings.Join(errs, "; ")
+				health.Error = errs[0]
 				return health
 			}
 			for _, e := range errs {
@@ -3738,7 +3739,6 @@ func (s *Server) healthz(opts *HealthzOptions) *HealthStatus {
 
 	// Access the Jetstream state to perform additional checks.
 	js := s.getJetStream()
-	const na = "unavailable"
 	if !js.isEnabled() {
 		health.StatusCode = http.StatusServiceUnavailable
 		health.Status = na
