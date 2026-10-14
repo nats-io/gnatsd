@@ -5028,9 +5028,9 @@ func (s *Server) removeEvictedPeers(n, meta RaftNode, actual []*Peer, actualPeer
 	// stable throughout. Step down and perform a leader transfer if we'd remove
 	// ourselves, preferring a successor that is already in the desired peer set.
 	ourPeerId := n.ID()
-	remove := s.selectPeerToRemove(ourPeerId, actual, evicted, nil)
+	remove := s.selectPeerToRemove(n, ourPeerId, actual, evicted, nil)
 	if remove == ourPeerId {
-		err := n.StepDown(s.selectStepDownPreferred(ourPeerId, actual, desiredPeers))
+		err := n.StepDown(s.selectStepDownPreferred(n, ourPeerId, actual, desiredPeers))
 		return hosted, mstat(MigrationStatusMembership, "stepping down, evicted from group").withErr(err)
 	}
 	err := n.ProposeRemovePeer(remove)
@@ -5162,15 +5162,15 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 	if status != nil {
 		return status
 	}
+	// If scaling down, we need to select where to.
+	if desiredScaleDown {
+		update.ScaleDownPeers = s.selectScaleDownPeers(n, ourPeerId, actual, desiredPeers, replicas)
+		sendMetaUpdate()
+		return mstat(MigrationStatusMeta, "selecting peers to scale down to")
+	}
 	// Extend the actual peer set through the log.
 	if status := s.extendPeerSet(n, actual, actualPeers, current, desiredPeers, hostedPeers); status != nil {
 		return status
-	}
-	// If scaling down, we need to select where to.
-	if desiredScaleDown {
-		update.ScaleDownPeers = s.selectScaleDownPeers(ourPeerId, actual, desiredPeers, replicas)
-		sendMetaUpdate()
-		return mstat(MigrationStatusMeta, "selecting peers to scale down to")
 	}
 
 	// Add peers in our desired peer set.
@@ -5251,7 +5251,7 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 		}
 
 		// Remove old peers one at a time, the leader selected last.
-		remove := s.selectPeerToRemove(ourPeerId, actual, remaining, hostedPeers)
+		remove := s.selectPeerToRemove(n, ourPeerId, actual, remaining, hostedPeers)
 		if remove == _EMPTY_ {
 			return mstat(MigrationStatusBlocked, "waiting to select a peer to remove")
 		}
@@ -5290,7 +5290,7 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 		}
 		// If we have current desired peers, and we're not a desired peer ourselves, step down.
 		if len(currentDesired) > 0 && !slices.Contains(desiredPeers, ourPeerId) {
-			preferred := s.selectStepDownPreferred(ourPeerId, actual, currentDesired)
+			preferred := s.selectStepDownPreferred(n, ourPeerId, actual, currentDesired)
 			if preferred == _EMPTY_ {
 				return mstat(MigrationStatusMembership, "waiting for a desired peer to step down to")
 			}
@@ -5315,7 +5315,7 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 		}
 		// Wait for a successor that holds the stream's data, rather than leave it to an election.
 		candidates := stepDownCandidates(ourPeerId, actual, desiredPeers, desiredMembers)
-		preferred := s.selectStepDownPreferred(ourPeerId, actual, candidates)
+		preferred := s.selectStepDownPreferred(n, ourPeerId, actual, candidates)
 		if preferred == _EMPTY_ {
 			return mstat(MigrationStatusMembership, "waiting for a desired peer to step down to")
 		}
@@ -8556,15 +8556,15 @@ func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n
 	if _, status := s.removeEvictedPeers(n, meta, actual, actualPeers, current, desiredPeers, nil); status != nil {
 		return status
 	}
+	// If scaling down, we need to select where to.
+	if desiredScaleDown {
+		update.ScaleDownPeers = s.selectScaleDownPeers(n, ourPeerId, actual, desiredPeers, replicas)
+		sendMetaUpdate()
+		return mstat(MigrationStatusMeta, "selecting peers to scale down to")
+	}
 	// Extend the actual peer set through the log.
 	if status := s.extendPeerSet(n, actual, actualPeers, current, desiredPeers, nil); status != nil {
 		return status
-	}
-	// If scaling down, we need to select where to.
-	if desiredScaleDown {
-		update.ScaleDownPeers = s.selectScaleDownPeers(ourPeerId, actual, desiredPeers, replicas)
-		sendMetaUpdate()
-		return mstat(MigrationStatusMeta, "selecting peers to scale down to")
 	}
 
 	// Add peers in our desired peer set.
@@ -8621,7 +8621,7 @@ func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n
 		// Step down and perform a leader transfer if we'd remove ourselves. We are
 		// selected last, so leadership changes at most once, and every remaining
 		// member is already in the desired peer set.
-		remove := s.selectPeerToRemove(ourPeerId, actual, remaining, nil)
+		remove := s.selectPeerToRemove(n, ourPeerId, actual, remaining, nil)
 		if remove == _EMPTY_ {
 			return mstat(MigrationStatusBlocked, "waiting to select a peer to remove")
 		}
@@ -8642,7 +8642,7 @@ func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n
 		if remove == ourPeerId {
 			// Wait for a successor that holds the stream's data, rather than leave it to an election.
 			candidates := stepDownCandidates(ourPeerId, actual, desiredPeers, streamMembers)
-			preferred := s.selectStepDownPreferred(ourPeerId, actual, candidates)
+			preferred := s.selectStepDownPreferred(n, ourPeerId, actual, candidates)
 			if preferred == _EMPTY_ {
 				return mstat(MigrationStatusMembership, "waiting for a desired peer to step down to")
 			}
@@ -11657,9 +11657,10 @@ func (s *Server) allPeersOffline(rg *raftGroup) bool {
 // they are to keep when scaling a raft group down, most preferable first:
 //  1. the current leader, if known and a candidate
 //  2. peers in the current peer set that are online, least lag first
-//  3. peers in the current peer set that are offline, least lag first
-//  4. peers not in the current peer set, these are treated as offline
-func (s *Server) sortScaleDownPeers(curLeader string, current []*Peer, candidates []string) []string {
+//  3. peers not in the current peer set that are caught up on our log
+//  4. peers in the current peer set that are offline, least lag first
+//  5. peers not in the current peer set, these are treated as offline
+func (s *Server) sortScaleDownPeers(n RaftNode, curLeader string, current []*Peer, candidates []string) []string {
 	peers := make(map[string]*Peer, len(current))
 	for _, p := range current {
 		peers[p.ID] = p
@@ -11679,7 +11680,12 @@ func (s *Server) sortScaleDownPeers(curLeader string, current []*Peer, candidate
 		}
 		p := peers[id]
 		if p == nil {
-			ranks[id] = rank{tier: 3}
+			// A caught up learner holds the log, so it's kept over a member that's offline.
+			if n.IsFollowerCaughtUp(id) {
+				ranks[id] = rank{tier: 2}
+			} else {
+				ranks[id] = rank{tier: 4}
+			}
 			continue
 		}
 		// Unknown peers are treated as offline.
@@ -11688,7 +11694,7 @@ func (s *Server) sortScaleDownPeers(curLeader string, current []*Peer, candidate
 			offline = si.(nodeInfo).offline
 		}
 		if offline {
-			ranks[id] = rank{tier: 2, lag: p.Lag}
+			ranks[id] = rank{tier: 3, lag: p.Lag}
 		} else {
 			ranks[id] = rank{tier: 1, lag: p.Lag}
 		}
@@ -11707,10 +11713,10 @@ func (s *Server) sortScaleDownPeers(curLeader string, current []*Peer, candidate
 
 // Select the peers to keep when scaling a raft group down to replicas.
 // The current leader, if known and a candidate, is always kept. Online peers
-// with the least lag are preferred, but we will fall back to offline peers to
-// honor the requested replica count.
-func (s *Server) selectScaleDownPeers(curLeader string, current []*Peer, peers []string, replicas int) []string {
-	sorted := s.sortScaleDownPeers(curLeader, current, peers)
+// with the least lag are preferred, then caught up learners, but we will fall
+// back to offline peers to honor the requested replica count.
+func (s *Server) selectScaleDownPeers(n RaftNode, curLeader string, current []*Peer, peers []string, replicas int) []string {
+	sorted := s.sortScaleDownPeers(n, curLeader, current, peers)
 	if len(sorted) > replicas {
 		sorted = sorted[:replicas]
 	}
@@ -11721,7 +11727,7 @@ func (s *Server) selectScaleDownPeers(curLeader string, current []*Peer, peers [
 // remove during scale-down: peers unknown to the group first, then offline
 // peers, then online peers with the most lag. The current leader, if among the
 // candidates, is picked last so leadership is transferred at most once.
-func (s *Server) selectPeerToRemove(curLeader string, current []*Peer, remaining, hosted []string) string {
+func (s *Server) selectPeerToRemove(n RaftNode, curLeader string, current []*Peer, remaining, hosted []string) string {
 	// A peer that still hosts a consumer keeps serving the stream's data until the
 	// consumer has migrated off, so it's not up for removal yet.
 	remaining = slices.DeleteFunc(remaining, func(peer string) bool {
@@ -11730,7 +11736,7 @@ func (s *Server) selectPeerToRemove(curLeader string, current []*Peer, remaining
 	if len(remaining) == 0 {
 		return _EMPTY_
 	}
-	sorted := s.sortScaleDownPeers(curLeader, current, remaining)
+	sorted := s.sortScaleDownPeers(n, curLeader, current, remaining)
 	if len(sorted) == 0 {
 		return _EMPTY_
 	}
@@ -11815,14 +11821,14 @@ func stepDownCandidates(ourPeerId string, actual []*Peer, desiredPeers, members 
 // selectStepDownPreferred picks the peer to transfer leadership to before the
 // current leader removes itself from the group: the most preferable member of
 // the desired peer set. Empty if no desired peer is part of the group yet.
-func (s *Server) selectStepDownPreferred(ourPeerId string, current []*Peer, desired []string) string {
+func (s *Server) selectStepDownPreferred(n RaftNode, ourPeerId string, current []*Peer, desired []string) string {
 	var candidates []string
 	for _, p := range current {
 		if p.ID != ourPeerId && slices.Contains(desired, p.ID) {
 			candidates = append(candidates, p.ID)
 		}
 	}
-	sorted := s.sortScaleDownPeers(_EMPTY_, current, candidates)
+	sorted := s.sortScaleDownPeers(n, _EMPTY_, current, candidates)
 	if len(sorted) == 0 {
 		return _EMPTY_
 	}

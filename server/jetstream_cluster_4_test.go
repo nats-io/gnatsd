@@ -11153,6 +11153,50 @@ func TestJetStreamClusterCanRemovePeer(t *testing.T) {
 	}
 }
 
+func TestJetStreamClusterSortScaleDownPeers(t *testing.T) {
+	// Members are "A" (us), then uppercase for online and lowercase for offline.
+	// Learners are uppercase for caught up and lowercase for behind. Others we haven't heard from.
+	for _, test := range []struct {
+		name     string
+		members  string
+		learners string
+		others   string
+		sorted   string
+	}{
+		{"leader first", "BA", "", "", "AB"},
+		{"online member before offline member", "AbC", "", "", "ACB"},
+		{"online member before caught up learner", "AB", "C", "", "ABC"},
+		{"caught up learner before offline member", "Ab", "C", "", "ACB"},
+		{"offline member before learner that's behind", "Ab", "c", "", "ABC"},
+		{"caught up learner before learner that's behind", "A", "cB", "", "ABC"},
+		{"unknown peer last", "Ab", "", "C", "ABC"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s, n := &Server{}, &raft{peers: map[string]*lps{}, observed: map[string]*lps{}}
+			now := time.Now()
+			// Members are passed last, so they're only first if sorted.
+			candidates := strings.Split(test.others, "")
+			for _, id := range test.learners {
+				peer := strings.ToUpper(string(id))
+				n.observed[peer] = &lps{ts: now, li: 1}
+				if peer != string(id) {
+					n.observed[peer].ci = 2
+				}
+				candidates = append(candidates, peer)
+			}
+			var current []*Peer
+			for _, id := range test.members {
+				peer := strings.ToUpper(string(id))
+				s.nodeToInfo.Store(peer, nodeInfo{offline: peer != string(id)})
+				n.peers[peer] = &lps{ts: now}
+				current = append(current, &Peer{ID: peer})
+				candidates = append(candidates, peer)
+			}
+			require_Equal(t, strings.Join(s.sortScaleDownPeers(n, "A", current, candidates), ""), test.sorted)
+		})
+	}
+}
+
 func TestJetStreamClusterStreamMoveHoldsWhileDesiredPeerCatchesUp(t *testing.T) {
 	askInterval, stall := migratePosAskInterval, migrateCatchupStall
 	migratePosAskInterval, migrateCatchupStall = 250*time.Millisecond, time.Second
@@ -12281,4 +12325,78 @@ func TestJetStreamClusterMetaMonitorNotStartedShutdown(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("shutdownJetStream took %v", elapsed)
 	}
+}
+
+func TestJetStreamClusterScaleDownNotBlockedByUnaddedPeer(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R4S", 4)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}, Replicas: 3})
+	require_NoError(t, err)
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "C", AckPolicy: nats.AckExplicitPolicy})
+	require_NoError(t, err)
+
+	sl := c.streamLeader(globalAccountName, "TEST")
+	cl := c.consumerLeader(globalAccountName, "TEST", "C")
+	mset, err := sl.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	n, sjs := mset.raftNode(), sl.getJetStream()
+	cmset, err := cl.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	o := cmset.lookupConsumer("C")
+	require_NotNil(t, o)
+	on, cjs := o.raftNode(), cl.getJetStream()
+
+	// Stop a member, so the live members can't reach quorum once a peer is added.
+	sjs.mu.RLock()
+	peers := copyStrings(sjs.streamAssignment(globalAccountName, "TEST").Group.Peers)
+	sjs.mu.RUnlock()
+	var down, unadded string
+	for _, s := range c.servers {
+		if !slices.Contains(peers, s.NodeName()) {
+			unadded = s.NodeName()
+		} else if down == _EMPTY_ && s != sl && s != cl {
+			down = s.NodeName()
+			s.Shutdown()
+		}
+	}
+	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		for _, rn := range []RaftNode{n, on} {
+			for _, p := range rn.Peers() {
+				if p.ID == down && withinLiveWindow(p.Last) {
+					return errors.New("member still live")
+				}
+			}
+		}
+		return nil
+	})
+
+	// The group was scaled up onto the fourth server, but scaled back down before it could be added.
+	scaleDown := func(rg *raftGroup, n RaftNode) {
+		rg.Peers = append(rg.Peers, unadded)
+		rg.Desired = &desiredRaftGroup{ID: "scale-down", Term: n.Term(), Peers: rg.Peers, ScaleDown: true}
+	}
+
+	t.Run("stream", func(t *testing.T) {
+		sjs.mu.RLock()
+		sa := sjs.streamAssignment(globalAccountName, "TEST").copyGroup()
+		sjs.mu.RUnlock()
+		scaleDown(sa.Group, n)
+		status := sjs.runStreamMigration(mset, sa, n, n.Term(), &peerPositions{})
+		require_NotNil(t, status)
+		require_Equal(t, status.Description, "selecting peers to scale down to")
+	})
+
+	t.Run("consumer", func(t *testing.T) {
+		cjs.mu.RLock()
+		ca := cjs.consumerAssignment(globalAccountName, "TEST", "C").copyGroup()
+		cjs.mu.RUnlock()
+		scaleDown(ca.Group, on)
+		status := cjs.runConsumerMigration(o, ca, on, on.Term())
+		require_NotNil(t, status)
+		require_Equal(t, status.Description, "selecting peers to scale down to")
+	})
 }
