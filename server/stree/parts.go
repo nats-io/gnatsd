@@ -17,6 +17,23 @@ import (
 	"strings"
 )
 
+// Wildcard parts share these backing arrays and are recognized by identity.
+// A literal part trimmed down to "*" or ">" must not be mistaken for a wildcard.
+var (
+	pwcPart = []byte{pwc}
+	fwcPart = []byte{fwc}
+)
+
+// isPWCPart returns true if the part is a pwc placeholder from genParts.
+func isPWCPart(part []byte) bool {
+	return len(part) == 1 && &part[0] == &pwcPart[0]
+}
+
+// isFWCPart returns true if the part is a fwc placeholder from genParts.
+func isFWCPart(part []byte) bool {
+	return len(part) == 1 && &part[0] == &fwcPart[0]
+}
+
 // genParts will break a filter subject up into parts.
 // We need to break this up into chunks based on wildcards, either pwc '*' or fwc '>'.
 // We do not care about other tokens per se, just parts that are separated by wildcards with an optional end fwc.
@@ -29,7 +46,7 @@ func genParts(filter []byte, parts [][]byte) [][]byte {
 				if i > start {
 					parts = append(parts, filter[start:i+1])
 				}
-				parts = append(parts, filter[i+1:i+2])
+				parts = append(parts, pwcPart)
 				i++ // Skip pwc
 				if i+2 <= e {
 					i++ // Skip next tsep from next part too.
@@ -39,7 +56,7 @@ func genParts(filter []byte, parts [][]byte) [][]byte {
 				if i > start {
 					parts = append(parts, filter[start:i+1])
 				}
-				parts = append(parts, filter[i+1:i+2])
+				parts = append(parts, fwcPart)
 				i++ // Skip fwc
 				start = i + 1
 			}
@@ -57,7 +74,11 @@ func genParts(filter []byte, parts [][]byte) [][]byte {
 				break
 			}
 			// We start with a pwc or fwc.
-			parts = append(parts, filter[i:i+1])
+			if filter[i] == pwc {
+				parts = append(parts, pwcPart)
+			} else {
+				parts = append(parts, fwcPart)
+			}
 			if i+1 <= e {
 				i++ // Skip next tsep from next part too.
 			}
@@ -92,7 +113,7 @@ func matchParts(parts [][]byte, frag string) ([][]byte, bool) {
 		lp := len(part)
 		// Check for pwc or fwc place holders.
 		if lp == 1 {
-			if part[0] == pwc {
+			if isPWCPart(part) {
 				index := strings.IndexByte(frag[si:], tsep)
 				// We are trying to match pwc and did not find our tsep.
 				// Will need to move to next node from caller.
@@ -104,7 +125,7 @@ func matchParts(parts [][]byte, frag string) ([][]byte, bool) {
 				}
 				si += index + 1
 				continue
-			} else if part[0] == fwc {
+			} else if isFWCPart(part) {
 				// If we are here we should be good.
 				return nil, true
 			}
