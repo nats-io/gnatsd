@@ -264,16 +264,25 @@ func TestJetStreamClusterSourceWorkingQueueWithLimit(t *testing.T) {
 	require_NoError(t, err)
 
 	sendBatch := func(subject string, n int) {
-		for i := 0; i < n; i++ {
+		for i := range n {
 			_, err = js.Publish(subject, []byte(fmt.Sprintf(msgPayloadFormat, i)))
 			require_NoError(t, err)
 		}
 	}
 
 	f := func(ss *nats.Subscription, done chan bool) {
-		for i := 0; i < totalMsgs; i++ {
-			m, err := ss.Fetch(1, nats.MaxWait(3*time.Second))
-			require_NoError(t, err)
+		for i := range totalMsgs {
+			var m []*nats.Msg
+			// The consumer's interest can still be propagating.
+			// The source also pauses for a few seconds after the stream was full.
+			checkFor(t, 5*time.Second, 50*time.Millisecond, func() error {
+				var err error
+				if m, err = ss.Fetch(1, nats.MaxWait(3*time.Second)); err == nats.ErrNoResponders || err == nats.ErrTimeout {
+					return err
+				}
+				require_NoError(t, err)
+				return nil
+			})
 			p, err := strconv.Atoi(string(m[0].Data))
 			require_NoError(t, err)
 			require_Equal(t, p, i)
@@ -329,7 +338,8 @@ func TestJetStreamClusterSourceWorkingQueueWithLimit(t *testing.T) {
 	select {
 	case <-doneChan1:
 		ss1.Drain()
-	case <-time.After(10 * time.Second):
+	// Every pause of the source slows down the consumer.
+	case <-time.After(30 * time.Second):
 		t.Fatalf("Did not receive completion signal")
 	}
 
@@ -357,7 +367,8 @@ func TestJetStreamClusterSourceWorkingQueueWithLimit(t *testing.T) {
 	select {
 	case <-doneChan2:
 		ss2.Drain()
-	case <-time.After(20 * time.Second):
+	// Every pause of the source slows down the consumer.
+	case <-time.After(30 * time.Second):
 		t.Fatalf("Did not receive completion signal")
 	}
 }
