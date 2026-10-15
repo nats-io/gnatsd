@@ -8796,154 +8796,159 @@ func (js *jetStream) applyConsumerEntries(o *consumer, ce *CommittedEntry, isLea
 			}
 		} else if e.Type == EntryAddPeer {
 			// Ignore for now.
-		} else {
-			buf := e.Data
-			if len(buf) == 0 {
-				return errBadEntryOp
+		} else if err := js.applyConsumerMsgOp(o, e.Data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// applyConsumerMsgOp applies an update proposed by the consumer.
+func (js *jetStream) applyConsumerMsgOp(o *consumer, buf []byte) error {
+	if len(buf) == 0 {
+		return errBadEntryOp
+	}
+	switch entryOp(buf[0]) {
+	case updateDeliveredOp:
+		dseq, sseq, dc, ts, err := decodeDeliveredUpdate(buf[1:])
+		if err != nil {
+			if mset, node := o.streamAndNode(); mset != nil && node != nil {
+				s := js.srv
+				s.Errorf("JetStream cluster could not decode consumer delivered update for '%s > %s > %s' [%s]",
+					mset.account(), mset.name(), o, node.Group())
 			}
-			switch entryOp(buf[0]) {
-			case updateDeliveredOp:
-				dseq, sseq, dc, ts, err := decodeDeliveredUpdate(buf[1:])
-				if err != nil {
-					if mset, node := o.streamAndNode(); mset != nil && node != nil {
-						s := js.srv
-						s.Errorf("JetStream cluster could not decode consumer delivered update for '%s > %s > %s' [%s]",
-							mset.account(), mset.name(), o, node.Group())
-					}
-					return err
-				}
-				// Make sure to update delivered under the lock.
-				o.mu.Lock()
-				err = o.store.UpdateDelivered(dseq, sseq, dc, ts)
-				o.ldt = time.Now()
-				// Need to send message to the client, since we have quorum to do so now.
-				if pmsg, ok := o.pendingDeliveries[sseq]; ok {
-					// Copy delivery subject and sequence first, as the send returns it to the pool and clears it.
-					dsubj, seq := pmsg.dsubj, pmsg.seq
-					o.outq.send(pmsg)
-					delete(o.pendingDeliveries, sseq)
+			return err
+		}
+		// Make sure to update delivered under the lock.
+		o.mu.Lock()
+		err = o.store.UpdateDelivered(dseq, sseq, dc, ts)
+		o.ldt = time.Now()
+		// Need to send message to the client, since we have quorum to do so now.
+		if pmsg, ok := o.pendingDeliveries[sseq]; ok {
+			// Copy delivery subject and sequence first, as the send returns it to the pool and clears it.
+			dsubj, seq := pmsg.dsubj, pmsg.seq
+			o.outq.send(pmsg)
+			delete(o.pendingDeliveries, sseq)
 
-					// Might need to send a request timeout after sending the last replicated delivery.
-					if wd, ok := o.waitingDeliveries[dsubj]; ok && wd.seq == seq {
-						if wd.pn > 0 || wd.pb > 0 {
-							hdr := fmt.Appendf(nil, "NATS/1.0 408 Request Timeout\r\n%s: %d\r\n%s: %d\r\n\r\n", JSPullRequestPendingMsgs, wd.pn, JSPullRequestPendingBytes, wd.pb)
-							o.outq.send(newJSPubMsg(dsubj, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
-						}
-						wd.recycle()
-						delete(o.waitingDeliveries, dsubj)
-					}
+			// Might need to send a request timeout after sending the last replicated delivery.
+			if wd, ok := o.waitingDeliveries[dsubj]; ok && wd.seq == seq {
+				if wd.pn > 0 || wd.pb > 0 {
+					hdr := fmt.Appendf(nil, "NATS/1.0 408 Request Timeout\r\n%s: %d\r\n%s: %d\r\n\r\n", JSPullRequestPendingMsgs, wd.pn, JSPullRequestPendingBytes, wd.pb)
+					o.outq.send(newJSPubMsg(dsubj, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
 				}
-				o.mu.Unlock()
-				if err != nil {
-					return err
-				}
-			case updateAcksOp:
-				dseq, sseq, err := decodeAckUpdate(buf[1:])
-				if err != nil {
-					if mset, node := o.streamAndNode(); mset != nil && node != nil {
-						s := js.srv
-						s.Errorf("JetStream cluster could not decode consumer ack update for '%s > %s > %s' [%s]",
-							mset.account(), mset.name(), o, node.Group())
-					}
-					return err
-				}
-				if err := o.processReplicatedAck(dseq, sseq); err == errConsumerClosed {
-					return err
-				}
-			case updateSkipOp:
-				sseq, err := decodeSkipUpdate(buf[1:])
-				if err != nil {
-					return err
-				}
-				o.mu.Lock()
-				if !o.isLeader() && sseq > o.sseq {
-					o.sseq = sseq
-				}
-				if o.dseq == 0 {
-					o.dseq = 1
-				}
-				if o.store != nil {
-					o.store.UpdateStarting(sseq - 1)
-				}
-				o.mu.Unlock()
-			case resetSeqOp:
-				sseq, reply, err := decodeResetUpdate(buf[1:])
-				if err != nil {
-					return err
-				}
-				o.mu.Lock()
-				recalcPending := o.resetLocalStartingSeq(sseq)
-				if o.store != nil {
-					o.store.Reset(sseq - 1)
-				}
-				// Cleanup messages that lost interest.
-				if o.retention == InterestPolicy {
-					if mset := o.mset; mset != nil {
-						o.mu.Unlock()
-						ss := mset.state()
-						o.checkStateForInterestStream(&ss)
-						o.mu.Lock()
-					}
-				}
-				// Recalculate pending, and re-trigger message delivery.
-				if !o.isLeader() {
-					o.mu.Unlock()
-				} else {
-					if recalcPending {
-						o.streamNumPending()
-					}
-					o.signalNewMessages()
-					s, a := o.srv, o.acc
-					if reply == _EMPTY_ {
-						o.mu.Unlock()
-					} else if rr, ok := o.rsm[reply]; !ok {
-						o.mu.Unlock()
-					} else {
-						delete(o.rsm, reply)
-						o.mu.Unlock()
-
-						// Check if the reset request needs to be answered on the system account.
-						// This will happen for replicated sourcing consumers that get reset as part of a create/update.
-						if rr.internal {
-							a = nil
-						}
-						var resp = JSApiConsumerResetResponse{ApiResponse: ApiResponse{Type: JSApiConsumerResetResponseType}}
-						if resp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.info()); resp.ConsumerInfo == nil {
-							// The consumer was closed before we could respond.
-							resp.Error = NewJSConsumerInvalidResetError(errConsumerClosed)
-							s.sendInternalAccountMsg(a, reply, s.jsonResponse(&resp))
-						} else {
-							resp.ResetSeq = sseq
-							if rr.identity {
-								rhdr := genHeader(nil, JSStreamIdentity, o.streamIdentity())
-								s.sendInternalAccountMsgWithReply(a, reply, _EMPTY_, rhdr, s.jsonResponse(&resp), false)
-							} else {
-								s.sendInternalAccountMsg(a, reply, s.jsonResponse(&resp))
-							}
-						}
-					}
-				}
-			case addPendingRequest:
-				o.mu.Lock()
-				if !o.isLeader() {
-					if o.prm == nil {
-						o.prm = make(map[string]struct{})
-					}
-					o.prm[string(buf[1:])] = struct{}{}
-				}
-				o.mu.Unlock()
-			case removePendingRequest:
-				o.mu.Lock()
-				if !o.isLeader() {
-					if o.prm != nil {
-						delete(o.prm, string(buf[1:]))
-					}
-				}
-				o.mu.Unlock()
-			default:
-				return fmt.Errorf("unknown consumer entry op type: %v", entryOp(buf[0]))
+				wd.recycle()
+				delete(o.waitingDeliveries, dsubj)
 			}
 		}
+		o.mu.Unlock()
+		if err != nil {
+			return err
+		}
+	case updateAcksOp:
+		dseq, sseq, err := decodeAckUpdate(buf[1:])
+		if err != nil {
+			if mset, node := o.streamAndNode(); mset != nil && node != nil {
+				s := js.srv
+				s.Errorf("JetStream cluster could not decode consumer ack update for '%s > %s > %s' [%s]",
+					mset.account(), mset.name(), o, node.Group())
+			}
+			return err
+		}
+		if err := o.processReplicatedAck(dseq, sseq); err == errConsumerClosed {
+			return err
+		}
+	case updateSkipOp:
+		sseq, err := decodeSkipUpdate(buf[1:])
+		if err != nil {
+			return err
+		}
+		o.mu.Lock()
+		if !o.isLeader() && sseq > o.sseq {
+			o.sseq = sseq
+		}
+		if o.dseq == 0 {
+			o.dseq = 1
+		}
+		if o.store != nil {
+			o.store.UpdateStarting(sseq - 1)
+		}
+		o.mu.Unlock()
+	case resetSeqOp:
+		sseq, reply, err := decodeResetUpdate(buf[1:])
+		if err != nil {
+			return err
+		}
+		o.mu.Lock()
+		recalcPending := o.resetLocalStartingSeq(sseq)
+		if o.store != nil {
+			o.store.Reset(sseq - 1)
+		}
+		// Cleanup messages that lost interest.
+		if o.retention == InterestPolicy {
+			if mset := o.mset; mset != nil {
+				o.mu.Unlock()
+				ss := mset.state()
+				o.checkStateForInterestStream(&ss)
+				o.mu.Lock()
+			}
+		}
+		// Recalculate pending, and re-trigger message delivery.
+		if !o.isLeader() {
+			o.mu.Unlock()
+		} else {
+			if recalcPending {
+				o.streamNumPending()
+			}
+			o.signalNewMessages()
+			s, a := o.srv, o.acc
+			if reply == _EMPTY_ {
+				o.mu.Unlock()
+			} else if rr, ok := o.rsm[reply]; !ok {
+				o.mu.Unlock()
+			} else {
+				delete(o.rsm, reply)
+				o.mu.Unlock()
+
+				// Check if the reset request needs to be answered on the system account.
+				// This will happen for replicated sourcing consumers that get reset as part of a create/update.
+				if rr.internal {
+					a = nil
+				}
+				var resp = JSApiConsumerResetResponse{ApiResponse: ApiResponse{Type: JSApiConsumerResetResponseType}}
+				if resp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.info()); resp.ConsumerInfo == nil {
+					// The consumer was closed before we could respond.
+					resp.Error = NewJSConsumerInvalidResetError(errConsumerClosed)
+					s.sendInternalAccountMsg(a, reply, s.jsonResponse(&resp))
+				} else {
+					resp.ResetSeq = sseq
+					if rr.identity {
+						rhdr := genHeader(nil, JSStreamIdentity, o.streamIdentity())
+						s.sendInternalAccountMsgWithReply(a, reply, _EMPTY_, rhdr, s.jsonResponse(&resp), false)
+					} else {
+						s.sendInternalAccountMsg(a, reply, s.jsonResponse(&resp))
+					}
+				}
+			}
+		}
+	case addPendingRequest:
+		o.mu.Lock()
+		if !o.isLeader() {
+			if o.prm == nil {
+				o.prm = make(map[string]struct{})
+			}
+			o.prm[string(buf[1:])] = struct{}{}
+		}
+		o.mu.Unlock()
+	case removePendingRequest:
+		o.mu.Lock()
+		if !o.isLeader() {
+			if o.prm != nil {
+				delete(o.prm, string(buf[1:]))
+			}
+		}
+		o.mu.Unlock()
+	default:
+		return fmt.Errorf("unknown consumer entry op type: %v", entryOp(buf[0]))
 	}
 	return nil
 }
