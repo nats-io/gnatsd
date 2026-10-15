@@ -15688,7 +15688,7 @@ func TestJetStreamClusterScaleDownCancelsCatchup(t *testing.T) {
 	waitReplicas := func(r int) {
 		t.Helper()
 		checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
-			si, err := js.StreamInfo("TEST")
+			si, err := js.StreamInfo("TEST", nats.MaxWait(time.Second))
 			if err != nil {
 				return err
 			}
@@ -16167,7 +16167,7 @@ func TestJetStreamClusterScaleUpSourceDown(t *testing.T) {
 						return fmt.Errorf("%s still an observer", s.Name())
 					}
 				}
-				ci, err := js.ConsumerInfo("TEST", "C")
+				ci, err := js.ConsumerInfo("TEST", "C", nats.MaxWait(time.Second))
 				if err != nil {
 					return err
 				}

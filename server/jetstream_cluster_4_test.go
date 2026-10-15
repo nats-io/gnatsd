@@ -3330,7 +3330,7 @@ func TestJetStreamClusterConsumerReplicasAfterScale(t *testing.T) {
 
 	checkConsumerReplicas := func(t *testing.T, stream, consumer string, cor, clr int) {
 		checkFor(t, 5*time.Second, 500*time.Millisecond, func() error {
-			if ci, err = js.ConsumerInfo(stream, consumer); err != nil {
+			if ci, err = js.ConsumerInfo(stream, consumer, nats.MaxWait(time.Second)); err != nil {
 				return err
 			}
 			if ci.Config.Replicas != cor {
@@ -3408,7 +3408,7 @@ func TestJetStreamClusterConsumerReplicasAfterScaleMoveConsumer(t *testing.T) {
 	consumerLeader := ci.Cluster.Leader
 
 	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
-		si, err := js.StreamInfo("TEST")
+		si, err := js.StreamInfo("TEST", nats.MaxWait(time.Second))
 		if err != nil {
 			return err
 		}
@@ -3429,7 +3429,7 @@ func TestJetStreamClusterConsumerReplicasAfterScaleMoveConsumer(t *testing.T) {
 
 	// Check that the consumer state wasn't lost.
 	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
-		ci2, err := js.ConsumerInfo("TEST", "CONSUMER")
+		ci2, err := js.ConsumerInfo("TEST", "CONSUMER", nats.MaxWait(time.Second))
 		if err != nil {
 			return err
 		}
@@ -6737,14 +6737,14 @@ func TestJetStreamClusterMaxHAAssetsR1MoveNotLimited(t *testing.T) {
 	require_True(t, moveResp.Error == nil)
 
 	checkFor(t, 10*time.Second, 200*time.Millisecond, func() error {
-		si, err := js.StreamInfo("S2")
+		si, err := js.StreamInfo("S2", nats.MaxWait(time.Second))
 		if err != nil {
 			return err
 		}
 		if si.Cluster.Leader == _EMPTY_ || si.Cluster.Leader == origin || len(si.Cluster.Replicas) > 0 {
 			return fmt.Errorf("move not completed yet: %+v", si.Cluster)
 		}
-		ci, err := js.ConsumerInfo("S2", "DUR")
+		ci, err := js.ConsumerInfo("S2", "DUR", nats.MaxWait(time.Second))
 		if err != nil {
 			return err
 		}

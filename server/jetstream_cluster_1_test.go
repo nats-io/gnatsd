@@ -4683,7 +4683,7 @@ func TestJetStreamClusterAccountUsageAfterServerRemove(t *testing.T) {
 
 	c.waitOnPeerCount(3)
 	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
-		si, err := js.StreamInfo("TEST")
+		si, err := js.StreamInfo("TEST", nats.MaxWait(time.Second))
 		if err != nil {
 			return err
 		}
