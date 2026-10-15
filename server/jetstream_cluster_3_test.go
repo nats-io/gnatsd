@@ -13913,6 +13913,10 @@ func TestJetStreamClusterPeerRemoveRestoresQuorumWhileScalingDown(t *testing.T) 
 				if l := c.consumerLeader(globalAccountName, "TEST", "scaled"); l != nil {
 					return fmt.Errorf("consumer still has leader %q", l.Name())
 				}
+				// The old leader unsubscribes only after its stream monitor processes the step down.
+				if sl.gacc.sl.HasInterest("foo") {
+					return errors.New("stream still has interest")
+				}
 				return nil
 			})
 			_, err = js.Publish("foo", nil)
