@@ -1579,14 +1579,20 @@ func (c *cluster) stepDownConsumerLeader(nc *nats.Conn, account, stream, consume
 	c.t.Helper()
 	req, err := json.Marshal(JSApiLeaderStepdownRequest{Placement: &Placement{Preferred: s.Name()}})
 	require_NoError(c.t, err)
-	cl := c.consumerLeader(account, stream, consumer)
-	if cl != s {
+	// The leader skips the preferred peer if it hasn't heard from it yet, retry until it's picked.
+	checkFor(c.t, 10*time.Second, 100*time.Millisecond, func() error {
+		c.waitOnConsumerLeader(account, stream, consumer)
+		if cl := c.consumerLeader(account, stream, consumer); cl == s {
+			return nil
+		}
 		_, err = nc.Request(fmt.Sprintf(JSApiConsumerLeaderStepDownT, stream, consumer), req, 5*time.Second)
 		require_NoError(c.t, err)
 		c.waitOnConsumerLeader(account, stream, consumer)
-		cl = c.consumerLeader(account, stream, consumer)
-	}
-	require_Equal(c.t, cl, s)
+		if cl := c.consumerLeader(account, stream, consumer); cl != s {
+			return fmt.Errorf("expected consumer leader %s, got %s", s, cl)
+		}
+		return nil
+	})
 }
 
 func (c *cluster) waitOnStreamLeader(account, stream string) {
