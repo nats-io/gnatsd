@@ -1097,6 +1097,10 @@ func (s *Server) Subsz(opts *SubszOptions) (*Subsz, error) {
 			sub.client.mu.Unlock()
 			i++
 		}
+		// Sort for a consistent order across paged requests, since subs were collected from maps.
+		slices.SortFunc(details, func(a, b SubDetail) int {
+			return cmp.Or(cmp.Compare(a.Cid, b.Cid), strings.Compare(a.Sid, b.Sid), strings.Compare(a.Subject, b.Subject))
+		})
 		// Make sure these are sane.
 		maxIndex := i
 		minoff := min(max(sz.Offset, 0), maxIndex)
