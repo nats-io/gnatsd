@@ -27557,7 +27557,6 @@ func TestJetStreamEnableAccountStorageDirFailure(t *testing.T) {
 }
 
 // https://github.com/nats-io/nats-server/issues/8725
-
 func TestJetStreamDeleteStreamPreservesAccountDirectories(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
@@ -27644,4 +27643,86 @@ func TestJetStreamConcurrentDeleteAndCreateStream(t *testing.T) {
 	require_NoError(t, createErr)
 
 	require_NoError(t, js.DeleteStream(name2))
+}
+
+// All sources share one inbound queue. A message rejected for one source must not
+// drop the messages of other sources behind it, or those get their consumer recreated too.
+func TestJetStreamSourceRejectedMsgKeepsRestOfBatch(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	for _, name := range []string{"A", "B"} {
+		_, err := js.AddStream(&nats.StreamConfig{Name: name, Subjects: []string{name}})
+		require_NoError(t, err)
+	}
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:    "S",
+		Sources: []*nats.StreamSource{{Name: "A"}, {Name: "B"}},
+	})
+	require_NoError(t, err)
+
+	mset, err := s.globalAccount().lookupStream("S")
+	require_NoError(t, err)
+
+	checkMsgs := func(want uint64) {
+		t.Helper()
+		checkFor(t, 5*time.Second, 50*time.Millisecond, func() error {
+			if n := mset.state().Msgs; n != want {
+				return fmt.Errorf("expected %d messages, got %d", want, n)
+			}
+			return nil
+		})
+	}
+
+	// Wait for both source consumers to deliver.
+	for _, subj := range []string{"A", "B"} {
+		_, err = js.Publish(subj, nil)
+		require_NoError(t, err)
+	}
+	checkMsgs(2)
+
+	// Hold the stream lock so the queued messages below are popped as one batch.
+	mset.mu.Lock()
+	unlock := sync.OnceFunc(mset.mu.Unlock)
+	defer unlock()
+	siA, siB, msgs := mset.sources["A > >"], mset.sources["B > >"], mset.smsgs
+	require_NotNil(t, siA)
+	require_NotNil(t, siB)
+	cname := siB.cname
+
+	checkQueued := func(want int) {
+		t.Helper()
+		checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+			if n := msgs.len(); n != want {
+				return fmt.Errorf("expected %d queued, got %d", want, n)
+			}
+			return nil
+		})
+	}
+	queueA := func(sseq, dseq uint64) {
+		reply := fmt.Sprintf("$JS.ACK.A.%s.1.%d.%d.%d.0", siA.cname, sseq, dseq, time.Now().UnixNano())
+		mset.queueInbound(msgs, "A", reply, nil, nil, siA, nil)
+	}
+
+	// Queue an already stored message. Once popped, the source goroutine blocks on the lock.
+	queueA(siA.sseq, siA.dseq)
+	checkQueued(0)
+
+	// A message for A with a delivery gap, then two for B, all left in the queue.
+	queueA(siA.sseq+1, siA.dseq+2)
+	for range 2 {
+		_, err = js.Publish("B", nil)
+		require_NoError(t, err)
+	}
+	checkQueued(3)
+	unlock()
+
+	// Both messages for B are stored without recreating its consumer.
+	checkMsgs(4)
+	mset.mu.RLock()
+	defer mset.mu.RUnlock()
+	require_Equal(t, siB.cname, cname)
 }

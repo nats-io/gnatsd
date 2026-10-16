@@ -4745,7 +4745,7 @@ func (mset *stream) processAllSourceMsgs() {
 						cleanUp()
 						return
 					}
-					break
+					// The batch holds messages from all sources, so only skip this one.
 				}
 				im.returnToPool()
 			}
