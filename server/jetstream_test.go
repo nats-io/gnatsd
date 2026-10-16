@@ -52,6 +52,46 @@ import (
 	"github.com/nats-io/nuid"
 )
 
+func TestJetStreamLameDuckGracePeriod(t *testing.T) {
+	o := DefaultOptions()
+	o.Cluster = ClusterOpts{}
+	o.JetStream = true
+	o.StoreDir = t.TempDir()
+	testSetLDMGracePeriod(o, 5*time.Second)
+	o.LameDuckDuration = 50 * time.Millisecond
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	ldm := make(chan struct{}, 1)
+	nc, js := jsClientConnect(t, s, nats.NoReconnect(), nats.LameDuckModeHandler(func(_ *nats.Conn) {
+		ldm <- struct{}{}
+	}))
+	defer nc.Close()
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}})
+	require_NoError(t, err)
+
+	done := make(chan struct{})
+	go func() {
+		s.LameDuckShutdown()
+		close(done)
+	}()
+	select {
+	case <-ldm:
+	case <-time.After(3 * time.Second):
+		t.Fatal("did not receive lame-duck INFO")
+	}
+
+	_, err = js.Publish("foo", []byte("during grace period"))
+	require_NoError(t, err)
+
+	s.Shutdown()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("lame-duck shutdown did not complete")
+	}
+}
+
 func TestJetStreamBasicNilConfig(t *testing.T) {
 	s := RunRandClientPortServer(t)
 	defer s.Shutdown()
