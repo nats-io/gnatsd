@@ -27493,3 +27493,65 @@ func TestJetStreamInterestCheckConsumerAheadOfStreamCompacts(t *testing.T) {
 		})
 	}
 }
+
+func TestJetStreamConcurrentEnableAndCreateFileStream(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	const iterations = 20
+	for i := 0; i < iterations; i++ {
+		accName := fmt.Sprintf("ACC_%d", i)
+		acc, _ := s.LookupOrRegisterAccount(accName)
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		var enableErr error
+		go func() {
+			defer wg.Done()
+			enableErr = acc.EnableJetStream(nil, nil)
+		}()
+
+		var streamErr error
+		go func() {
+			defer wg.Done()
+			for range 500 {
+				_, streamErr = acc.addStream(&StreamConfig{
+					Name:     "S0",
+					Subjects: []string{"s0.>"},
+					Storage:  FileStorage,
+				})
+				if streamErr == nil || !IsNatsErr(streamErr, JSNotEnabledForAccountErr) {
+					break
+				}
+				time.Sleep(2 * time.Millisecond)
+			}
+		}()
+
+		wg.Wait()
+		require_NoError(t, enableErr)
+		require_NoError(t, streamErr)
+	}
+}
+
+func TestJetStreamEnableAccountStorageDirFailure(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	acc, _ := s.LookupOrRegisterAccount("ACC_FAIL")
+
+	// Place a file where the account's storage directory should go, so that
+	// creating the streams directory fails.
+	accDir := filepath.Join(s.JetStreamConfig().StoreDir, "ACC_FAIL")
+	require_NoError(t, os.WriteFile(accDir, []byte("x"), 0600))
+
+	// Enabling must fail and must not leave the account half enabled.
+	require_Error(t, acc.EnableJetStream(nil, nil))
+	require_False(t, acc.JetStreamEnabled())
+	require_Equal(t, s.JetStreamNumAccounts(), 1) // Only the global account.
+
+	// Once the problem is gone, a retry succeeds.
+	require_NoError(t, os.Remove(accDir))
+	require_NoError(t, acc.EnableJetStream(nil, nil))
+	require_True(t, acc.JetStreamEnabled())
+}

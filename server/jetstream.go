@@ -1249,6 +1249,24 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits, tq c
 	jsa := &jsAccount{js: js, account: a, limits: limits, streams: make(map[string]*stream), sendq: sendq, usage: make(map[string]*jsaStorage)}
 	jsa.storeDir = filepath.Join(js.config.StoreDir, a.Name)
 
+	// Make sure the account's streams directory exists before the account is
+	// published, so that stream creation can't race with its setup. Do this
+	// before starting the usage timer and subscription below, so there is
+	// nothing to tear down if it fails.
+	sdir := filepath.Join(jsa.storeDir, streamsDir)
+	hasState := false
+	if _, err := os.Stat(sdir); err == nil {
+		hasState = true
+	} else if os.IsNotExist(err) {
+		if err := os.MkdirAll(sdir, defaultDirPerms); err != nil {
+			js.mu.Unlock()
+			return fmt.Errorf("could not create storage streams directory - %v", err)
+		}
+	} else {
+		js.mu.Unlock()
+		return fmt.Errorf("could not create storage streams directory - %v", err)
+	}
+
 	// A single server does not need to do the account updates at this point.
 	if js.cluster != nil || !s.standAloneMode() {
 		jsa.usageMu.Lock()
@@ -1286,17 +1304,7 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits, tq c
 	// Clean up any old snapshots that were orphaned while staging.
 	os.RemoveAll(filepath.Join(js.config.StoreDir, snapStagingDir))
 
-	sdir := filepath.Join(jsa.storeDir, streamsDir)
-	if _, err := os.Stat(sdir); os.IsNotExist(err) {
-		if err := os.MkdirAll(sdir, defaultDirPerms); err != nil {
-			return fmt.Errorf("could not create storage streams directory - %v", err)
-		}
-		// Just need to make sure we can write to the directory.
-		// Remove the directory will create later if needed.
-		os.RemoveAll(sdir)
-		// when empty remove parent directory, which may have been created as well
-		os.Remove(jsa.storeDir)
-	} else {
+	if hasState {
 		// Restore any state here.
 		s.Debugf("Recovering JetStream state for account %q", a.Name)
 	}
