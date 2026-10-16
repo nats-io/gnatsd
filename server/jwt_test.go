@@ -2067,8 +2067,8 @@ func TestJWTAccountURLResolverPermanentFetchFailure(t *testing.T) {
 	o := LoadConfig(confA)
 	sA := RunServer(o)
 	defer sA.Shutdown()
-	l := &captureDebugLogger{dbgCh: make(chan string, 100)} // has enough space to not block
-	sA.SetLogger(l, true, false)
+	l := &captureErrorLogger{errCh: make(chan string, 100)} // has enough space to not block
+	sA.SetLogger(l, false, false)
 	// Create clients
 	ncA := natsConnect(t, sA.ClientURL(), createUserCreds(t, nil, impkp))
 	defer ncA.Close()
@@ -2085,14 +2085,14 @@ func TestJWTAccountURLResolverPermanentFetchFailure(t *testing.T) {
 	defer tmr.Stop()
 	for {
 		select {
-		case line := <-l.dbgCh:
-			if strings.HasPrefix(line, "Error adding stream import to account") {
+		case line := <-l.errCh:
+			if strings.HasPrefix(line, "Error adding stream import") {
 				importErrCnt++
 			}
 		case <-tmr.C:
-			// connecting and updating, each cause 3 traces (2 + 1 on iteration) + 1 xtra fetch
+			// connecting and updating, each cause 3 errors (2 + 1 on iteration) + 1 extra fetch
 			if importErrCnt != 7 {
-				t.Fatalf("Expected 7 debug traces, got %d", importErrCnt)
+				t.Fatalf("Expected 7 import errors, got %d", importErrCnt)
 			}
 			return
 		}
