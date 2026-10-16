@@ -977,6 +977,36 @@ func TestMonitorConnzOffsetOverflow(t *testing.T) {
 	require_NoError(t, err)
 }
 
+func TestMonitorConnzSortedPaging(t *testing.T) {
+	s := runMonitorServer()
+	defer s.Shutdown()
+
+	// All clients tie on these sort options.
+	clients := make([]*nats.Conn, 50)
+	for i := range clients {
+		clients[i] = createClientConnSubscribeAndPublish(t, s)
+		defer clients[i].Close()
+	}
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
+	for _, sortOpt := range []SortOpt{BySubs, ByPending, ByOutMsgs, ByInMsgs, ByOutBytes, ByInBytes} {
+		for mode := range 2 {
+			// Paging must return every connection exactly once.
+			seen := make(map[uint64]struct{})
+			for offset := 0; offset < 50; offset += 10 {
+				c := pollConnz(t, s, mode, fmt.Sprintf("%sconnz?sort=%s&offset=%d&limit=10", url, sortOpt, offset),
+					&ConnzOptions{Sort: sortOpt, Offset: offset, Limit: 10})
+				require_Equal(t, c.Total, 50)
+				require_Len(t, len(c.Conns), 10)
+				for _, ci := range c.Conns {
+					seen[ci.Cid] = struct{}{}
+				}
+			}
+			require_Len(t, len(seen), 50)
+		}
+	}
+}
+
 func TestMonitorConnzDefaultSorted(t *testing.T) {
 	s := runMonitorServer()
 	defer s.Shutdown()
