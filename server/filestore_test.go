@@ -7467,6 +7467,114 @@ func TestFileStoreMultiLastSeqs(t *testing.T) {
 	seqs, err = fs.MultiLastSeqs([]string{">"}, 99, -1)
 	require_NoError(t, err)
 	checkResults(seqs, []uint64{97, 98, 99})
+
+	// No subjects match the filter.
+	seqs, err = fs.MultiLastSeqs([]string{"missing.*"}, 0, -1)
+	require_NoError(t, err)
+	checkResults(seqs, nil)
+}
+
+func TestFileStoreMultiLastSeqsDeletedBlocks(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		subjects []string
+		deletes  []uint64
+		filters  []string
+		maxSeq   uint64
+		want     []uint64
+	}{
+		{
+			name:     "removed last block",
+			subjects: []string{"foo.a", "foo.b", "foo.b", "foo.a", "foo.a", "foo.a", "foo.b", "foo.b", "foo.b"},
+			deletes:  []uint64{4, 5, 6},
+			filters:  []string{"foo.a"},
+			maxSeq:   8,
+			want:     []uint64{1},
+		},
+		{
+			name:     "multiple subjects with removed last block",
+			subjects: []string{"foo.a", "foo.c", "foo.c", "foo.a", "foo.c", "foo.c", "foo.b", "foo.b", "foo.b"},
+			deletes:  []uint64{4, 5, 6},
+			filters:  []string{"foo.a", "foo.c"},
+			maxSeq:   8,
+			want:     []uint64{1, 3},
+		},
+		{
+			name:     "subjects with existing and removed last blocks",
+			subjects: []string{"foo.a", "foo.c", "foo.c", "foo.a", "foo.a", "foo.a", "foo.b", "foo.b", "foo.b"},
+			deletes:  []uint64{4, 5, 6},
+			filters:  []string{"foo.a", "foo.c"},
+			maxSeq:   8,
+			want:     []uint64{1, 3},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// Each block holds three messages, so deleting 4-6 removes block 2.
+			fs, err := newFileStore(
+				FileStoreConfig{StoreDir: t.TempDir(), BlockSize: 128},
+				StreamConfig{Name: "TEST", Subjects: []string{"foo.*"}, Storage: FileStorage})
+			require_NoError(t, err)
+			defer fs.Stop()
+			for _, subject := range test.subjects {
+				_, _, err := fs.StoreMsg(subject, nil, []byte("x"), 0)
+				require_NoError(t, err)
+			}
+			for _, seq := range test.deletes {
+				removed, err := fs.RemoveMsg(seq)
+				require_NoError(t, err)
+				require_True(t, removed)
+			}
+			seqs, err := fs.MultiLastSeqs(test.filters, test.maxSeq, 0)
+			require_NoError(t, err)
+			if !slices.Equal(seqs, test.want) {
+				t.Errorf("MultiLastSeqs: expected %v, got %v", test.want, seqs)
+			}
+			var delivered []uint64
+			total, pending, err := fs.MultiLastMsgs(test.filters, 0, test.maxSeq, 1024, func(sm *StoreMsg, _ uint64) bool {
+				delivered = append(delivered, sm.seq)
+				return true
+			})
+			require_NoError(t, err)
+			require_Equal(t, total, uint64(len(test.want)))
+			require_Equal(t, pending, uint64(0))
+			if !slices.Equal(delivered, test.want) {
+				t.Errorf("MultiLastMsgs: expected %v, got %v", test.want, delivered)
+			}
+		})
+	}
+}
+
+func TestFileStoreMultiLastSeqsOverlappingFilters(t *testing.T) {
+	// Each block holds three messages, placing foo.a and foo.b in separate blocks.
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: t.TempDir(), BlockSize: 128},
+		StreamConfig{Name: "TEST", Subjects: []string{"foo.*"}, Storage: FileStorage})
+	require_NoError(t, err)
+	defer fs.Stop()
+	for _, subject := range []string{"foo.a", "foo.a", "foo.a", "foo.b", "foo.b", "foo.b"} {
+		_, _, err := fs.StoreMsg(subject, nil, []byte("x"), 0)
+		require_NoError(t, err)
+	}
+
+	filters := []string{"foo.*", "foo.a"}
+	const maxSeq = 5
+	want := []uint64{3, 5}
+	seqs, err := fs.MultiLastSeqs(filters, maxSeq, 0)
+	require_NoError(t, err)
+	if !slices.Equal(seqs, want) {
+		t.Errorf("MultiLastSeqs: expected %v, got %v", want, seqs)
+	}
+	var delivered []uint64
+	total, pending, err := fs.MultiLastMsgs(filters, 0, maxSeq, 1024, func(sm *StoreMsg, _ uint64) bool {
+		delivered = append(delivered, sm.seq)
+		return true
+	})
+	require_NoError(t, err)
+	require_Equal(t, total, uint64(len(want)))
+	require_Equal(t, pending, uint64(0))
+	if !slices.Equal(delivered, want) {
+		t.Errorf("MultiLastMsgs: expected %v, got %v", want, delivered)
+	}
 }
 
 func TestFileStoreMultiLastSeqsMaxAllowed(t *testing.T) {

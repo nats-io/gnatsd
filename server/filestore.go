@@ -4070,30 +4070,21 @@ func (fs *fileStore) multiLastSeqsLocked(filters []string, maxSeq uint64, maxAll
 		return nil, nil
 	}
 
-	// Grab our last mb index (not same as blk index).
-	lastMB.mu.RLock()
-	lastMBIndex := lastMB.index
-	lastMB.mu.RUnlock()
-
+	// Find a starting point for the backward scan over matching subjects.
 	subs := make(map[string]*psi)
-	var numLess int
 	var maxBlk uint32
 
 	for _, filter := range filters {
 		fs.psim.Match(stringToBytes(filter), func(subj []byte, psi *psi) {
 			subs[string(subj)] = psi
-			if psi.lblk < lastMBIndex {
-				numLess++
-				if psi.lblk > maxBlk {
-					maxBlk = psi.lblk
-				}
+			if psi.lblk > maxBlk {
+				maxBlk = psi.lblk
 			}
 		})
 	}
 
-	// If all subjects have a lower last index, select the largest for our walk backwards.
-	if numLess == len(subs) {
-		lastMB = fs.bim[maxBlk]
+	if len(subs) == 0 {
+		return nil, nil
 	}
 
 	// Collect all sequences needed.
@@ -4109,16 +4100,13 @@ func (fs *fileStore) multiLastSeqsLocked(filters []string, maxSeq uint64, maxAll
 		}
 	}
 
-	for i, lnf := lastBlkIndex, false; i >= 0; i-- {
+	for i := lastBlkIndex; i >= 0; i-- {
 		if len(subs) == 0 {
 			break
 		}
 		mb := fs.blks[i]
-		if !lnf {
-			if mb != lastMB {
-				continue
-			}
-			lnf = true
+		if mb.index > maxBlk {
+			continue
 		}
 		// We can start properly looking here.
 		mb.mu.Lock()
