@@ -200,6 +200,49 @@ func TestStartupAndShutdown(t *testing.T) {
 	}
 }
 
+func TestClientCreationDuringShutdown(t *testing.T) {
+	for _, create := range []struct {
+		name string
+		fn   func(*Server, net.Conn) *client
+	}{
+		{"nats", func(s *Server, conn net.Conn) *client { return s.createClient(conn) }},
+		{"websocket", func(s *Server, conn net.Conn) *client { return s.createWSClient(conn, &websocket{}) }},
+		{"mqtt", func(s *Server, conn net.Conn) *client { return s.createMQTTClient(conn, nil) }},
+	} {
+		for _, mode := range []string{"lame_duck", "shutdown"} {
+			t.Run(create.name+"/"+mode, func(t *testing.T) {
+				s := RunServer(DefaultOptions())
+				defer s.Shutdown()
+				if mode == "lame_duck" {
+					_, ok := s.enterLameDuckMode()
+					require_True(t, ok)
+				} else {
+					s.Shutdown()
+				}
+
+				conn, peer := net.Pipe()
+				defer conn.Close()
+				defer peer.Close()
+				closed := make(chan struct{})
+				go func() {
+					io.Copy(io.Discard, peer)
+					close(closed)
+				}()
+				c := create.fn(s, conn)
+				if c != nil {
+					c.closeConnection(ServerShutdown)
+					t.Fatal("accepted a client while draining or shutting down")
+				}
+				select {
+				case <-closed:
+				case <-time.After(time.Second):
+					t.Fatal("rejected connection is still open")
+				}
+			})
+		}
+	}
+}
+
 func TestConcurrentShutdown(t *testing.T) {
 	opts := DefaultOptions()
 	opts.DisableShortFirstPing = true
