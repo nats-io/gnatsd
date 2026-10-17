@@ -1377,6 +1377,7 @@ func (js *jetStream) setupMetaGroup() error {
 		peers := s.ActivePeers()
 		s.Debugf("JetStream cluster initial peers: %+v", peers)
 		if err := s.bootstrapRaftNode(cfg, peers, false); err != nil {
+			fs.Stop()
 			return err
 		}
 		if cfg.Observer {
@@ -1406,6 +1407,7 @@ func (js *jetStream) setupMetaGroup() error {
 			// set extension state to undetermined.
 			ps.domainExt = extUndetermined
 			if err := writePeerState(s.diskIOSemaphore(), storeDir, ps); err != nil {
+				fs.Stop()
 				return err
 			}
 		}

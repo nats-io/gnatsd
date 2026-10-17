@@ -2562,3 +2562,20 @@ func publishAsync(t testing.TB, js nats.JetStreamContext, subj string, msg []byt
 		require_Error(t, err, nats.ErrTooManyStalledMsgs)
 	}
 }
+
+// requireFileStoreStopped checks that the named filestore has already logged
+// to l that it stopped.
+func requireFileStoreStopped(t *testing.T, l *captureDebugLogger, name string) {
+	t.Helper()
+	stopped := fmt.Sprintf("Filestore [%s] Stopped", name)
+	for {
+		select {
+		case msg := <-l.dbgCh:
+			if msg == stopped {
+				return
+			}
+		default:
+			t.Fatalf("Filestore %q not stopped", name)
+		}
+	}
+}
