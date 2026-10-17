@@ -12455,6 +12455,7 @@ func (fs *fileStore) stop(delete, writeState bool) error {
 	// Unregister from the access time service.
 	ats.Unregister()
 
+	fs.debug("Stopped")
 	return nil
 }
 
