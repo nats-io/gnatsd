@@ -8921,22 +8921,16 @@ func (mset *stream) stop(deleteFlag, advisory bool) error {
 
 	if deleteFlag {
 		// cleanup directories after the stream
-		accDir := filepath.Join(js.config.StoreDir, accName)
 		if store != nil {
 			// Ignore errors.
 			store.Delete(false)
 		} else {
+			accDir := filepath.Join(js.config.StoreDir, accName)
 			streamDir := filepath.Join(accDir, streamsDir)
 			os.RemoveAll(filepath.Join(streamDir, name))
 		}
 		// Release any resources.
 		js.releaseStreamResources(&mset.cfg)
-		// Do cleanup in separate go routine similar to how fs will use purge here..
-		go func() {
-			// no op if not empty
-			os.Remove(filepath.Join(accDir, streamsDir))
-			os.Remove(accDir)
-		}()
 	} else if store != nil {
 		// Ignore errors.
 		store.Stop()
