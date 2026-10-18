@@ -95,3 +95,23 @@ func TestPSEmulationWin(t *testing.T) {
 	}
 	checkValues(t, pcpu, tPcpu, rss, tRss)
 }
+
+func TestPSEmulationWinInitFailureClosesQuery(t *testing.T) {
+	pcQueryLock.Lock()
+	defer pcQueryLock.Unlock()
+
+	savedHandle, savedInitial := pcHandle, initialSample
+	defer func() { pcHandle, initialSample = savedHandle, savedInitial }()
+	pcHandle = 0
+
+	// No process matches this image name, so collecting the query data
+	// fails with PDH_NO_DATA, the same error seen when the server's
+	// account is not allowed to read performance counters.
+	if err := initCounters("nats-pse-no-such-image"); err == nil {
+		t.Fatal("Expected initCounters to fail")
+	}
+	if pcHandle != 0 {
+		pdhCloseQuery(pcHandle)
+		t.Fatal("Expected the query to be closed after initCounters failed")
+	}
+}

@@ -33,6 +33,7 @@ var (
 	winPdhOpenQuery                = pdh.NewProc("PdhOpenQuery")
 	winPdhAddCounter               = pdh.NewProc("PdhAddCounterW")
 	winPdhCollectQueryData         = pdh.NewProc("PdhCollectQueryData")
+	winPdhCloseQuery               = pdh.NewProc("PdhCloseQuery")
 	winPdhGetFormattedCounterValue = pdh.NewProc("PdhGetFormattedCounterValue")
 	winPdhGetFormattedCounterArray = pdh.NewProc("PdhGetFormattedCounterArrayW")
 )
@@ -42,7 +43,7 @@ func init() {
 		panic(err)
 	}
 	for _, p := range []*windows.LazyProc{
-		winPdhOpenQuery, winPdhAddCounter, winPdhCollectQueryData,
+		winPdhOpenQuery, winPdhAddCounter, winPdhCollectQueryData, winPdhCloseQuery,
 		winPdhGetFormattedCounterValue, winPdhGetFormattedCounterArray,
 	} {
 		if err := p.Find(); err != nil {
@@ -121,6 +122,14 @@ func pdhOpenQuery(datasrc *uint16, userdata uint32, query *PDH_HQUERY) error {
 	return nil
 }
 
+func pdhCloseQuery(hQuery PDH_HQUERY) error {
+	r0, _, _ := winPdhCloseQuery.Call(uintptr(hQuery))
+	if r0 != 0 {
+		return fmt.Errorf("pdhCloseQuery failed - %d", r0)
+	}
+	return nil
+}
+
 func pdhCollectQueryData(hQuery PDH_HQUERY) error {
 	r0, _, _ := winPdhCollectQueryData.Call(uintptr(hQuery))
 	if r0 != 0 {
@@ -180,8 +189,9 @@ func getProcessImageName() (name string) {
 	return
 }
 
-// initialize our counters
-func initCounters() (err error) {
+// initialize our counters for all processes whose image name starts
+// with imageName.
+func initCounters(imageName string) (err error) {
 
 	processPid = os.Getpid()
 	// require an addressible nil pointer
@@ -189,9 +199,17 @@ func initCounters() (err error) {
 	if err := pdhOpenQuery(&source, 0, &pcHandle); err != nil {
 		return err
 	}
+	// If anything below fails, initCounters will be called again on the
+	// next sample, so close the query now or every retry leaks one.
+	defer func() {
+		if err != nil {
+			pdhCloseQuery(pcHandle)
+			pcHandle = 0
+		}
+	}()
 
 	// setup the performance counters, search for all server instances
-	name := fmt.Sprintf("%s*", getProcessImageName())
+	name := fmt.Sprintf("%s*", imageName)
 	pidQuery := fmt.Sprintf("\\Process(%s)\\ID Process", name)
 	cpuQuery := fmt.Sprintf("\\Process(%s)\\%% Processor Time", name)
 	rssQuery := fmt.Sprintf("\\Process(%s)\\Working Set - Private", name)
@@ -233,7 +251,7 @@ func ProcUsage(pcpu *float64, rss, vss *int64) error {
 
 	// First time through, initialize counters.
 	if initialSample {
-		if err = initCounters(); err != nil {
+		if err = initCounters(getProcessImageName()); err != nil {
 			return err
 		}
 		initialSample = false
