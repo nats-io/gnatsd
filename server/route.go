@@ -1529,8 +1529,8 @@ func (c *client) processRemoteSub(argo []byte, leafSub, hasOrigin bool) (err err
 	c.mu.Lock()
 	accountName := string(c.route.accName)
 	lnSupport := c.route.ln
-	c.mu.Unlock()
 	oldStyle := !c.route.lnocu && !(leafSub && !hasOrigin)
+	c.mu.Unlock()
 
 	// Indicate if the account name should be in the protocol. It would be the
 	// case if accountName is empty.
