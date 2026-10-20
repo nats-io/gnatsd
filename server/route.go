@@ -2178,6 +2178,9 @@ func (s *Server) addRoute(c *client, didSolicit, sendDelayedInfo bool, gossipMod
 			invProtoErr = fmt.Sprintf("Not possible to have a dedicated route for account %q between those servers", accName)
 			// In this case, make sure this route does not attempt to reconnect
 			c.setNoReconnect()
+		} else if info.RoutePoolIdx != 0 {
+			// Without pooling, the incoming's RoutePoolIdx should not be set.
+			invProtoErr = fmt.Sprintf("Route pool index should not be set but is set to %v", info.RoutePoolIdx)
 		} else {
 			// We will accept, but treat this remote has "no pool"
 			pool, noReconnectForOldServer = false, true

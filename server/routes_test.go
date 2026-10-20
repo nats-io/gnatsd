@@ -1372,6 +1372,52 @@ func TestRouteCloseTLSConnection(t *testing.T) {
 	ch <- true
 }
 
+func TestRouteNoPoolRejectsRoutePoolIdx(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		poolSize int
+		info     string
+	}{
+		{"remote out of range", 0, `"route_pool_size":0,"route_pool_idx":3`},
+		{"remote in range", 0, `"route_pool_size":0,"route_pool_idx":2`},
+		{"remote negative", 0, `"route_pool_size":0,"route_pool_idx":-1`},
+		{"local out of range", -1, `"route_pool_size":3,"route_pool_idx":3`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			o := DefaultOptions()
+			o.Cluster.Name = "A"
+			o.Cluster.Host = "127.0.0.1"
+			o.Cluster.Port = -1
+			o.Cluster.PoolSize = test.poolSize
+			s := RunServer(o)
+			defer s.Shutdown()
+
+			conn, err := net.DialTimeout("tcp", net.JoinHostPort(o.Cluster.Host, fmt.Sprintf("%d", o.Cluster.Port)), 2*time.Second)
+			require_NoError(t, err)
+			defer conn.Close()
+
+			_, err = conn.Write([]byte("CONNECT {\"name\":\"route\",\"verbose\":false,\"pedantic\":false,\"cluster\":\"A\"}\r\n"))
+			require_NoError(t, err)
+			_, err = conn.Write(fmt.Appendf(nil, "INFO {\"server_id\":\"route\",\"name\":\"route\",\"cluster\":\"A\",%s}\r\n", test.info))
+			require_NoError(t, err)
+
+			// The route must be rejected as a protocol violation.
+			require_NoError(t, conn.SetReadDeadline(time.Now().Add(2*time.Second)))
+			br := bufio.NewReader(conn)
+			for {
+				line, err := br.ReadString('\n')
+				require_NoError(t, err)
+				if strings.HasPrefix(line, "-ERR") {
+					require_Contains(t, line, "Route pool index should not be set")
+					break
+				}
+			}
+			require_True(t, s.Running())
+			require_Equal(t, s.NumRoutes(), 0)
+		})
+	}
+}
+
 func TestRouteClusterNameConflictBetweenStaticAndDynamic(t *testing.T) {
 	o1 := DefaultOptions()
 	o1.Cluster.Name = "AAAAAAAAAAAAAAAAAAAA" // make it alphabetically the "smallest"
