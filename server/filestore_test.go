@@ -9129,6 +9129,65 @@ func Benchmark_FileStoreCreateConsumerStores(b *testing.B) {
 	}
 }
 
+func BenchmarkFileStoreLoadNextMsgMultiRepeatedSubjects(b *testing.B) {
+	for _, test := range []struct {
+		name   string
+		keys   int
+		msgs   int
+		pad    int
+		blocks int
+	}{
+		{"RepeatedMoreSubjects", 4000, 40000, 0, 1},
+		{"RepeatedAcrossBlocks", 2000, 16000, 2048, 5},
+		{"Unique", 20000, 80000, 0, 1},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			fs, err := newFileStore(
+				FileStoreConfig{StoreDir: b.TempDir(), BlockSize: 8 * 1024 * 1024},
+				StreamConfig{Name: "bench", Subjects: []string{"data.*.*"}, Storage: FileStorage})
+			require_NoError(b, err)
+			defer fs.Stop()
+
+			payload := append([]byte(`{"v": 1}`), bytes.Repeat([]byte(" "), test.pad)...)
+			for i := range test.msgs {
+				subj := fmt.Sprintf("data.%016x.k%d", (i/4)%test.keys, i%4+1)
+				_, _, err := fs.StoreMsg(subj, nil, payload, 0)
+				require_NoError(b, err)
+			}
+			require_Equal(b, fs.numMsgBlocks(), test.blocks)
+
+			for _, multi := range []bool{true, false} {
+				name := "Single"
+				sl := gsl.NewSublist[struct{}]()
+				if multi {
+					name = "Multi"
+					for kind := 1; kind <= 4; kind++ {
+						require_NoError(b, sl.Insert(fmt.Sprintf("data.*.k%d", kind), struct{}{}))
+					}
+				} else {
+					require_NoError(b, sl.Insert("data.*.*", struct{}{}))
+				}
+				b.Run(name, func(b *testing.B) {
+					var smv StoreMsg
+					b.ReportAllocs()
+					b.ResetTimer()
+					for range b.N {
+						for seq := uint64(1); seq <= uint64(test.msgs); seq++ {
+							sm, nseq, err := fs.LoadNextMsgMulti(sl, seq, &smv)
+							if err != nil {
+								b.Fatal(err)
+							}
+							if nseq != seq || sm.seq != seq {
+								b.Fatalf("Expected sequence %d, got %d (%d)", seq, nseq, sm.seq)
+							}
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestFileStoreMaxMsgsPerSubjectOneStaleFblkAfterRestart(t *testing.T) {
 	sd := t.TempDir()
 	fcfg := FileStoreConfig{StoreDir: sd, BlockSize: 256}
