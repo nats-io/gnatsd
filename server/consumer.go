@@ -2704,6 +2704,10 @@ func (o *consumer) updateConfig(cfg *ConsumerConfig) error {
 		}
 		if !old.Equal(new) {
 			o.updatePauseState(cfg)
+			// A resume has no timer to wake the delivery loop, unlike a
+			// pause that runs out, so waiting pulls and pending messages
+			// would otherwise wait for the next message or pull.
+			o.signalNewMessages()
 			if o.isLeader() {
 				o.sendPauseAdvisoryLocked(cfg)
 			}
