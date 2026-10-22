@@ -10427,21 +10427,6 @@ func TestJetStreamClusterConsumerHealthCheckMustNotRecreate(t *testing.T) {
 			return nil
 		})
 	}
-	waitForNoConsumerAssignments := func() {
-		t.Helper()
-		checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
-			for _, s := range c.servers {
-				sjs := s.getJetStream()
-				sjs.mu.RLock()
-				ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
-				sjs.mu.RUnlock()
-				if ca != nil {
-					return fmt.Errorf("stream assignment still available on %s", s.Name())
-				}
-			}
-			return nil
-		})
-	}
 	getConsumerAssignment := func(rs *Server) (*jetStream, *streamAssignment, *consumerAssignment, *stream) {
 		acc, err := rs.lookupAccount(globalAccountName)
 		require_NoError(t, err)
@@ -10522,7 +10507,18 @@ func TestJetStreamClusterConsumerHealthCheckMustNotRecreate(t *testing.T) {
 
 	err = js.DeleteConsumer("TEST", "CONSUMER")
 	require_NoError(t, err)
-	waitForNoConsumerAssignments()
+
+	// Wait for deletion to clear the node on the other replica,
+	// otherwise cleanup could later remove the node that is
+	// restored below.
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		sjs.mu.RLock()
+		defer sjs.mu.RUnlock()
+		if ca.Group.node != nil {
+			return errors.New("consumer node cleanup still in progress")
+		}
+		return nil
+	})
 
 	// Underlying layer would be aware the health check made a copy.
 	// So we sneakily set these values back, which simulates a race condition where
