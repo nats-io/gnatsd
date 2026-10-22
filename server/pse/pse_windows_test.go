@@ -101,7 +101,11 @@ func TestPSEmulationWinInitFailureClosesQuery(t *testing.T) {
 	defer pcQueryLock.Unlock()
 
 	savedHandle, savedInitial := pcHandle, initialSample
-	defer func() { pcHandle, initialSample = savedHandle, savedInitial }()
+	savedPid, savedCPU, savedRss, savedVss := pidCounter, cpuCounter, rssCounter, vssCounter
+	defer func() {
+		pcHandle, initialSample = savedHandle, savedInitial
+		pidCounter, cpuCounter, rssCounter, vssCounter = savedPid, savedCPU, savedRss, savedVss
+	}()
 	pcHandle = 0
 
 	// No process matches this image name, so collecting the query data
