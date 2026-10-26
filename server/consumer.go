@@ -2874,7 +2874,12 @@ func (o *consumer) processAck(subject, reply string, hdr int, rmsg []byte) {
 		}
 	case bytes.HasPrefix(msg, AckNext):
 		o.processAckMsg(sseq, dseq, dc, _EMPTY_, true)
-		o.processNextMsgRequest(reply, msg[len(AckNext):])
+		// An _R_ reply's Nats-Request-Info holds the requester's account and reply, parsed only if needed.
+		var rci []byte
+		if strings.HasPrefix(reply, replyPrefix) && hdr > 0 {
+			rci = sliceHeader(ClientInfoHdr, rmsg[:hdr])
+		}
+		o.processNextMsgRequest(reply, msg[len(AckNext):], rci)
 		skipAckReply = true
 	case bytes.HasPrefix(msg, AckNak):
 		o.processNak(sseq, dseq, dc, msg)
@@ -4080,6 +4085,8 @@ type waitingRequest struct {
 	next          *waitingRequest
 	acc           *Account
 	interest      string
+	racc          *Account // Requester's account from Nats-Request-Info, until its interest is tracked.
+	rreply        string   // Requester's reply from Nats-Request-Info, until its interest is tracked.
 	reply         string
 	n             int // For batching
 	d             int // num delivered
@@ -4112,6 +4119,7 @@ func (wr *waitingRequest) recycleIfDone() bool {
 func (wr *waitingRequest) recycle() {
 	if wr != nil {
 		wr.next, wr.acc, wr.interest, wr.reply = nil, nil, _EMPTY_, _EMPTY_
+		wr.racc, wr.rreply = nil, _EMPTY_
 		wrPool.Put(wr)
 	}
 }
@@ -4533,6 +4541,7 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 				}
 			}
 
+			wr.trackRequesterInterest(o.srv)
 			if wr.acc.sl.HasInterest(wr.interest) {
 				return o.waiting.popOrPopAndRequeue(o.cfg.PriorityPolicy)
 			} else if time.Since(wr.received) < defaultGatewayRecentSubExpiration && (o.srv.leafNodeEnabled || o.srv.gateway.enabled) {
@@ -4587,11 +4596,12 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 type nextMsgReq struct {
 	reply string
 	msg   []byte
+	rci   []byte // Nats-Request-Info, for an _R_ reply of a service import
 }
 
 var nextMsgReqPool sync.Pool
 
-func newNextMsgReq(reply string, msg []byte) *nextMsgReq {
+func newNextMsgReq(reply string, msg, rci []byte) *nextMsgReq {
 	var nmr *nextMsgReq
 	m := nextMsgReqPool.Get()
 	if m != nil {
@@ -4602,7 +4612,7 @@ func newNextMsgReq(reply string, msg []byte) *nextMsgReq {
 	// When getting something from a pool it is critical that all fields are
 	// initialized. Doing this way guarantees that if someone adds a field to
 	// the structure, the compiler will fail the build if this line is not updated.
-	(*nmr) = nextMsgReq{reply, msg}
+	(*nmr) = nextMsgReq{reply, msg, rci}
 	return nmr
 }
 
@@ -4610,7 +4620,7 @@ func (nmr *nextMsgReq) returnToPool() {
 	if nmr == nil {
 		return
 	}
-	nmr.reply, nmr.msg = _EMPTY_, nil
+	nmr.reply, nmr.msg, nmr.rci = _EMPTY_, nil, nil
 	nextMsgReqPool.Put(nmr)
 }
 
@@ -4635,7 +4645,12 @@ func (o *consumer) processNextMsgReq(_ *subscription, c *client, _ *Account, _, 
 		o.outq.send(newJSPubMsg(reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
 		return
 	}
-	o.nextMsgReqs.push(newNextMsgReq(reply, copyBytes(msg)))
+	// An _R_ reply's Nats-Request-Info holds the requester's account and reply, parsed only if needed.
+	var rci []byte
+	if strings.HasPrefix(reply, replyPrefix) && len(hdr) > 0 {
+		rci = copyBytes(sliceHeader(ClientInfoHdr, hdr))
+	}
+	o.nextMsgReqs.push(newNextMsgReq(reply, copyBytes(msg), rci))
 }
 
 // processResetReq will reset a consumer to a new starting sequence.
@@ -4691,7 +4706,7 @@ func (o *consumer) processResetReq(_ *subscription, c *client, a *Account, _, re
 	}
 }
 
-func (o *consumer) processNextMsgRequest(reply string, msg []byte) {
+func (o *consumer) processNextMsgRequest(reply string, msg, rci []byte) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
@@ -4801,12 +4816,21 @@ func (o *consumer) processNextMsgRequest(reply string, msg []byte) {
 
 	// If we receive this request though an account export, we need to track that interest subject and account.
 	acc, interest := trackDownAccountAndInterest(o.acc, reply)
+	// An _R_ reply of an import on another server can't be tracked down here, and always has interest.
+	// Get the requester's account and reply from Nats-Request-Info instead.
+	var racc *Account
+	var rreply string
+	if len(rci) > 0 && strings.HasPrefix(interest, replyPrefix) {
+		racc, rreply = o.srv.requesterFromRequestInfo(rci)
+	}
 
 	// Create a waiting request.
 	wr := wrPool.Get().(*waitingRequest)
 	wr.acc, wr.interest, wr.reply, wr.n, wr.d, wr.noWait, wr.expires, wr.hb, wr.hbt, wr.priorityGroup = acc, interest, reply, batchSize, 0, noWait, expires, hb, hbt, priorityGroup
+	wr.racc, wr.rreply = racc, rreply
 	wr.b = maxBytes
 	wr.received = time.Now()
+	wr.trackRequesterInterest(o.srv)
 
 	if o.cfg.PriorityPolicy == PriorityPrioritized {
 		if err := o.waiting.addPrioritized(wr); err != nil {
@@ -4852,6 +4876,30 @@ func trackDownAccountAndInterest(acc *Account, interest string) (*Account, strin
 		oa.mu.RUnlock()
 	}
 	return acc, interest
+}
+
+// Returns the requester's account and reply from Nats-Request-Info, if known here.
+func (s *Server) requesterFromRequestInfo(rci []byte) (*Account, string) {
+	var ci ClientInfo
+	if json.Unmarshal(rci, &ci) != nil || ci.Reply == _EMPTY_ {
+		return nil, _EMPTY_
+	}
+	if a, ok := s.accounts.Load(ci.Account); ok {
+		return a.(*Account), ci.Reply
+	}
+	return nil, _EMPTY_
+}
+
+// Tracks the requester's reply instead of the _R_ reply, once we see its interest.
+// Until then its interest may not have reached us, or it's behind a leafnode.
+func (wr *waitingRequest) trackRequesterInterest(s *Server) {
+	if wr.racc == nil {
+		return
+	}
+	if wr.racc.sl.HasInterest(wr.rreply) || s.hasGatewayInterest(wr.racc.Name, wr.rreply) {
+		wr.acc, wr.interest = wr.racc, wr.rreply
+		wr.racc, wr.rreply = nil, _EMPTY_
+	}
 }
 
 // Return current delivery count for a given sequence.
@@ -5157,6 +5205,7 @@ func (o *consumer) processWaiting(eos bool) (int, int, int, time.Time) {
 			}
 		}
 		// Now check interest.
+		wr.trackRequesterInterest(s)
 		interest := wr.acc.sl.HasInterest(wr.interest)
 		if !interest && (s.leafNodeEnabled || s.gateway.enabled) {
 			// If we are here check on gateways and leaf nodes (as they can mask gateways on the other end).
@@ -5367,7 +5416,7 @@ func (o *consumer) processInboundNextMsgReqs(qch chan struct{}) {
 		case <-o.nextMsgReqs.ch:
 			reqs := o.nextMsgReqs.pop()
 			for _, req := range reqs {
-				o.processNextMsgRequest(req.reply, req.msg)
+				o.processNextMsgRequest(req.reply, req.msg, req.rci)
 				req.returnToPool()
 			}
 			o.nextMsgReqs.recycle(&reqs)

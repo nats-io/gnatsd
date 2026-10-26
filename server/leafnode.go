@@ -3420,6 +3420,12 @@ func (c *client) processInboundLeafMsg(msg []byte) {
 		return
 	}
 
+	// A leafnode only speaks for the account it's bound to.
+	// The system account is trusted to speak for others, like for JetStream API requests.
+	if len(c.pa.reply) > 0 && c.pa.hdr > 0 && acc != srv.SystemAccount() {
+		msg = c.bindLeafClientInfoHeader(acc, msg)
+	}
+
 	// Match the subscriptions. We will use our own L1 map if
 	// it's still valid, avoiding contention on the shared sublist.
 	var r *SublistResult

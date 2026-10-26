@@ -4362,6 +4362,12 @@ func isJSAckSubject(subject []byte) bool {
 	return len(subject) > jsAckPreLen && bytesToString(subject[:jsAckPreLen]) == jsAckPre
 }
 
+// Test whether a message is a JetStream pull request, either directly or with an ack.
+func isJSPullRequest(subject string, payload []byte) bool {
+	return strings.HasPrefix(subject, jsRequestNextPre) ||
+		(isJSAckSubject(stringToBytes(subject)) && bytes.HasPrefix(payload, AckNext))
+}
+
 // jsAckDeliverIdx returns the byte offset of the `@` separator in an encoded
 // `$JS.ACK....@<deliver>` reply, or -1 if reply is not in that form. Stream,
 // consumer, and subject tokens may legally contain `@`, so we accept only the
@@ -5088,6 +5094,9 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 			ci = c.getClientInfo(share)
 			// Fast batch requires knowledge of the original reply subject.
 			if bytes.HasSuffix(c.pa.reply, []byte(FastBatchSuffix)) {
+				ci.Reply = bytesToString(c.pa.reply)
+			} else if ci != nil && len(c.pa.reply) > 0 && isJSPullRequest(to, msg[max(c.pa.hdr, 0):]) {
+				// So do pull requests, for a consumer leader on another server to track the requester's interest.
 				ci.Reply = bytesToString(c.pa.reply)
 			}
 			// If we did not share but the imports destination is the system account add in the server and cluster info.
@@ -5921,6 +5930,26 @@ func (c *client) checkLeafClientInfoHeader(msg []byte) (dmsg []byte, setHdr bool
 		}
 	}
 	return dmsg, setHdr
+}
+
+// Bind a client info header received from a leafnode to the account of the leafnode connection.
+func (c *client) bindLeafClientInfoHeader(acc *Account, msg []byte) []byte {
+	if c.pa.hdr < 0 || len(msg) < c.pa.hdr {
+		return msg
+	}
+	cir := sliceHeader(ClientInfoHdr, msg[:c.pa.hdr])
+	if len(cir) == 0 {
+		return msg
+	}
+	var ci ClientInfo
+	if err := json.Unmarshal(cir, &ci); err != nil || ci.Account == acc.Name {
+		return msg
+	}
+	ci.Account = acc.Name
+	if b, _ := json.Marshal(ci); b != nil {
+		msg = c.setHeader(ClientInfoHdr, bytesToString(b), msg)
+	}
+	return msg
 }
 
 func (c *client) pubPermissionViolation(subject []byte) {
