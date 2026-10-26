@@ -6626,7 +6626,7 @@ func (js *jetStream) processClusterCreateConsumer(oca, ca *consumerAssignment, s
 								resp.Error = NewJSConsumerInvalidResetError(err)
 								s.sendAPIErrResponse(client, acc, subject, reply, _EMPTY_, s.jsonResponse(&resp))
 							} else if canRespond {
-								if resp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.info()); resp.ConsumerInfo == nil {
+								if resp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.resetInfo(resetSeq)); resp.ConsumerInfo == nil {
 									// The consumer was closed before we could respond.
 									resp.Error = NewJSConsumerInvalidResetError(errConsumerClosed)
 									s.sendAPIErrResponse(client, acc, subject, reply, _EMPTY_, s.jsonResponse(&resp))
@@ -7346,7 +7346,7 @@ func (js *jetStream) applyConsumerEntries(o *consumer, ce *CommittedEntry, isLea
 							a = nil
 						}
 						var resp = JSApiConsumerResetResponse{ApiResponse: ApiResponse{Type: JSApiConsumerResetResponseType}}
-						if resp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.info()); resp.ConsumerInfo == nil {
+						if resp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.resetInfo(sseq)); resp.ConsumerInfo == nil {
 							// The consumer was closed before we could respond.
 							resp.Error = NewJSConsumerInvalidResetError(errConsumerClosed)
 							s.sendInternalAccountMsg(a, reply, s.jsonResponse(&resp))
@@ -7568,7 +7568,7 @@ func (js *jetStream) processConsumerLeaderChangeWithAssignment(o *consumer, ca *
 				rresp.Error = NewJSConsumerInvalidResetError(err)
 				s.sendAPIErrResponse(client, acc, subject, reply, _EMPTY_, s.jsonResponse(&rresp))
 			} else if canRespond {
-				if rresp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.info()); rresp.ConsumerInfo == nil {
+				if rresp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.resetInfo(resetSeq)); rresp.ConsumerInfo == nil {
 					// The consumer was closed before we could respond.
 					rresp.Error = NewJSConsumerInvalidResetError(errConsumerClosed)
 					s.sendAPIErrResponse(client, acc, subject, reply, _EMPTY_, s.jsonResponse(&rresp))

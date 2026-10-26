@@ -3487,6 +3487,18 @@ func (o *consumer) info() *ConsumerInfo {
 	return o.infoWithSnap(false)
 }
 
+// resetInfo returns the consumer info for a reset to the given starting sequence.
+// Delivery resumes before the info is gathered, so report the reset point itself.
+func (o *consumer) resetInfo(seq uint64) *ConsumerInfo {
+	info := o.info()
+	if info == nil {
+		return nil
+	}
+	info.Delivered.Consumer, info.Delivered.Stream = 0, seq-1
+	info.AckFloor.Consumer, info.AckFloor.Stream = 0, seq-1
+	return info
+}
+
 func (o *consumer) infoWithSnap(snap bool) *ConsumerInfo {
 	return o.infoWithSnapAndReply(snap, _EMPTY_)
 }
@@ -4613,7 +4625,7 @@ func (o *consumer) processResetReq(_ *subscription, c *client, a *Account, _, re
 		resp.Error = NewJSConsumerInvalidResetError(err)
 		s.sendInternalAccountMsg(a, reply, s.jsonResponse(&resp))
 	} else if canRespond {
-		if resp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.info()); resp.ConsumerInfo == nil {
+		if resp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.resetInfo(resetSeq)); resp.ConsumerInfo == nil {
 			// The consumer was closed before we could respond.
 			resp.Error = NewJSConsumerInvalidResetError(errConsumerClosed)
 			s.sendInternalAccountMsg(a, reply, s.jsonResponse(&resp))

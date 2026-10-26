@@ -13970,6 +13970,61 @@ func TestJetStreamConsumerEphemeralPullDefaultInactiveThresholdAfterRestart(t *t
 	})
 }
 
+func TestJetStreamConsumerResetResponseReportsResetSeq(t *testing.T) {
+	test := func(t *testing.T, replicas int) {
+		c := createJetStreamClusterExplicit(t, "R3S", 3)
+		defer c.shutdown()
+
+		nc := clientConnectToServer(t, c.randomServer())
+		defer nc.Close()
+
+		_, err := jsStreamCreate(t, nc, &StreamConfig{
+			Name:     "TEST",
+			Subjects: []string{"foo"},
+			Replicas: replicas,
+			Storage:  FileStorage,
+		})
+		require_NoError(t, err)
+		for range 200 {
+			_, err = nc.Request("foo", nil, time.Second)
+			require_NoError(t, err)
+		}
+
+		// Answer flow control so the consumer keeps delivering.
+		sub, err := nc.Subscribe("deliver", func(m *nats.Msg) {
+			if m.Reply != _EMPTY_ {
+				m.Respond(nil)
+			}
+		})
+		require_NoError(t, err)
+		defer sub.Unsubscribe()
+
+		_, err = jsConsumerCreate(t, nc, "TEST", ConsumerConfig{
+			Durable:        "CONSUMER",
+			DeliverSubject: "deliver",
+			AckPolicy:      AckFlowControl,
+			Replicas:       replicas,
+		}, false)
+		require_NoError(t, err)
+		c.waitOnConsumerLeader(globalAccountName, "TEST", "CONSUMER")
+
+		// Delivery resumes right after the reset, the response must still report the reset point.
+		for range 500 {
+			msg, err := nc.Request(fmt.Sprintf(JSApiConsumerResetT, "TEST", "CONSUMER"), nil, 2*time.Second)
+			require_NoError(t, err)
+			var resp JSApiConsumerResetResponse
+			require_NoError(t, json.Unmarshal(msg.Data, &resp))
+			require_True(t, resp.Error == nil)
+			require_Equal(t, resp.Delivered.Stream, resp.ResetSeq-1)
+			require_Equal(t, resp.AckFloor.Stream, resp.ResetSeq-1)
+		}
+	}
+
+	for _, replicas := range []int{1, 3} {
+		t.Run(fmt.Sprintf("R%d", replicas), func(t *testing.T) { test(t, replicas) })
+	}
+}
+
 func TestJetStreamConsumerResetPendingHoldsDeliveries(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
