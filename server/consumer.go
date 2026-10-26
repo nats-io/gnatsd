@@ -4943,6 +4943,7 @@ func (o *consumer) isFilterSubsetOf(subj string) bool {
 
 var (
 	errMaxAckPending = errors.New("max ack pending reached")
+	errResetPending  = errors.New("reset pending")
 	errBadConsumer   = errors.New("consumer not valid")
 	errNoInterest    = errors.New("consumer requires interest for delivery subject when ephemeral")
 )
@@ -4953,6 +4954,11 @@ var (
 func (o *consumer) getNextMsg() (*jsPubMsg, uint64, error) {
 	if o.mset == nil || o.mset.store == nil {
 		return nil, 0, errBadConsumer
+	}
+	// Deliveries proposed before a reset applies would mix into the delivered state after it.
+	// Only our own resets are tracked, these always have a reply when replicated.
+	if len(o.rsm) > 0 {
+		return nil, 0, errResetPending
 	}
 	// Process redelivered messages before looking at possibly "skip list" (deliver last per subject)
 	if o.hasRedeliveries() {
@@ -5467,7 +5473,7 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 			if err == ErrStoreEOF {
 				o.checkNumPendingOnEOF()
 			}
-			if err == ErrStoreMsgNotFound || err == errDeletedMsg || err == ErrStoreEOF || err == errMaxAckPending {
+			if err == ErrStoreMsgNotFound || err == errDeletedMsg || err == ErrStoreEOF || err == errMaxAckPending || err == errResetPending {
 				goto waitForMsgs
 			} else {
 				if pmsg != nil {
@@ -5600,8 +5606,8 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 		// Make sure to process any expired requests that are pending.
 		var wrExp <-chan time.Time
 		if o.isPullMode() {
-			// Dont expire oneshots if we are here because of max ack pending limit.
-			_, _, _, fexp := o.processWaiting(err != errMaxAckPending)
+			// Dont expire oneshots if we are here because of max ack pending limit or a pending reset.
+			_, _, _, fexp := o.processWaiting(err != errMaxAckPending && err != errResetPending)
 			if !fexp.IsZero() {
 				expires := time.Until(fexp)
 				if expires <= 0 {
