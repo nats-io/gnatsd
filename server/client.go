@@ -6260,6 +6260,12 @@ func (c *client) processSubsOnConfigReload(awcsti map[string]struct{}) {
 		checkAcc   = c.acc != nil
 		acc        = c.acc
 	)
+	if checkAcc {
+		// We actually only want to check if stream imports have changed.
+		if _, ok := awcsti[acc.Name]; !ok {
+			checkAcc = false
+		}
+	}
 	if !checkPerms && !checkAcc {
 		c.mu.Unlock()
 		return
@@ -6271,12 +6277,6 @@ func (c *client) processSubsOnConfigReload(awcsti map[string]struct{}) {
 		removed  = _removed[:0]
 		srv      = c.srv
 	)
-	if checkAcc {
-		// We actually only want to check if stream imports have changed.
-		if _, ok := awcsti[acc.Name]; !ok {
-			checkAcc = false
-		}
-	}
 	// We will clear any mperms we have here. It will rebuild on the fly with canSubscribe,
 	// so we do that here as we collect them. We will check result down below.
 	if checkPerms {
