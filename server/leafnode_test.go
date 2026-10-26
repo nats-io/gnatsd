@@ -10724,6 +10724,106 @@ func TestLeafNodeDenyImportsDoesNotDropRepliesToHub(t *testing.T) {
 	}
 }
 
+// A leafnode's subs hold the remote's interest. An account update on either side must
+// not remove it based on the leafnode's subscribe perms.
+func TestLeafNodeAccountUpdateKeepsRemoteInterest(t *testing.T) {
+	sysKp, sysPub := createKey(t)
+	sysJwt := encodeClaim(t, jwt.NewAccountClaims(sysPub), sysPub)
+	sysCreds := newUser(t, sysKp)
+
+	_, expPub := createKey(t)
+	expClaim := jwt.NewAccountClaims(expPub)
+	expClaim.Exports.Add(&jwt.Export{Subject: "feed", Type: jwt.Stream})
+	expJwt := encodeClaim(t, expClaim, expPub)
+
+	aKp, aPub := createKey(t)
+	aClaim := jwt.NewAccountClaims(aPub)
+	aJwt := encodeClaim(t, aClaim, aPub)
+	aCreds := newUser(t, aKp)
+
+	// The leaf user may receive anything, but may not publish "events".
+	ukp, _ := nkeys.CreateUser()
+	seed, _ := ukp.Seed()
+	upub, _ := ukp.PublicKey()
+	uclaim := newJWTTestUserClaims()
+	uclaim.Subject = upub
+	uclaim.Pub.Deny.Add("events")
+	ujwt, err := uclaim.Encode(aKp)
+	require_NoError(t, err)
+	leafCreds := genCredsFile(t, ujwt, seed)
+
+	tmpl := `
+		server_name: %s
+		listen: "127.0.0.1:-1"
+		operator: %s
+		system_account: %s
+		resolver: MEMORY
+		resolver_preload: {
+			%s: %s
+			%s: %s
+			%s: %s
+		}
+		leafnodes {
+			%s
+		}
+	`
+	conf := func(name, leafnodes string) string {
+		return createConfFile(t, []byte(fmt.Sprintf(tmpl, name, ojwt, sysPub,
+			sysPub, sysJwt, expPub, expJwt, aPub, aJwt, leafnodes)))
+	}
+	hub, ohub := RunServerWithConfig(conf("HUB", `listen: "127.0.0.1:-1"`))
+	defer hub.Shutdown()
+
+	leaf, _ := RunServerWithConfig(conf("LEAF", fmt.Sprintf(`
+		remotes: [
+			{ url: "nats://127.0.0.1:%d", account: %s, credentials: '%s', deny_imports: ["_INBOX.>"] }
+		]
+	`, ohub.LeafNode.Port, aPub, leafCreds)))
+	defer leaf.Shutdown()
+
+	checkLeafNodeConnected(t, hub)
+	checkLeafNodeConnected(t, leaf)
+
+	ncLeaf := natsConnect(t, leaf.ClientURL(), nats.UserCredentials(aCreds))
+	defer ncLeaf.Close()
+	natsSub(t, ncLeaf, "svc", func(m *nats.Msg) {
+		m.Respond([]byte("OK"))
+	})
+	sub := natsSubSync(t, ncLeaf, "events")
+	natsFlush(t, ncLeaf)
+	checkSubInterest(t, hub, aPub, "svc", time.Second)
+	checkSubInterest(t, hub, aPub, "events", time.Second)
+
+	ncHub := natsConnect(t, hub.ClientURL(), nats.UserCredentials(aCreds))
+	defer ncHub.Close()
+
+	check := func() {
+		t.Helper()
+		// The leaf holds the hub requester's _INBOX interest, overlapping deny_imports.
+		resp, err := ncHub.Request("svc", []byte("hello"), 2*time.Second)
+		require_NoError(t, err)
+		require_Equal(t, "OK", string(resp.Data))
+
+		// The hub holds the leaf's interest in "events", which the leaf user may not publish.
+		natsPub(t, ncHub, "events", nil)
+		natsFlush(t, ncHub)
+		natsNexMsg(t, sub, time.Second)
+	}
+	check()
+
+	// Adding a stream import reprocesses the subs of all connections in the account.
+	aClaim.Imports.Add(&jwt.Import{Subject: "feed", Account: expPub, Type: jwt.Stream})
+	aJwt = encodeClaim(t, aClaim, aPub)
+	for _, s := range []*Server{hub, leaf} {
+		ncSys := natsConnect(t, s.ClientURL(), nats.UserCredentials(sysCreds))
+		msg, err := ncSys.Request(fmt.Sprintf(accUpdateEventSubjNew, aPub), []byte(aJwt), time.Second)
+		ncSys.Close()
+		require_NoError(t, err)
+		require_Contains(t, string(msg.Data), "jwt updated")
+	}
+	check()
+}
+
 func TestLeafNodePermissionWithGateways(t *testing.T) {
 	usConf := createConfFile(t, []byte(`
 		server_name: "US"
