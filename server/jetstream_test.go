@@ -25608,6 +25608,83 @@ func TestJetStreamDurableStreamMirrorAndSourceIncorrectConsumerConfig(t *testing
 	require_Error(t, err, NewJSSourceDurableConsumerCfgInvalidError())
 }
 
+// https://github.com/nats-io/nats-server/issues/8796
+func TestJetStreamDurableStreamSourcingStaleDeliveryAfterReset(t *testing.T) {
+	test := func(t *testing.T, source bool) {
+		s := RunBasicJetStreamServer(t)
+		defer s.Shutdown()
+
+		nc, _ := jsClientConnect(t, s)
+		defer nc.Close()
+
+		_, err := jsStreamCreate(t, nc, &StreamConfig{Name: "O", Subjects: []string{"foo"}, Storage: FileStorage})
+		require_NoError(t, err)
+		// Starts at s2, so the reset when setting up goes back to the ack floor at s1.
+		// Deliveries go elsewhere, we hand them to the mirror or source ourselves.
+		_, err = jsConsumerCreate(t, nc, "O", ConsumerConfig{
+			Durable:        "C",
+			DeliverSubject: "orig",
+			AckPolicy:      AckFlowControl,
+			DeliverPolicy:  DeliverByStartSequence,
+			OptStartSeq:    2,
+		}, false)
+		require_NoError(t, err)
+
+		ssi := &StreamSource{Name: "O", Consumer: &StreamConsumerSource{Name: "C", DeliverSubject: "dlv"}}
+		cfg := &StreamConfig{Name: "M", Storage: FileStorage}
+		if source {
+			cfg.Sources = []*StreamSource{ssi}
+		} else {
+			cfg.Mirror = ssi
+		}
+		_, err = jsStreamCreate(t, nc, cfg)
+		require_NoError(t, err)
+		mset, err := s.globalAccount().lookupStream("M")
+		require_NoError(t, err)
+
+		var si *sourceInfo
+		checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+			mset.mu.RLock()
+			defer mset.mu.RUnlock()
+			if si = mset.mirror; source {
+				for _, si = range mset.sources {
+				}
+			}
+			if si == nil || si.sub == nil {
+				return errors.New("consumer not set up yet")
+			}
+			return nil
+		})
+		deliver := func(dseq, sseq uint64) {
+			m := &inMsg{subj: "foo", rply: fmt.Sprintf("$JS.ACK.O.C.1.%d.%d.0.0", sseq, dseq), msg: []byte("x")}
+			if source {
+				mset.processInboundSourceMsg(si, m)
+			} else {
+				mset.processInboundMirrorMsg(m)
+			}
+		}
+
+		// A stale d1 = s1 from before the reset arrives first.
+		deliver(1, 1)
+		// A source would drop d1 = s2 by itself, a mirror only skips s2 if it's lost.
+		if source {
+			deliver(1, 2)
+		}
+		deliver(2, 3)
+
+		// The origin never deleted s2, so s3 must not be stored without it.
+		state := mset.state()
+		if source {
+			require_Equal(t, state.Msgs, 2)
+		} else {
+			require_Equal(t, state.LastSeq, 1)
+		}
+	}
+
+	t.Run("Mirror", func(t *testing.T) { test(t, false) })
+	t.Run("Source", func(t *testing.T) { test(t, true) })
+}
+
 func TestJetStreamDurableStreamSourcesWithUniqueConsumerNames(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
