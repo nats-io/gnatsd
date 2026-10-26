@@ -14025,3 +14025,125 @@ func TestJetStreamConsumerEphemeralPullDefaultInactiveThresholdAfterRestart(t *t
 		return nil
 	})
 }
+
+func TestJetStreamConsumerResetPendingHoldsDeliveries(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc := clientConnectToServer(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := jsStreamCreate(t, nc, &StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+		Storage:  FileStorage,
+	})
+	require_NoError(t, err)
+	for range 30 {
+		_, err = nc.Request("foo", nil, time.Second)
+		require_NoError(t, err)
+	}
+
+	// No interest on the deliver subject, so we drive deliveries ourselves.
+	_, err = jsConsumerCreate(t, nc, "TEST", ConsumerConfig{
+		Durable:        "CONSUMER",
+		DeliverSubject: "deliver",
+		AckPolicy:      AckFlowControl,
+		Replicas:       3,
+	}, false)
+	require_NoError(t, err)
+	c.waitOnConsumerLeader(globalAccountName, "TEST", "CONSUMER")
+
+	lookupConsumer := func() *consumer {
+		t.Helper()
+		cl := c.consumerLeader(globalAccountName, "TEST", "CONSUMER")
+		require_NotNil(t, cl)
+		mset, err := cl.globalAccount().lookupStream("TEST")
+		require_NoError(t, err)
+		o := mset.lookupConsumer("CONSUMER")
+		require_NotNil(t, o)
+		return o
+	}
+	o := lookupConsumer()
+
+	// Same as loopAndGatherMsgs, lock should be held.
+	deliverNext := func() error {
+		pmsg, dc, err := o.getNextMsg()
+		if err != nil {
+			return err
+		}
+		o.deliverMsg(o.cfg.DeliverSubject, o.ackReply(pmsg.seq, o.dseq, dc, pmsg.ts, o.numPending()), pmsg, dc, LimitsPolicy)
+		return nil
+	}
+	reset := func(seq uint64) {
+		t.Helper()
+		o.mu.Lock()
+		_, _, err := o.resetStartingSeqLocked(seq, _EMPTY_, false, false)
+		o.mu.Unlock()
+		require_NoError(t, err)
+		checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+			o.mu.RLock()
+			defer o.mu.RUnlock()
+			if o.dseq != 1 || o.sseq != seq {
+				return fmt.Errorf("reset not applied yet: dseq=%d sseq=%d", o.dseq, o.sseq)
+			}
+			return nil
+		})
+	}
+	deliver := func(n int) {
+		t.Helper()
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		for range n {
+			require_NoError(t, deliverNext())
+		}
+	}
+
+	// Deliver d1..d5 = s15..s19.
+	reset(15)
+	deliver(5)
+
+	// Reset back to s11, nothing must be delivered until it's applied.
+	// Otherwise d6 = s20 is applied after the reset and mixes into the delivered state.
+	o.mu.Lock()
+	_, _, err = o.resetStartingSeqLocked(11, "reply", false, false)
+	if err == nil {
+		err = deliverNext()
+	}
+	o.mu.Unlock()
+	require_Error(t, err, errResetPending)
+
+	// Deliver d1..d8 = s11..s18.
+	reset(11)
+	deliver(8)
+	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		for _, s := range c.servers {
+			mset, err := s.globalAccount().lookupStream("TEST")
+			if err != nil {
+				return err
+			}
+			state, err := mset.lookupConsumer("CONSUMER").store.State()
+			if err != nil {
+				return err
+			}
+			if state.Delivered.Consumer != 8 || state.Delivered.Stream != 18 {
+				return fmt.Errorf("%s: unexpected delivered state %+v", s, state.Delivered)
+			}
+		}
+		return nil
+	})
+
+	// A new leader must continue at d9 = s19.
+	o.mu.RLock()
+	node := o.node
+	o.mu.RUnlock()
+	require_NoError(t, node.StepDown())
+	c.waitOnConsumerLeader(globalAccountName, "TEST", "CONSUMER")
+	o = lookupConsumer()
+	o.mu.RLock()
+	dseq, sseq := o.dseq, o.sseq
+	o.mu.RUnlock()
+	require_Equal(t, dseq, 9)
+	require_Equal(t, sseq, 19)
+}
