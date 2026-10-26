@@ -10530,6 +10530,111 @@ func TestLeafNodeQueueScopedImportDenyFiltersBroadQueueInterest(t *testing.T) {
 	require_Equal(t, "exact blocked", string(msg.Data))
 }
 
+// A remote's deny_imports only limits what the leaf receives from the hub, and
+// deny_exports only what it sends. Replies to a hub requester must not be dropped
+// when interest on either side overlaps an import deny.
+func TestLeafNodeDenyImportsDoesNotDropRepliesToHub(t *testing.T) {
+	// In each case a single kind of interest overlaps the deny. All but the first use the
+	// old request style, so the hub's reply inbox is literal and doesn't overlap it.
+	for _, test := range []struct {
+		name            string
+		oldRequestStyle bool
+		hubQueue        bool
+		leafWildcard    bool
+	}{
+		// The hub requester's response inbox (_INBOX.<id>.*) overlaps the deny.
+		{"hub wildcard inbox", false, false, false},
+		// A hub queue sub on a literal subject overlaps the deny.
+		{"hub queue sub", true, true, false},
+		// A leaf wildcard sub overlaps the deny.
+		{"leaf wildcard sub", true, false, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			hconf := createConfFile(t, []byte(`
+				server_name: "HUB"
+				listen: "127.0.0.1:-1"
+				leafnodes {
+					listen: "127.0.0.1:-1"
+				}
+			`))
+			hub, ohub := RunServerWithConfig(hconf)
+			defer hub.Shutdown()
+
+			lconf := createConfFile(t, []byte(fmt.Sprintf(`
+				server_name: "LEAF"
+				listen: "127.0.0.1:-1"
+				leafnodes {
+					remotes: [
+						{ url: "nats://127.0.0.1:%d", deny_imports: ["_INBOX.>"], deny_exports: ["out.secret"] }
+					]
+				}
+			`, ohub.LeafNode.Port)))
+			leaf, _ := RunServerWithConfig(lconf)
+			defer leaf.Shutdown()
+
+			checkLeafNodeConnected(t, hub)
+			checkLeafNodeConnected(t, leaf)
+
+			var opts []nats.Option
+			if test.oldRequestStyle {
+				opts = append(opts, nats.UseOldRequestStyle())
+			}
+			ncHub := natsConnect(t, hub.ClientURL(), opts...)
+			defer ncHub.Close()
+			out := natsSubSync(t, ncHub, "out.*")
+			if test.hubQueue {
+				natsQueueSubSync(t, ncHub, "_INBOX.queue", "q")
+			}
+			natsFlush(t, ncHub)
+			checkSubInterest(t, leaf, globalAccountName, "out.public", time.Second)
+			if test.hubQueue {
+				checkSubInterest(t, leaf, globalAccountName, "_INBOX.queue", time.Second)
+			}
+
+			ncLeaf := natsConnect(t, leaf.ClientURL())
+			defer ncLeaf.Close()
+			natsSub(t, ncLeaf, "svc", func(m *nats.Msg) {
+				m.Respond([]byte("OK"))
+			})
+			var wildcard *nats.Subscription
+			if test.leafWildcard {
+				wildcard = natsSubSync(t, ncLeaf, ">")
+			}
+			denied := natsSubSync(t, ncLeaf, "_INBOX.leaf")
+			natsFlush(t, ncLeaf)
+			checkSubInterest(t, hub, globalAccountName, "svc", time.Second)
+
+			resp, err := ncHub.Request("svc", []byte("hello"), 2*time.Second)
+			require_NoError(t, err)
+			require_Equal(t, "OK", string(resp.Data))
+
+			// The export deny still applies to what the leaf sends.
+			natsPub(t, ncLeaf, "out.secret", nil)
+			natsPub(t, ncLeaf, "out.public", nil)
+			natsFlush(t, ncLeaf)
+			require_Equal(t, "out.public", natsNexMsg(t, out, time.Second).Subject)
+
+			// The import deny still keeps _INBOX traffic from the hub off the leaf.
+			natsPub(t, ncHub, "_INBOX.leaf", nil)
+			natsFlush(t, ncHub)
+			if _, err := denied.NextMsg(100 * time.Millisecond); err != nats.ErrTimeout {
+				t.Fatalf("Expected _INBOX.leaf to be denied by deny_imports, got %v", err)
+			}
+			// The wildcard sub also gets the leaf's own traffic, but not _INBOX.leaf.
+			for wildcard != nil {
+				msg, err := wildcard.NextMsg(100 * time.Millisecond)
+				if err == nats.ErrTimeout {
+					break
+				}
+				require_NoError(t, err)
+				if msg.Subject == "_INBOX.leaf" {
+					t.Fatalf("Expected _INBOX.leaf to be denied by deny_imports for the wildcard sub")
+				}
+			}
+		})
+	}
+}
+
 func TestLeafNodePermissionWithGateways(t *testing.T) {
 	usConf := createConfFile(t, []byte(`
 		server_name: "US"
