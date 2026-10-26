@@ -1082,6 +1082,10 @@ func (c *client) updateDefaultPermissions(perms *Permissions) bool {
 	if c.user == nil || !c.user.defaultPerms {
 		return false
 	}
+	// A leafnode's perms are set up at connect, like on config reload.
+	if c.kind == LEAF {
+		return false
+	}
 	if perms == nil {
 		c.user.Permissions = nil
 		c.perms = nil

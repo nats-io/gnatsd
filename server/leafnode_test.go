@@ -10735,6 +10735,90 @@ func TestLeafNodeAccountUpdateKeepsRemoteInterest(t *testing.T) {
 	check()
 }
 
+func TestLeafNodeAccountDefaultPermsUpdateKeepsLeafPerms(t *testing.T) {
+	sysKp, sysPub := createKey(t)
+	sysJwt := encodeClaim(t, jwt.NewAccountClaims(sysPub), sysPub)
+	sysCreds := newUser(t, sysKp)
+
+	// Users without perms of their own may only receive "feed" and send "up".
+	aKp, aPub := createKey(t)
+	aClaim := jwt.NewAccountClaims(aPub)
+	aClaim.DefaultPermissions.Sub.Allow.Add("feed")
+	aClaim.DefaultPermissions.Pub.Allow.Add("up")
+	aJwt := encodeClaim(t, aClaim, aPub)
+
+	userCreds := func(allowAll bool) string {
+		ukp, _ := nkeys.CreateUser()
+		seed, _ := ukp.Seed()
+		upub, _ := ukp.PublicKey()
+		uclaim := newJWTTestUserClaims()
+		uclaim.Subject = upub
+		if allowAll {
+			uclaim.Pub.Allow.Add(">")
+			uclaim.Sub.Allow.Add(">")
+		}
+		ujwt, err := uclaim.Encode(aKp)
+		require_NoError(t, err)
+		return genCredsFile(t, ujwt, seed)
+	}
+	leafCreds := userCreds(false)
+	clientCreds := userCreds(true)
+
+	tmpl := `
+		server_name: %s
+		listen: "127.0.0.1:-1"
+		operator: %s
+		system_account: %s
+		resolver: MEMORY
+		resolver_preload: {
+			%s: %s
+			%s: %s
+		}
+		leafnodes {
+			%s
+		}
+	`
+	conf := func(name, leafnodes string) string {
+		return createConfFile(t, []byte(fmt.Sprintf(tmpl, name, ojwt, sysPub,
+			sysPub, sysJwt, aPub, aJwt, leafnodes)))
+	}
+	hub, ohub := RunServerWithConfig(conf("HUB", `listen: "127.0.0.1:-1"`))
+	defer hub.Shutdown()
+
+	leaf, _ := RunServerWithConfig(conf("LEAF", fmt.Sprintf(`
+		remotes: [
+			{ url: "nats://127.0.0.1:%d", account: %s, credentials: '%s' }
+		]
+	`, ohub.LeafNode.Port, aPub, leafCreds)))
+	defer leaf.Shutdown()
+
+	checkLeafNodeConnected(t, hub)
+	checkLeafNodeConnected(t, leaf)
+
+	ncLeaf := natsConnect(t, leaf.ClientURL(), nats.UserCredentials(clientCreds))
+	defer ncLeaf.Close()
+	sub := natsSubSync(t, ncLeaf, "feed")
+	natsFlush(t, ncLeaf)
+	checkSubInterest(t, hub, aPub, "feed", time.Second)
+
+	ncHub := natsConnect(t, hub.ClientURL(), nats.UserCredentials(clientCreds))
+	defer ncHub.Close()
+	natsPub(t, ncHub, "feed", nil)
+	natsNexMsg(t, sub, time.Second)
+
+	// Changing the default perms must not reset the leaf's reversed perms.
+	aClaim.DefaultPermissions.Pub.Allow.Add("up2")
+	aJwt = encodeClaim(t, aClaim, aPub)
+	ncSys := natsConnect(t, hub.ClientURL(), nats.UserCredentials(sysCreds))
+	defer ncSys.Close()
+	msg, err := ncSys.Request(fmt.Sprintf(accUpdateEventSubjNew, aPub), []byte(aJwt), time.Second)
+	require_NoError(t, err)
+	require_Contains(t, string(msg.Data), "jwt updated")
+
+	natsPub(t, ncHub, "feed", nil)
+	natsNexMsg(t, sub, time.Second)
+}
+
 func TestLeafNodePermissionWithGateways(t *testing.T) {
 	usConf := createConfFile(t, []byte(`
 		server_name: "US"
