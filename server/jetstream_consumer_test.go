@@ -11318,7 +11318,7 @@ func TestJetStreamConsumerNoWaitNoMessagesOnEos(t *testing.T) {
 	req := &JSApiConsumerGetNextRequest{NoWait: true}
 	jreq, err := json.Marshal(req)
 	require_NoError(t, err)
-	o.processNextMsgRequest("reply", jreq)
+	o.processNextMsgRequest("reply", jreq, nil)
 
 	msg, err := sub.NextMsg(time.Second)
 	require_NoError(t, err)
@@ -11355,7 +11355,7 @@ func TestJetStreamConsumerNoWaitNoMessagesOnEosWithDeliveredMsgs(t *testing.T) {
 	req := &JSApiConsumerGetNextRequest{NoWait: true, Batch: 2}
 	jreq, err := json.Marshal(req)
 	require_NoError(t, err)
-	o.processNextMsgRequest("reply", jreq)
+	o.processNextMsgRequest("reply", jreq, nil)
 
 	msg, err := sub.NextMsg(time.Second)
 	require_NoError(t, err)

@@ -13985,3 +13985,71 @@ func TestLeafNodeLogsRemoteURL(t *testing.T) {
 	s2.Shutdown()
 	checkNoticeNotContains(t, l, remoteURLLogUser, remoteURLLogPassword)
 }
+
+// A leafnode can send a pull request with an _R_ reply and its own Nats-Request-Info.
+// It may only speak for its own account, so the consumer must not track interest of another account.
+func TestLeafNodeJetStreamPullForgedRequestInfo(t *testing.T) {
+	conf := createConfFile(t, fmt.Appendf(nil, `
+		listen: 127.0.0.1:-1
+		jetstream: {max_mem_store: 64MB, max_file_store: 64MB, store_dir: %q}
+		accounts {
+			JS {
+				jetstream: enabled
+				users = [ { user: js, password: js }, { user: leaf, password: leaf } ]
+			}
+			V { users = [ { user: v, password: v } ] }
+		}
+		leafnodes { listen: 127.0.0.1:-1 }
+	`, t.TempDir()))
+	s, o := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s, nats.UserInfo("js", "js"))
+	defer nc.Close()
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}})
+	require_NoError(t, err)
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "C", AckPolicy: nats.AckExplicitPolicy})
+	require_NoError(t, err)
+
+	// Another account has interest in a subject.
+	ncV := natsConnect(t, s.ClientURL(), nats.UserInfo("v", "v"))
+	defer ncV.Close()
+	natsSubSync(t, ncV, "victim.inbox")
+	natsFlush(t, ncV)
+
+	leafConn, err := net.DialTimeout("tcp", net.JoinHostPort(o.LeafNode.Host, fmt.Sprintf("%d", o.LeafNode.Port)), 2*time.Second)
+	require_NoError(t, err)
+	defer leafConn.Close()
+	_, err = bufio.NewReader(leafConn).ReadString('\n')
+	require_NoError(t, err)
+	_, err = leafConn.Write([]byte("CONNECT {\"name\":\"leaf\",\"user\":\"leaf\",\"pass\":\"leaf\",\"headers\":true}\r\nPING\r\n"))
+	require_NoError(t, err)
+	checkLeafNodeConnected(t, s)
+
+	// The leafnode claims the request came from that account.
+	hdr := "NATS/1.0\r\n" + ClientInfoHdr + ": {\"acc\":\"V\",\"reply\":\"victim.inbox\"}\r\n\r\n"
+	req := `{"batch":1,"expires":30000000000}`
+	subj := fmt.Sprintf(JSApiRequestNextT, "TEST", "C")
+	_, err = fmt.Fprintf(leafConn, "HMSG %s _R_.forged %d %d\r\n%s%s\r\n", subj, len(hdr), len(hdr)+len(req), hdr, req)
+	require_NoError(t, err)
+
+	jsAcc, err := s.LookupAccount("JS")
+	require_NoError(t, err)
+	mset, err := jsAcc.lookupStream("TEST")
+	require_NoError(t, err)
+	oc := mset.lookupConsumer("C")
+	require_NotNil(t, oc)
+	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		oc.mu.RLock()
+		defer oc.mu.RUnlock()
+		if oc.waiting.len() != 1 {
+			return fmt.Errorf("expected 1 waiting pull request, got %d", oc.waiting.len())
+		}
+		return nil
+	})
+	oc.mu.RLock()
+	acc, interest := oc.waiting.head.acc.Name, oc.waiting.head.interest
+	oc.mu.RUnlock()
+	require_Equal(t, acc, "JS")
+	require_Equal(t, interest, "_R_.forged")
+}
