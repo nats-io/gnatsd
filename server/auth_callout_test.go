@@ -4529,3 +4529,32 @@ func TestAuthCalloutOperatorModeRejectionNotReportedAsAccountLimit(t *testing.T)
 		t.Fatalf("expected an authentication error in the server log, got %q", errs)
 	}
 }
+
+// Shutdown() stops eventing before it shuts down JetStream and closes the
+// client, websocket and MQTT listeners, so a CONNECT can still reach the auth
+// callout after the system account is gone. The callout must refuse that client
+// rather than dereference the torn-down system account.
+func TestAuthCalloutAfterEventingShutdown(t *testing.T) {
+	conf := `
+		listen: "127.0.0.1:-1"
+		server_name: A
+		authorization {
+			timeout: 1s
+			users: [ { user: "auth", password: "pwd" } ]
+			auth_callout {
+				issuer: "ABJHLOVMPA4CI6R5KLNGOB4GSLNIY7IOUPAJC4YFNDLQVIOBYQGUWVLA"
+				auth_users: [ auth ]
+			}
+		}
+	`
+	handler := func(m *nats.Msg) { m.Respond(nil) }
+	at := NewAuthTest(t, conf, handler, nats.UserInfo("auth", "pwd"))
+	defer at.Cleanup()
+
+	// The first step of Shutdown(), while every listener is still open.
+	at.srv.shutdownEventing()
+
+	_, err := at.NewClient(nats.UserInfo("dlc", "zzz"))
+	require_Error(t, err)
+	require_Contains(t, err.Error(), "Authorization Violation")
+}
