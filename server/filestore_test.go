@@ -9130,6 +9130,14 @@ func Benchmark_FileStoreCreateConsumerStores(b *testing.B) {
 }
 
 func BenchmarkFileStoreLoadNextMsgMultiRepeatedSubjects(b *testing.B) {
+	benchmarkFileStoreLoadMsgMulti(b, false)
+}
+
+func BenchmarkFileStoreLoadPrevMsgMultiRepeatedSubjects(b *testing.B) {
+	benchmarkFileStoreLoadMsgMulti(b, true)
+}
+
+func benchmarkFileStoreLoadMsgMulti(b *testing.B, reverse bool) {
 	for _, test := range []struct {
 		name   string
 		keys   int
@@ -9156,6 +9164,13 @@ func BenchmarkFileStoreLoadNextMsgMultiRepeatedSubjects(b *testing.B) {
 			}
 			require_Equal(b, fs.numMsgBlocks(), test.blocks)
 
+			loadMsg := fs.LoadNextMsgMulti
+			first, end, step := 1, test.msgs+1, 1
+			if reverse {
+				loadMsg = fs.LoadPrevMsgMulti
+				first, end, step = test.msgs, 0, -1
+			}
+
 			for _, multi := range []bool{true, false} {
 				name := "Single"
 				sl := gsl.NewSublist[struct{}]()
@@ -9172,12 +9187,12 @@ func BenchmarkFileStoreLoadNextMsgMultiRepeatedSubjects(b *testing.B) {
 					b.ReportAllocs()
 					b.ResetTimer()
 					for range b.N {
-						for seq := uint64(1); seq <= uint64(test.msgs); seq++ {
-							sm, nseq, err := fs.LoadNextMsgMulti(sl, seq, &smv)
+						for seq := first; seq != end; seq += step {
+							sm, nseq, err := loadMsg(sl, uint64(seq), &smv)
 							if err != nil {
 								b.Fatal(err)
 							}
-							if nseq != seq || sm.seq != seq {
+							if nseq != uint64(seq) || sm.seq != uint64(seq) {
 								b.Fatalf("Expected sequence %d, got %d (%d)", seq, nseq, sm.seq)
 							}
 						}
