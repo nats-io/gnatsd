@@ -86,7 +86,17 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 	ukp, _ := nkeys.CreateUser()
 	pub, _ := ukp.PublicKey()
 
+	// Shutdown() stops eventing before it closes the listeners, so a client can
+	// get here after the system account is gone.
+	s.mu.RLock()
+	if s.sys == nil {
+		s.mu.RUnlock()
+		errStr = "Authorization callout not available, eventing shut down"
+		s.Debugf(errStr)
+		return false, errStr
+	}
 	reply := s.newRespInbox()
+	s.mu.RUnlock()
 	respCh := make(chan string, 1)
 
 	decodeResponse := func(rc *client, rmsg []byte, acc *Account) (*jwt.UserClaims, error) {
