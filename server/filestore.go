@@ -3215,18 +3215,17 @@ func (mb *msgBlock) firstMatching(filter string, wc bool, start uint64, sm *Stor
 		fseq = lseq + 1
 		if bfilter := stringToBytes(filter); wc {
 			var ierr error
-			mb.fss.Match(bfilter, func(bsubj []byte, ss *SimpleState) {
-				if ierr != nil {
-					return
-				}
+			mb.fss.MatchUntil(bfilter, func(bsubj []byte, ss *SimpleState) bool {
 				if ss.firstNeedsUpdate || ss.lastNeedsUpdate {
 					if ierr = mb.recalculateForSubj(bytesToString(bsubj), ss); ierr != nil {
-						return
+						return false
 					}
 				}
 				if start <= ss.Last {
 					fseq = min(fseq, max(start, ss.First))
 				}
+				// No candidate can precede the requested starting sequence.
+				return fseq != start
 			})
 			if ierr != nil {
 				return nil, false, ierr

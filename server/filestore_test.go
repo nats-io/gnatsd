@@ -9144,10 +9144,12 @@ func benchmarkFileStoreLoadMsgMulti(b *testing.B, reverse bool) {
 		msgs   int
 		pad    int
 		blocks int
+		filter string
 	}{
-		{"RepeatedMoreSubjects", 4000, 40000, 0, 1},
-		{"RepeatedAcrossBlocks", 2000, 16000, 2048, 5},
-		{"Unique", 20000, 80000, 0, 1},
+		{"RepeatedMoreSubjects", 4000, 40000, 0, 1, "data.*.*"},
+		{"RepeatedAcrossBlocks", 2000, 16000, 2048, 5, "data.*.*"},
+		{"RepeatedWildcardIndex", 256, 8192, 0, 1, "data.>"},
+		{"Unique", 20000, 80000, 0, 1, "data.*.*"},
 	} {
 		b.Run(test.name, func(b *testing.B) {
 			fs, err := newFileStore(
@@ -9180,7 +9182,7 @@ func benchmarkFileStoreLoadMsgMulti(b *testing.B, reverse bool) {
 						require_NoError(b, sl.Insert(fmt.Sprintf("data.*.k%d", kind), struct{}{}))
 					}
 				} else {
-					require_NoError(b, sl.Insert("data.*.*", struct{}{}))
+					require_NoError(b, sl.Insert(test.filter, struct{}{}))
 				}
 				b.Run(name, func(b *testing.B) {
 					var smv StoreMsg
