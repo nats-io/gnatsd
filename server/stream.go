@@ -6632,13 +6632,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 					seqSubj = optSubj
 				}
 
-				// TODO(dlc) - We could make a new store func that does this all in one.
-				var smv StoreMsg
-				var fseq uint64
-				sm, err := store.LoadLastMsg(seqSubj, &smv)
-				if sm != nil {
-					fseq = sm.seq
-				}
+				fseq, err := store.LoadLastSeq(seqSubj)
 				if err == ErrStoreMsgNotFound && seq == 0 {
 					fseq, err = 0, nil
 				}
@@ -7169,10 +7163,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 
 	// If we are republishing grab last sequence for this exact subject. Aids in gap detection for lightweight clients.
 	if republish {
-		var smv StoreMsg
-		if sm, _ := store.LoadLastMsg(subject, &smv); sm != nil {
-			tlseq = sm.seq
-		}
+		tlseq, _ = store.LoadLastSeq(subject)
 	}
 
 	// If clustered this was already checked and we do not want to check here and possibly introduce skew.
