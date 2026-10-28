@@ -159,6 +159,8 @@ type GatewayOpts struct {
 	RejectUnknown     bool                 `json:"reject_unknown,omitempty"` // config got renamed to reject_unknown_cluster
 	WriteDeadline     time.Duration        `json:"-"`
 	WriteTimeout      WriteTimeoutPolicy   `json:"-"`
+	PingInterval      time.Duration        `json:"-"`
+	MaxPingsOut       int                  `json:"-"`
 
 	// Not exported, for tests.
 	resolver         netResolver
@@ -2376,6 +2378,13 @@ func parseGateway(v any, o *Options, errors *[]error, warnings *[]error) error {
 			o.Gateway.WriteDeadline = parseDuration("write_deadline", tk, mv, errors, warnings)
 		case "write_timeout":
 			o.Gateway.WriteTimeout = parseWriteDeadlinePolicy(tk, mv.(string), errors)
+		case "ping_interval":
+			o.Gateway.PingInterval = parseDuration("ping_interval", tk, mv, errors, warnings)
+			if o.Gateway.PingInterval > gatewayMaxPingInterval {
+				*warnings = append(*warnings, &configErr{tk, fmt.Sprintf("Gateway 'ping_interval' will reset to %v which is the max for gateways", gatewayMaxPingInterval)})
+			}
+		case "ping_max":
+			o.Gateway.MaxPingsOut = int(mv.(int64))
 		default:
 			if !tk.IsUsedVariable() {
 				err := &unknownConfigFieldErr{
