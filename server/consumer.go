@@ -117,7 +117,9 @@ type ConsumerConfig struct {
 	DeliverGroup   string        `json:"deliver_group,omitempty"`
 	Heartbeat      time.Duration `json:"idle_heartbeat,omitempty"`
 
-	// Ephemeral inactivity threshold.
+	// Inactivity threshold duration for both ephemeral and durable consumers.
+	// Tracks continuous server runtime; reinitializes upon server start or
+	// leadership acquisition to allow disconnected clients time to reconnect.
 	InactiveThreshold time.Duration `json:"inactive_threshold,omitempty"`
 
 	// Generally inherited by parent stream and other markers, now can be configured directly.

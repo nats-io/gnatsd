@@ -14202,3 +14202,62 @@ func TestJetStreamConsumerResetPendingHoldsDeliveries(t *testing.T) {
 	require_Equal(t, dseq, 9)
 	require_Equal(t, sseq, 19)
 }
+
+// https://github.com/nats-io/nats-server/issues/8704
+func TestJetStreamDurableConsumerInactiveThresholdRestartsOnBoot(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Storage:  nats.FileStorage,
+	})
+	require_NoError(t, err)
+
+	const inactiveThresh = 200 * time.Millisecond
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:           "DURABLE_INACTIVE",
+		AckPolicy:         nats.AckExplicitPolicy,
+		InactiveThreshold: inactiveThresh,
+	})
+	require_NoError(t, err)
+
+	// Verify consumer exists before shutdown.
+	_, err = js.ConsumerInfo("TEST", "DURABLE_INACTIVE")
+	require_NoError(t, err)
+
+	sd := s.JetStreamConfig().StoreDir
+	nc.Close()
+	s.Shutdown()
+	s.WaitForShutdown()
+
+	// In pull mode, updateInactiveThreshold adds up to 1s of jitter
+	// (dthresh is at most inactiveThresh + 1s = 1.2s). Keep the server
+	// down for longer than the maximum possible threshold (1.5s > 1.2s).
+	time.Sleep(1500 * time.Millisecond)
+
+	// Restart server.
+	s = RunJetStreamServerOnPort(-1, sd)
+	defer s.Shutdown()
+
+	nc, js = jsClientConnect(t, s)
+	defer nc.Close()
+
+	// Consumer must still exist immediately after boot to grant the client
+	// time to reconnect and resume activity, proving the threshold restarted on boot.
+	_, err = js.ConsumerInfo("TEST", "DURABLE_INACTIVE")
+	require_NoError(t, err)
+
+	// Once the inactivity threshold of active server uptime has elapsed without
+	// client activity, the consumer should be cleaned up.
+	checkFor(t, 3*time.Second, 50*time.Millisecond, func() error {
+		if _, err := js.ConsumerInfo("TEST", "DURABLE_INACTIVE"); err == nil {
+			return errors.New("consumer still exists")
+		}
+		return nil
+	})
+}
