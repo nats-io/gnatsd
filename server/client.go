@@ -6006,6 +6006,9 @@ func (c *client) processPingTimer() {
 	if c.kind == LEAF && opts.LeafNode.PingInterval > 0 {
 		pingInterval = opts.LeafNode.PingInterval
 	}
+	if c.kind == GATEWAY && opts.Gateway.PingInterval > 0 {
+		pingInterval = opts.Gateway.PingInterval
+	}
 	if c.isWebsocket() && opts.Websocket.PingInterval > 0 {
 		pingInterval = opts.Websocket.PingInterval
 	}
@@ -6034,6 +6037,9 @@ func (c *client) processPingTimer() {
 		}
 		if c.kind == LEAF && opts.LeafNode.MaxPingsOut > 0 {
 			maxPingsOut = opts.LeafNode.MaxPingsOut
+		}
+		if c.kind == GATEWAY && opts.Gateway.MaxPingsOut > 0 {
+			maxPingsOut = opts.Gateway.MaxPingsOut
 		}
 		if c.ping.out+1 > maxPingsOut {
 			c.Debugf("Stale Client Connection - Closing")
@@ -6096,6 +6102,9 @@ func (c *client) setPingTimer() {
 	}
 	if c.kind == LEAF && opts.LeafNode.PingInterval > 0 {
 		d = opts.LeafNode.PingInterval
+	}
+	if c.kind == GATEWAY && opts.Gateway.PingInterval > 0 {
+		d = opts.Gateway.PingInterval
 	}
 	if c.isWebsocket() && opts.Websocket.PingInterval > 0 {
 		d = opts.Websocket.PingInterval
@@ -7192,6 +7201,9 @@ func (c *client) setFirstPingTimer() {
 	}
 	if c.kind == LEAF && opts.LeafNode.PingInterval > 0 {
 		d = opts.LeafNode.PingInterval
+	}
+	if c.kind == GATEWAY && opts.Gateway.PingInterval > 0 {
+		d = opts.Gateway.PingInterval
 	}
 	if c.isWebsocket() && opts.Websocket.PingInterval > 0 {
 		d = opts.Websocket.PingInterval

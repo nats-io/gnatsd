@@ -922,7 +922,15 @@ func (s *Server) createGateway(cfg *gatewayCfg, url *url.URL, conn net.Conn) {
 	// that the connection is not stale until the first INFO from the remote
 	// is received.
 	if solicit {
-		c.watchForStaleConnection(adjustPingInterval(GATEWAY, opts.PingInterval), opts.MaxPingsOut)
+		pingInterval := opts.PingInterval
+		pingMax := opts.MaxPingsOut
+		if opts.Gateway.PingInterval > 0 {
+			pingInterval = opts.Gateway.PingInterval
+		}
+		if opts.Gateway.MaxPingsOut > 0 {
+			pingMax = opts.Gateway.MaxPingsOut
+		}
+		c.watchForStaleConnection(adjustPingInterval(GATEWAY, pingInterval), pingMax)
 	}
 
 	c.mu.Unlock()

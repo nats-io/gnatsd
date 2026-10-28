@@ -6714,6 +6714,40 @@ func TestGatewayPings(t *testing.T) {
 	}
 }
 
+func TestGatewayCustomPing(t *testing.T) {
+	pingInterval := 50 * time.Millisecond
+
+	ob := testDefaultOptionsForGateway("B")
+	ob.Gateway.PingInterval = pingInterval
+	ob.Gateway.MaxPingsOut = 2
+	sb := RunServer(ob)
+	defer sb.Shutdown()
+
+	oa := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
+	oa.Gateway.PingInterval = pingInterval
+	sa := RunServer(oa)
+	defer sa.Shutdown()
+
+	waitForInboundGateways(t, sa, 1, 2*time.Second)
+	waitForOutboundGateways(t, sa, 1, 2*time.Second)
+	waitForInboundGateways(t, sb, 1, 2*time.Second)
+	waitForOutboundGateways(t, sb, 1, 2*time.Second)
+
+	c := sa.getOutboundGatewayConnection("B")
+	ch := make(chan struct{}, 1)
+	c.mu.Lock()
+	c.nc = &capturePingConn{c.nc, ch}
+	c.mu.Unlock()
+
+	for i := 0; i < 5; i++ {
+		select {
+		case <-ch:
+		case <-time.After(250 * time.Millisecond):
+			t.Fatalf("Did not send PING")
+		}
+	}
+}
+
 func TestGatewayTLSConfigReload(t *testing.T) {
 	template := `
 		listen: 127.0.0.1:-1
