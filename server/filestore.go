@@ -9706,7 +9706,8 @@ func (fs *fileStore) LoadNextMsgMulti(sl *gsl.SimpleSublist, start uint64, smp *
 				// Similar to above if start <= first seq.
 				// TODO(dlc) - For v2 track these by filter subject since they will represent filtered consumers.
 				// We should not do this at all if we are already on the last block.
-				if i == bi && i < len(fs.blks)-1 {
+				// Nor if the next block is the last one, since we can simply skip to it.
+				if i == bi && i < len(fs.blks)-2 {
 					nbi, err := fs.checkSkipFirstBlockMulti(sl, bi)
 					// Nothing available.
 					if err == ErrStoreEOF {
@@ -9778,9 +9779,10 @@ func (fs *fileStore) LoadNextMsg(filter string, wc bool, start uint64, sm *Store
 				// Similar to above if start <= first seq.
 				// TODO(dlc) - For v2 track these by filter subject since they will represent filtered consumers.
 				// We should not do this at all if we are already on the last block.
+				// Nor if the next block is the last one, since we can simply skip to it.
 				// Also if we are a wildcard do not check if large subject space.
 				const wcMaxSizeToCheck = 64 * 1024
-				if i == bi && i < len(fs.blks)-1 && (!wc || fs.psim.Size() < wcMaxSizeToCheck) {
+				if i == bi && i < len(fs.blks)-2 && (!wc || fs.psim.Size() < wcMaxSizeToCheck) {
 					nbi, err := fs.checkSkipFirstBlock(filter, wc, bi)
 					// Nothing available.
 					if err == ErrStoreEOF {

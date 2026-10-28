@@ -14130,6 +14130,80 @@ func TestFileStoreLoadNextMsgSkipAhead(t *testing.T) {
 	}
 }
 
+func TestFileStoreLoadNextMsgSkipCheckNotOnSecondToLastBlock(t *testing.T) {
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: t.TempDir()},
+		StreamConfig{Name: "zzz", Subjects: []string{"foo.>"}, Storage: FileStorage})
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	// The filtered subject first appears at the head of the stream, so psim's fblk
+	// for it points at the first block, like long-lived subjects in a stream with MaxAge.
+	_, _, err = fs.StoreMsg("foo.a1.b.c0.d.e.hit", nil, nil, 0)
+	require_NoError(t, err)
+
+	// Just under the subject count where the single wildcard check is skipped.
+	const filler = 60_000
+	for i := range filler {
+		_, _, err = fs.StoreMsg(fmt.Sprintf("foo.a%d.b.%d.d.e.row", i%50, i), nil, nil, 0)
+		require_NoError(t, err)
+	}
+
+	// A caught-up consumer resumes from a sequence in the second-to-last block,
+	// and the next message for it lands in the last block.
+	_, err = fs.newMsgBlockForWrite()
+	require_NoError(t, err)
+	start, _, err := fs.StoreMsg("foo.a2.b.other.d.e.row", nil, nil, 0)
+	require_NoError(t, err)
+	_, err = fs.newMsgBlockForWrite()
+	require_NoError(t, err)
+	target, _, err := fs.StoreMsg("foo.a1.b.c0.d.e.hit", nil, nil, 0)
+	require_NoError(t, err)
+
+	fs.mu.RLock()
+	psimSize, nblks := fs.psim.Size(), len(fs.blks)
+	bi, _ := fs.selectMsgBlockWithIndex(start)
+	fs.mu.RUnlock()
+	require_True(t, psimSize < 64*1024)
+	require_Equal(t, bi, nblks-2)
+
+	sl := gsl.NewSublist[struct{}]()
+	for i := range 45 {
+		require_NoError(t, sl.Insert(fmt.Sprintf("foo.*.*.c%d.*.e.>", i), struct{}{}))
+	}
+
+	for _, test := range []struct {
+		title string
+		load  func(smp *StoreMsg) (*StoreMsg, uint64, error)
+	}{
+		// The selective token comes last, so matching this filter visits every subject.
+		{"Wildcard", func(smp *StoreMsg) (*StoreMsg, uint64, error) {
+			return fs.LoadNextMsg("foo.*.*.*.*.*.hit", true, start, smp)
+		}},
+		// Wildcards come before the selective token, so the intersect can't prune early.
+		{"Multi", func(smp *StoreMsg) (*StoreMsg, uint64, error) {
+			return fs.LoadNextMsgMulti(sl, start, smp)
+		}},
+	} {
+		t.Run(test.title, func(t *testing.T) {
+			// Take the fastest of a few calls so scheduling noise can't fail the test.
+			var smv StoreMsg
+			took := time.Duration(math.MaxInt64)
+			for range 5 {
+				s := time.Now()
+				sm, _, err := test.load(&smv)
+				elapsed := time.Since(s)
+				require_NoError(t, err)
+				require_Equal(t, sm.seq, target)
+				took = min(took, elapsed)
+			}
+			t.Logf("Load took %v with %d subjects", took, psimSize)
+			// Only the last block is left to scan, so this should not cost anything near a psim walk.
+			require_LessThan(t, took, time.Millisecond)
+		})
+	}
+}
+
 func TestFileStoreLoadNextMsgMultiSkipAhead(t *testing.T) {
 	test := func(t *testing.T, headStart, singleSubjPerBlock bool) {
 		testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
