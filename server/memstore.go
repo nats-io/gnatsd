@@ -1920,25 +1920,46 @@ func (ms *memStore) LoadLastMsg(subject string, smp *StoreMsg) (*StoreMsg, error
 	return ms.loadLastLocked(subject, smp)
 }
 
-// Lock should be held.
-func (ms *memStore) loadLastLocked(subject string, smp *StoreMsg) (*StoreMsg, error) {
-	var sm *StoreMsg
-	var ok bool
+// LoadLastSeq will return the sequence of the last message that matches a given subject.
+// The subject can be a wildcard.
+func (ms *memStore) LoadLastSeq(subject string) (uint64, error) {
+	// This needs to be a write lock, as lastSeqLocked can
+	// mutate the per-subject state.
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	seq := ms.lastSeqLocked(subject)
+	// Only report sequences LoadLastMsg would find a message for.
+	if _, ok := ms.msgs[seq]; !ok {
+		return 0, ErrStoreMsgNotFound
+	}
+	return seq, nil
+}
 
+// lastSeqLocked returns the last sequence for a subject, or zero if no message matches.
+// Write lock should be held, for recalculateForSubj.
+func (ms *memStore) lastSeqLocked(subject string) uint64 {
 	if subject == _EMPTY_ || subject == fwcs {
-		sm, ok = ms.msgs[ms.state.LastSeq]
-	} else if subjectIsLiteral(subject) {
-		var ss *SimpleState
-		if ss, ok = ms.fss.Find(stringToBytes(subject)); ok && ss.Msgs > 0 {
+		return ms.state.LastSeq
+	}
+	if subjectIsLiteral(subject) {
+		if ss, ok := ms.fss.Find(stringToBytes(subject)); ok && ss.Msgs > 0 {
 			// Check if we need to recalculate. We only care about the last sequence.
 			if ss.lastNeedsUpdate {
 				ms.recalculateForSubj(subject, ss)
 			}
-			sm, ok = ms.msgs[ss.Last]
+			return ss.Last
 		}
-	} else if ss := ms.filteredStateLocked(1, subject, true); ss.Msgs > 0 {
-		sm, ok = ms.msgs[ss.Last]
+		return 0
 	}
+	if ss := ms.filteredStateLocked(1, subject, true); ss.Msgs > 0 {
+		return ss.Last
+	}
+	return 0
+}
+
+// Lock should be held.
+func (ms *memStore) loadLastLocked(subject string, smp *StoreMsg) (*StoreMsg, error) {
+	sm, ok := ms.msgs[ms.lastSeqLocked(subject)]
 	if !ok || sm == nil {
 		return nil, ErrStoreMsgNotFound
 	}

@@ -15225,6 +15225,92 @@ func TestJetStreamStreamRepublishHeadersOnly(t *testing.T) {
 	}
 }
 
+// RePublish only needs the sequence of a subject's previous message to fill in
+// Nats-Last-Sequence. When that message's block still has its per-subject state
+// but its message cache has expired, the lookup shouldn't read the block from disk.
+func TestJetStreamStreamRepublishLastSequenceSkipsBlockLoad(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	addStream(t, nc, &StreamConfig{
+		Name:     "TEST",
+		Storage:  FileStorage,
+		Subjects: []string{"foo.>"},
+		// A small MaxBytes gives the minimum block size, so a few messages fill a block.
+		MaxBytes: 100 * 1024,
+		RePublish: &RePublish{
+			Source:      "foo.>",
+			Destination: "rp.>",
+			HeadersOnly: true,
+		},
+	})
+
+	_, err := js.Publish("foo.a", nil)
+	require_NoError(t, err)
+	_, err = js.Publish("foo.b", nil)
+	require_NoError(t, err)
+
+	mset, err := s.GlobalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	fs := mset.store.(*fileStore)
+	fill := bytes.Repeat([]byte("Z"), 1024)
+	for fs.numMsgBlocks() < 2 {
+		_, err = js.Publish("foo.fill", fill)
+		require_NoError(t, err)
+	}
+
+	// Restart so the first block has no recent writes, which keep its cache from expiring.
+	sd := s.JetStreamConfig().StoreDir
+	nc.Close()
+	s.Shutdown()
+	s = RunJetStreamServerOnPort(-1, sd)
+	defer s.Shutdown()
+
+	nc, js = jsClientConnect(t, s)
+	defer nc.Close()
+	sub, err := nc.SubscribeSync("rp.>")
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
+
+	mset, err = s.GlobalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	fs = mset.store.(*fileStore)
+	fs.mu.RLock()
+	mb, mb2 := fs.blks[0], fs.selectMsgBlock(2)
+	fs.mu.RUnlock()
+	require_True(t, mb == mb2)
+
+	// A lookup in the first block makes sure its per-subject state is loaded.
+	_, err = js.Publish("foo.a", nil)
+	require_NoError(t, err)
+	m, err := sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_Equal(t, m.Header.Get(JSLastSequence), "1")
+
+	// Expire the message cache as 10s without reads would. The per-subject state stays.
+	mb.tryForceExpireCache()
+	mb.mu.Lock()
+	fssLoaded, cacheLoaded, loads := mb.fss != nil, !mb.cacheNotLoaded(), mb.cloads
+	mb.mu.Unlock()
+	require_True(t, fssLoaded)
+	require_False(t, cacheLoaded)
+
+	// foo.b's previous message is also in the first block.
+	_, err = js.Publish("foo.b", nil)
+	require_NoError(t, err)
+	m, err = sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_Equal(t, m.Header.Get(JSLastSequence), "2")
+
+	mb.mu.RLock()
+	after := mb.cloads
+	mb.mu.RUnlock()
+	require_Equal(t, after, loads)
+}
+
 func TestJetStreamMsgGetNoAdvisory(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()

@@ -9535,12 +9535,39 @@ func (fs *fileStore) loadLast(subj string, sm *StoreMsg) (lsm *StoreMsg, err err
 
 // Lock should be held.
 func (fs *fileStore) loadLastLocked(subj string, sm *StoreMsg) (lsm *StoreMsg, err error) {
+	mb, l, err := fs.lastSeqLocked(subj)
+	if err != nil || l == 0 {
+		return nil, err
+	}
+
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	needsCleanup := mb.cache == nil
+	if mb.cacheNotLoaded() {
+		if err := mb.loadMsgsWithLock(); err != nil {
+			if needsCleanup {
+				mb.finishedWithCache()
+			}
+			return nil, err
+		}
+	}
+	lsm, err = mb.cacheLookup(l, sm)
+	if needsCleanup {
+		mb.finishedWithCache()
+	}
+	return lsm, err
+}
+
+// lastSeqLocked returns the last sequence for a subject and the block holding it.
+// The sequence is zero if no message matches. Subject should be non empty and not ">".
+// Lock should be held.
+func (fs *fileStore) lastSeqLocked(subj string) (*msgBlock, uint64, error) {
 	if fs.isClosed() || fs.lmb == nil {
-		return nil, ErrStoreClosed
+		return nil, 0, ErrStoreClosed
 	}
 
 	if len(fs.blks) == 0 {
-		return nil, ErrStoreMsgNotFound
+		return nil, 0, ErrStoreMsgNotFound
 	}
 
 	wc := subjectHasWildcard(subj)
@@ -9560,14 +9587,14 @@ func (fs *fileStore) loadLastLocked(subj string, sm *StoreMsg) (lsm *StoreMsg, e
 		})
 		// None matched.
 		if stop == 0 {
-			return nil, ErrStoreMsgNotFound
+			return nil, 0, ErrStoreMsgNotFound
 		}
 		// These need to be swapped.
 		start, stop = stop, start
 	} else if info, ok := fs.psim.Find(stringToBytes(subj)); ok {
 		start, stop = info.lblk, info.fblk
 	} else {
-		return nil, ErrStoreMsgNotFound
+		return nil, 0, ErrStoreMsgNotFound
 	}
 
 	// Walk blocks backwards.
@@ -9577,9 +9604,9 @@ func (fs *fileStore) loadLastLocked(subj string, sm *StoreMsg) (lsm *StoreMsg, e
 			continue
 		}
 		mb.mu.Lock()
-		if err = mb.ensurePerSubjectInfoLoaded(); err != nil {
+		if err := mb.ensurePerSubjectInfoLoaded(); err != nil {
 			mb.mu.Unlock()
-			return nil, err
+			return nil, 0, err
 		}
 		// Mark fss activity.
 		mb.lsts = ats.AccessTime()
@@ -9591,43 +9618,28 @@ func (fs *fileStore) loadLastLocked(subj string, sm *StoreMsg) (lsm *StoreMsg, e
 				// Check if we need to recalculate. We only care about the last sequence.
 				if ss.lastNeedsUpdate {
 					// mb is already loaded into the cache so should be fast-ish.
-					if err = mb.recalculateForSubj(subj, ss); err != nil {
+					if err := mb.recalculateForSubj(subj, ss); err != nil {
 						mb.mu.Unlock()
-						return nil, err
+						return nil, 0, err
 					}
 				}
 				l = ss.Last
 			}
 		}
 		if l == 0 {
+			var err error
 			_, _, l, err = mb.filteredPendingLocked(subj, wc, atomic.LoadUint64(&mb.first.seq))
 			if err != nil {
 				mb.mu.Unlock()
-				return nil, err
+				return nil, 0, err
 			}
-		}
-		needsCleanup := mb.cache == nil
-		if l > 0 {
-			if mb.cacheNotLoaded() {
-				if err := mb.loadMsgsWithLock(); err != nil {
-					if needsCleanup {
-						mb.finishedWithCache()
-					}
-					mb.mu.Unlock()
-					return nil, err
-				}
-			}
-			lsm, err = mb.cacheLookup(l, sm)
-		}
-		if needsCleanup {
-			mb.finishedWithCache()
 		}
 		mb.mu.Unlock()
 		if l > 0 {
-			break
+			return mb, l, nil
 		}
 	}
-	return lsm, err
+	return nil, 0, nil
 }
 
 // LoadLastMsg will return the last message we have that matches a given subject.
@@ -9638,10 +9650,34 @@ func (fs *fileStore) LoadLastMsg(subject string, smv *StoreMsg) (sm *StoreMsg, e
 	} else {
 		sm, err = fs.loadLast(subject, smv)
 	}
-	if sm == nil || (err != nil && err != ErrStoreClosed) {
+	if sm == nil {
 		err = ErrStoreMsgNotFound
 	}
 	return sm, err
+}
+
+// LoadLastSeq will return the sequence of the last message that matches a given subject.
+// Unlike LoadLastMsg it doesn't load the message itself.
+// The subject can be a wildcard.
+func (fs *fileStore) LoadLastSeq(subject string) (uint64, error) {
+	// The stream's last sequence stays after its message is removed or purged.
+	// Load the message to only return it if it still exists, like LoadLastMsg.
+	if subject == _EMPTY_ || subject == fwcs {
+		var smv StoreMsg
+		sm, err := fs.LoadLastMsg(subject, &smv)
+		if sm == nil {
+			return 0, err
+		}
+		return sm.seq, nil
+	}
+
+	fs.mu.RLock()
+	_, seq, _ := fs.lastSeqLocked(subject)
+	fs.mu.RUnlock()
+	if seq == 0 {
+		return 0, ErrStoreMsgNotFound
+	}
+	return seq, nil
 }
 
 // LoadNextMsgMulti will find the next message matching any entry in the sublist.

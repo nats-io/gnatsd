@@ -799,12 +799,7 @@ func checkMsgHeadersPreClusteredProposal(
 				}
 				e.clseq = mset.clseq
 			} else {
-				var smv StoreMsg
-				var fseq uint64
-				sm, err := mset.store.LoadLastMsg(seqSubj, &smv)
-				if sm != nil {
-					fseq = sm.seq
-				}
+				fseq, err := mset.store.LoadLastSeq(seqSubj)
 				if err == ErrStoreMsgNotFound && seq == 0 {
 					fseq, err = 0, nil
 				}
