@@ -2585,7 +2585,8 @@ func (s *Server) sendPermsAndAccountInfo(c *client) {
 	// s.SystemAccount() uses an atomic operation and does not get the server lock, so this is safe.
 	info.IsSystemAccount = c.acc == s.SystemAccount()
 	info.ConnectInfo = true
-	c.enqueueProto(generateInfoJSON(info))
+	// Flush now, so it isn't delayed by sending all subs.
+	c.enqueueProtoAndFlush(generateInfoJSON(info), true)
 	c.mu.Unlock()
 }
 

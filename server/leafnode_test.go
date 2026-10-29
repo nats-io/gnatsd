@@ -15015,3 +15015,35 @@ func TestLeafNodeJetStreamPullForgedRequestInfo(t *testing.T) {
 	require_Equal(t, acc, "JS")
 	require_Equal(t, interest, "_R_.forged")
 }
+
+func TestLeafNodeConnectInfoNotDelayedBySendingSubs(t *testing.T) {
+	o := DefaultOptions()
+	o.LeafNode.Port = -1
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	// Block sending subs, like an account with many subs would.
+	sl := s.globalAccount().sl
+	sl.Lock()
+	defer sl.Unlock()
+
+	addr := fmt.Sprintf("127.0.0.1:%d", o.LeafNode.Port)
+	c, err := net.Dial("tcp", addr)
+	require_NoError(t, err)
+	defer c.Close()
+
+	br := bufio.NewReader(c)
+	require_NoError(t, c.SetReadDeadline(time.Now().Add(2*time.Second)))
+	l, _, err := br.ReadLine()
+	require_NoError(t, err)
+	require_True(t, strings.HasPrefix(string(l), "INFO"))
+
+	_, err = c.Write([]byte("CONNECT {}\r\n"))
+	require_NoError(t, err)
+
+	// The soliciting side times out if the INFO response to CONNECT is delayed.
+	require_NoError(t, c.SetReadDeadline(time.Now().Add(2*time.Second)))
+	l, _, err = br.ReadLine()
+	require_NoError(t, err)
+	require_True(t, strings.Contains(string(l), `"connect_info":true`))
+}
