@@ -3450,17 +3450,10 @@ func (mb *msgBlock) filteredPendingLocked(filter string, wc bool, sseq uint64) (
 			}
 		}
 	} else {
-		mb.fss.Match(stringToBytes(filter), func(bsubj []byte, ss *SimpleState) {
-			if err != nil {
-				return
-			}
-			if havePartial {
-				// If we already found a partial then don't do anything else.
-				return
-			}
+		mb.fss.MatchUntil(stringToBytes(filter), func(bsubj []byte, ss *SimpleState) bool {
 			if ss.firstNeedsUpdate || ss.lastNeedsUpdate {
 				if err = mb.recalculateForSubj(bytesToString(bsubj), ss); err != nil {
-					return
+					return false
 				}
 			}
 			if sseq <= ss.First {
@@ -3469,6 +3462,7 @@ func (mb *msgBlock) filteredPendingLocked(filter string, wc bool, sseq uint64) (
 				// We matched but its a partial.
 				havePartial = true
 			}
+			return !havePartial
 		})
 		if err != nil {
 			return 0, 0, 0, err
