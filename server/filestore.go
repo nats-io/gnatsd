@@ -9895,25 +9895,27 @@ func (mb *msgBlock) prevMatching(filter string, wc bool, start uint64, sm *Store
 		var first, last uint64
 		if bfilter := stringToBytes(filter); wc {
 			var ierr error
-			mb.fss.Match(bfilter, func(bsubj []byte, ss *SimpleState) {
-				if ierr != nil {
-					return
-				}
+			mb.fss.MatchUntil(bfilter, func(bsubj []byte, ss *SimpleState) bool {
 				if ss.firstNeedsUpdate || ss.lastNeedsUpdate {
 					if ierr = mb.recalculateForSubj(bytesToString(bsubj), ss); ierr != nil {
-						return
+						return false
 					}
 				}
 				if end < ss.First {
-					return
+					return true
 				}
 				if !found {
 					found = true
 					first, last = ss.First, min(end, ss.Last)
-					return
+				} else {
+					first = min(first, ss.First)
+					last = max(last, min(end, ss.Last))
 				}
-				first = min(first, ss.First)
-				last = max(last, min(end, ss.Last))
+				// No remaining subject can expand either bound of the scan.
+				if first <= lseq && last >= end {
+					return false
+				}
+				return true
 			})
 			if ierr != nil {
 				return nil, false, ierr
