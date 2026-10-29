@@ -4433,18 +4433,11 @@ func (fs *fileStore) NumPending(sseq uint64, filter string, lastPerSubject bool)
 			var t uint64
 			var ierr error
 			var havePartial bool
-			mb.fss.Match(stringToBytes(filter), func(bsubj []byte, ss *SimpleState) {
-				if ierr != nil {
-					return
-				}
-				if havePartial {
-					// If we already found a partial then don't do anything else.
-					return
-				}
+			mb.fss.MatchUntil(stringToBytes(filter), func(bsubj []byte, ss *SimpleState) bool {
 				subj := bytesToString(bsubj)
 				if ss.firstNeedsUpdate || ss.lastNeedsUpdate {
 					if ierr = mb.recalculateForSubj(subj, ss); ierr != nil {
-						return
+						return false
 					}
 				}
 				if sseq <= ss.First {
@@ -4453,6 +4446,7 @@ func (fs *fileStore) NumPending(sseq uint64, filter string, lastPerSubject bool)
 					// We matched but its a partial.
 					havePartial = true
 				}
+				return !havePartial
 			})
 			if ierr != nil {
 				mb.mu.Unlock()
