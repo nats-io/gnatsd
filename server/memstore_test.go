@@ -1068,6 +1068,27 @@ func TestMemStoreMultiLastSeqs(t *testing.T) {
 	checkResults(seqs, []uint64{97, 98, 99})
 }
 
+func TestMemStoreMultiLastSeqsFirstSequenceBound(t *testing.T) {
+	ms, err := newMemStore(&StreamConfig{Storage: MemoryStorage})
+	require_NoError(t, err)
+	defer ms.Stop()
+
+	// Searching below a subject's first sequence must not scan back to zero.
+	const first = uint64(1 << 63)
+	require_NoError(t, ms.SkipMsgs(1, first-1))
+	for range 2 {
+		_, _, err = ms.StoreMsg("foo.foo", nil, nil, 0)
+		require_NoError(t, err)
+	}
+	seqs, err := ms.MultiLastSeqs([]string{"foo.*"}, first-1, -1)
+	require_NoError(t, err)
+	require_Equal(t, len(seqs), 0)
+	seqs, err = ms.MultiLastSeqs([]string{"foo.*"}, first, -1)
+	require_NoError(t, err)
+	require_Equal(t, len(seqs), 1)
+	require_Equal(t, seqs[0], first)
+}
+
 func TestMemStoreMultiLastSeqsMaxAllowed(t *testing.T) {
 	cfg := &StreamConfig{
 		Name:     "zzz",
