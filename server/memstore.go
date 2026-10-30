@@ -1620,7 +1620,7 @@ func (ms *memStore) PurgeEx(subject string, sequence, keep uint64) (purged uint6
 	// sequence filter; sequence >= 1 clamps the upper bound to sequence-1
 	// (so sequence == 1 purges nothing).
 	last := ss.Last
-	if sequence >= 1 {
+	if sequence >= 1 && sequence <= last {
 		last = sequence - 1
 	}
 	var bytes, lowSeq uint64

@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"reflect"
 	"slices"
@@ -487,6 +488,25 @@ func TestMemStorePurgeExWithSubject(t *testing.T) {
 	// This should purge all.
 	ms.PurgeEx("foo", 0, 0)
 	require_True(t, ms.State().Msgs == 0)
+}
+
+func TestMemStorePurgeExLastSequenceBound(t *testing.T) {
+	ms, err := newMemStore(&StreamConfig{Storage: MemoryStorage})
+	require_NoError(t, err)
+	defer ms.Stop()
+
+	// A sequence beyond the stored range should still only purge matching messages.
+	_, _, err = ms.StoreMsg("foo", nil, nil, 0)
+	require_NoError(t, err)
+	seq, _, err := ms.StoreMsg("bar", nil, nil, 0)
+	require_NoError(t, err)
+	purged, err := ms.PurgeEx("foo", math.MaxUint64, 0)
+	require_NoError(t, err)
+	require_Equal(t, purged, uint64(1))
+	require_Equal(t, ms.State().Msgs, uint64(1))
+	sm, err := ms.LoadMsg(seq, nil)
+	require_NoError(t, err)
+	require_Equal(t, sm.subj, "bar")
 }
 
 func TestMemStoreUpdateMaxMsgsPerSubject(t *testing.T) {
