@@ -2245,8 +2245,11 @@ func (n *raft) isCurrent(healthy, quiet bool) bool {
 		return false
 	}
 
+	// A learner only stores entries until the leader adds it to the peer set. It can't commit before then.
+	learner := healthy && !n.votingMemberLocked()
+
 	// Check whether we've made progress on any state, 0 is invalid so not healthy.
-	if n.commit == 0 {
+	if n.commit == 0 && !learner {
 		debug("Not current, no commits")
 		return false
 	}
@@ -2336,9 +2339,14 @@ func (n *raft) isCurrent(healthy, quiet bool) bool {
 		debug("Not current, no append entry from the leader in this term")
 		return false
 	}
-	if n.processed < n.hcindex {
+	// A learner can only have stored up to the leader's index.
+	progress := n.processed
+	if learner {
+		progress = n.pindex
+	}
+	if progress < n.hcindex {
 		n.hcbehind = true
-		warn("Falling behind in health check, processed %d < leader index %d", n.processed, n.hcindex)
+		warn("Falling behind in health check, processed %d < leader index %d", progress, n.hcindex)
 		return false
 	}
 	clearBehindState()

@@ -3237,6 +3237,17 @@ func TestNRGHealthy(t *testing.T) {
 			n.state.Store(int32(Leader))
 			n.switchToFollowerLocked(noLeader)
 		}},
+		{title: "learner stored leader index", healthy: true, setup: func(n *raft) {
+			n.managed = true
+			delete(n.peers, n.id)
+			n.commit, n.processed, n.applied = 0, 0, 0
+		}},
+		{title: "learner below leader index", behind: true, setup: func(n *raft) {
+			n.managed = true
+			delete(n.peers, n.id)
+			n.commit, n.processed, n.applied = 0, 0, 0
+			n.hcindex = 2
+		}},
 		{title: "no leader", setup: func(n *raft) {
 			n.updateLeader(noLeader)
 			n.lgt = time.Time{}
