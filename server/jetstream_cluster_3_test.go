@@ -12733,6 +12733,11 @@ func TestJetStreamClusterConsumerHealthCheckUnmappedDuringMigration(t *testing.T
 	require_NotNil(t, sa)
 	require_NotNil(t, ca)
 
+	// Not new assets anymore, so missing nodes get no startup grace.
+	sjs.mu.Lock()
+	sa.Created, ca.Created = time.Time{}, time.Time{}
+	sjs.mu.Unlock()
+
 	// Healthy to start with.
 	require_NoError(t, sjs.isStreamHealthy(acc, sa))
 	require_NoError(t, sjs.isConsumerHealthy(mset, sa, "CONSUMER", ca))

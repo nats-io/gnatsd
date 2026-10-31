@@ -8401,6 +8401,8 @@ func TestJetStreamClusterStreamHealthCheckStreamCatchup(t *testing.T) {
 	require_NoError(t, err)
 	sjs.mu.Lock()
 	sa := sjs.streamAssignment(globalAccountName, "TEST")
+	// Not a new stream anymore, so it gets no grace while starting.
+	sa.Created = time.Time{}
 	sjs.mu.Unlock()
 
 	require_NoError(t, sjs.isStreamHealthy(acc, sa))
