@@ -12513,3 +12513,55 @@ func TestJetStreamClusterMetaGroupStopsWALOnSetupFailure(t *testing.T) {
 		})
 	}
 }
+
+func TestJetStreamClusterHealthzNewReplicatedAssets(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	ml := c.leader()
+	nc, js := jsClientConnect(t, ml)
+	defer nc.Close()
+
+	// Poll a follower, the meta leader applies assignments before the others.
+	s := c.randomNonLeader()
+	require_NotNil(t, s)
+	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		if hs := s.healthz(nil); hs.StatusCode != 200 {
+			return fmt.Errorf("healthz: %d %s", hs.StatusCode, hs.Error)
+		}
+		return nil
+	})
+
+	var stop atomic.Bool
+	errCh := make(chan string, 1)
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for !stop.Load() {
+			if hs := s.healthz(nil); hs.StatusCode != 200 {
+				select {
+				case errCh <- fmt.Sprintf("%d %s", hs.StatusCode, hs.Error):
+				default:
+				}
+			}
+			time.Sleep(time.Millisecond)
+		}
+	})
+
+	// New replicated streams and consumers are starting, not unhealthy.
+	for i := range 10 {
+		name := fmt.Sprintf("TEST%d", i)
+		_, err := js.AddStream(&nats.StreamConfig{Name: name, Subjects: []string{name}, Replicas: 3})
+		require_NoError(t, err)
+		_, err = js.AddConsumer(name, &nats.ConsumerConfig{Durable: "CONSUMER", AckPolicy: nats.AckExplicitPolicy, Replicas: 3})
+		require_NoError(t, err)
+	}
+	c.waitOnAllCurrent()
+	stop.Store(true)
+	wg.Wait()
+
+	select {
+	case e := <-errCh:
+		t.Fatalf("Expected healthz to stay healthy, got: %s", e)
+	default:
+	}
+}
