@@ -471,3 +471,12 @@ func encode(t *testing.T, ae *appendEntry) *appendEntry {
 	ae.buf = buf
 	return ae
 }
+
+func runRaftTestServer(t *testing.T) *Server {
+	t.Helper()
+	o := DefaultTestOptions
+	o.Port = -1
+	o.JetStream = true
+	o.StoreDir = t.TempDir()
+	return RunServer(&o)
+}
