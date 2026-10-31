@@ -3171,7 +3171,8 @@ func TestNRGHealthy(t *testing.T) {
 		{title: "paused with pending commits", setup: func(n *raft) { n.paused, n.hcommit = true, 2 }},
 		{title: "paused without pending commits", healthy: true, setup: func(n *raft) { n.paused, n.hcommit = true, 1 }},
 		{title: "falling behind on applies", setup: func(n *raft) { n.quorumPaused = true }},
-		{title: "no recent leader contact", setup: func(n *raft) { n.peers[nats0].ts = time.Now().Add(-3 * hbInterval) }},
+		{title: "no recent leader contact", setup: func(n *raft) { n.peers[nats0].ts = time.Now().Add(-4 * hbInterval) }},
+		{title: "leader contact over two heartbeats ago", healthy: true, setup: func(n *raft) { n.peers[nats0].ts = time.Now().Add(-5 * hbInterval / 2) }},
 		{title: "new term without leader contact", setup: func(n *raft) { n.term = 2 }},
 		{title: "new term records leader index", behind: true, setup: func(n *raft) {
 			processAE(n, 2, 1, 1, 1, entries)
@@ -3216,7 +3217,7 @@ func TestNRGHealthy(t *testing.T) {
 			time.Sleep(hbInterval * 3 / 2)
 		}},
 		{title: "vote request without grace after losing leader contact", setup: func(n *raft) {
-			n.peers[nats0].ts = time.Now().Add(-3 * hbInterval)
+			n.peers[nats0].ts = time.Now().Add(-4 * hbInterval)
 			requestVote(n)
 		}},
 		{title: "election timeout without grace after losing leader contact", setup: func(n *raft) {
