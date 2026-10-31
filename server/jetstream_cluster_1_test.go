@@ -10388,6 +10388,8 @@ func TestJetStreamClusterStreamHealthCheckStreamCatchup(t *testing.T) {
 	require_NoError(t, err)
 	sjs.mu.Lock()
 	sa := sjs.streamAssignment(globalAccountName, "TEST")
+	// Not a new stream anymore, so it gets no grace while starting.
+	sa.Created = time.Time{}
 	sjs.mu.Unlock()
 
 	require_NoError(t, sjs.isStreamHealthy(acc, sa))
@@ -11179,6 +11181,10 @@ func TestJetStreamClusterConsumerHealthCheckUnmappedDuringMigration(t *testing.T
 	sjs.mu.RUnlock()
 	require_NotNil(t, sa)
 	require_NotNil(t, ca)
+	// Not a new consumer anymore, so it gets no grace while starting.
+	sjs.mu.Lock()
+	ca.Created = time.Time{}
+	sjs.mu.Unlock()
 
 	// Healthy to start with.
 	require_NoError(t, sjs.isConsumerHealthy(mset, sa, "CONSUMER", ca))
