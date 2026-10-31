@@ -1933,7 +1933,9 @@ func (n *raft) isCurrent(healthy, quiet bool) bool {
 
 	// Check to see that we have heard from the current leader lately.
 	if n.leader != noLeader && n.leader != n.id && n.catchup == nil {
-		okInterval := hbInterval * 2
+		// A leader only sends a heartbeat after a full idle interval, so contact can be nearly two intervals apart.
+		// Allow for an extra interval of delay, so a current follower doesn't flap.
+		okInterval := hbInterval * 3
 		if ps := n.peers[n.leader]; ps == nil || time.Since(ps.ts) > okInterval {
 			debug("Not current, no recent leader contact")
 			return false
@@ -2272,7 +2274,7 @@ func (n *raft) Peers() []*Peer {
 		} else if id == n.leader {
 			// This peer is the leader, we don't know our lag, but we can report
 			// on whether we've seen the leader recently.
-			okInterval := hbInterval * 2
+			okInterval := hbInterval * 3
 			current = time.Since(ps.ts) <= okInterval
 		} else {
 			// The remaining condition is another follower that we're not in contact with.
