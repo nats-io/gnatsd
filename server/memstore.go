@@ -2512,12 +2512,12 @@ func (ms *memStore) fastStateLocked(state *StreamState) {
 
 // holdForSnapshot fills in state as FastState does and, at the same instant,
 // starts keeping a copy of each message the store removes before the snapshot
-// reads it, until releaseSnapshotHold.
-func (ms *memStore) holdForSnapshot(state *StreamState) *snapshotHold {
+// reads it, until releaseSnapshotHold, charging the copies to budget.
+func (ms *memStore) holdForSnapshot(state *StreamState, budget *snapshotHoldBudget) *snapshotHold {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 	ms.fastStateLocked(state)
-	h := newSnapshotHold(state)
+	h := newSnapshotHold(state, budget)
 	ms.holds = append(ms.holds, h)
 	return h
 }

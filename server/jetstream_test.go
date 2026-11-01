@@ -34,6 +34,7 @@ import (
 	"reflect"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -4463,6 +4464,11 @@ func TestJetStreamSnapshotWithDeletedLastSeq(t *testing.T) {
 	require_Equal(t, si.State.Msgs, uint64(9))
 }
 
+// The snapshot's compressor takes a block of the stream per processor before it
+// waits for the reader: the snapshot tests run on one, so that a stream of a few
+// megabytes leaves the snapshot waiting partway through whatever the machine.
+const snapshotTestProcs = 1
+
 // A snapshot holds the stream as it was when it began, though messages it has
 // yet to read are removed while it reads: here each key of a key-value stream is
 // updated, which removes its older message, and the new one lies past the
@@ -4496,6 +4502,7 @@ func TestJetStreamSnapshotV2HoldsMessagesRemovedWhileReading(t *testing.T) {
 			// Far more than the pipe and the compressor take before they wait for
 			// the reader, so the snapshot waits partway through.
 			const keys = 2000
+			defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(snapshotTestProcs))
 			value := func(key, round int) []byte {
 				v := make([]byte, 4096)
 				crand.Read(v)
@@ -4522,6 +4529,8 @@ func TestJetStreamSnapshotV2HoldsMessagesRemovedWhileReading(t *testing.T) {
 			mset.store.FastState(&live)
 			require_Equal(t, live.Msgs, keys)
 			require_Equal(t, live.FirstSeq, keys+1)
+			// The snapshot was waiting, so it holds what it had yet to read.
+			require_True(t, s.getJetStream().snapHolds.used.Load() > 0)
 
 			snapshot, err := io.ReadAll(sr.Reader)
 			require_NoError(t, err)
@@ -4544,8 +4553,95 @@ func TestJetStreamSnapshotV2HoldsMessagesRemovedWhileReading(t *testing.T) {
 				require_Equal(t, sm.seq, uint64(k+1))
 				require_True(t, bytes.HasPrefix(sm.msg, fmt.Appendf(nil, "%d/0/", k)))
 			}
+			// And it holds nothing once done.
+			require_Equal(t, s.getJetStream().snapHolds.used.Load(), 0)
 		})
 	}
+}
+
+// A snapshot falling so far behind a stream's removals that the copies it holds
+// would pass the server's limit fails, rather than take the server's memory or
+// leave them out, and gives back what it held.
+func TestJetStreamSnapshotV2FailsPastHoldLimit(t *testing.T) {
+	for _, storage := range []StorageType{FileStorage, MemoryStorage} {
+		t.Run(storage.String(), func(t *testing.T) {
+			s := RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+			snapHolds := &s.getJetStream().snapHolds
+			snapHolds.max = 1024 * 1024
+			defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(snapshotTestProcs))
+
+			mset, err := s.GlobalAccount().addStream(&StreamConfig{
+				Name:       "KV_TEST",
+				Subjects:   []string{"$KV.TEST.>"},
+				Storage:    storage,
+				MaxMsgsPer: 1,
+			})
+			require_NoError(t, err)
+
+			const keys = 2000
+			v := make([]byte, 4096)
+			for k := range keys {
+				crand.Read(v)
+				_, _, err := mset.store.StoreMsg(fmt.Sprintf("$KV.TEST.k%d", k), nil, v, 0)
+				require_NoError(t, err)
+			}
+
+			sr, err := mset.snapshot(0, false, true)
+			require_NoError(t, err)
+			// Every key updated holds about 8 MB of its older messages.
+			for k := range keys {
+				crand.Read(v)
+				_, _, err := mset.store.StoreMsg(fmt.Sprintf("$KV.TEST.k%d", k), nil, v, 0)
+				require_NoError(t, err)
+			}
+			require_LessThan(t, snapHolds.used.Load(), snapHolds.max+1)
+
+			_, err = io.ReadAll(sr.Reader)
+			require_NoError(t, err)
+			require_Error(t, <-sr.errCh, errSnapshotHoldLimit)
+			require_Equal(t, snapHolds.used.Load(), 0)
+		})
+	}
+}
+
+// A hold gives each message back once, in sequence order, when the snapshot
+// reaches it, whatever order the store removed them in.
+func TestJetStreamSnapshotHoldGivesBackInOrder(t *testing.T) {
+	budget := &snapshotHoldBudget{max: 1 << 30}
+	h := newSnapshotHold(&StreamState{Msgs: 100, FirstSeq: 1, LastSeq: 100}, budget)
+	keep := func(seq uint64) {
+		h.keep(&StoreMsg{subj: "foo", msg: []byte("bar"), seq: seq})
+	}
+	for _, seq := range []uint64{90, 7, 50, 3, 99, 7, 51, 100, 2} {
+		keep(seq)
+	}
+	require_Equal(t, budget.used.Load(), 9*6)
+
+	seqs := func(upTo uint64) []uint64 {
+		t.Helper()
+		held, err := h.through(upTo)
+		require_NoError(t, err)
+		var seqs []uint64
+		for _, sm := range held {
+			seqs = append(seqs, sm.seq)
+		}
+		return seqs
+	}
+	// Nothing held before the first message.
+	require_Len(t, len(seqs(1)), 0)
+	// Read from the store after all: 3 is dropped, 2 is given back.
+	require_True(t, slices.Equal(seqs(3), []uint64{2}))
+	// Already read: no longer kept.
+	keep(3)
+	require_True(t, slices.Equal(seqs(60), []uint64{7, 50, 51}))
+	require_True(t, slices.Equal(seqs(101), []uint64{90, 99, 100}))
+	require_Equal(t, budget.used.Load(), 0)
+
+	// Past the snapshot's last sequence: not kept.
+	keep(101)
+	require_Equal(t, budget.used.Load(), 0)
+	h.release()
 }
 
 // A snapshot whose messages are purged before it reads them fails, rather than
@@ -4563,6 +4659,7 @@ func TestJetStreamSnapshotV2FailsWhenPurgedWhileReading(t *testing.T) {
 			})
 			require_NoError(t, err)
 
+			defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(snapshotTestProcs))
 			v := make([]byte, 4096)
 			for i := range 2000 {
 				crand.Read(v)

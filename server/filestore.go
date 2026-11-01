@@ -10106,12 +10106,12 @@ func (fs *fileStore) fastStateLocked(state *StreamState) {
 
 // holdForSnapshot fills in state as FastState does and, at the same instant,
 // starts keeping a copy of each message the store removes before the snapshot
-// reads it, until releaseSnapshotHold.
-func (fs *fileStore) holdForSnapshot(state *StreamState) *snapshotHold {
+// reads it, until releaseSnapshotHold, charging the copies to budget.
+func (fs *fileStore) holdForSnapshot(state *StreamState, budget *snapshotHoldBudget) *snapshotHold {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	fs.fastStateLocked(state)
-	h := newSnapshotHold(state)
+	h := newSnapshotHold(state, budget)
 	fs.holds = append(fs.holds, h)
 	return h
 }

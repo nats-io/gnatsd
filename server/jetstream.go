@@ -149,6 +149,10 @@ type jetStream struct {
 
 	// Atomic versions
 	disabled atomic.Bool
+
+	// What the stream snapshots of this server hold of messages removed while
+	// they read, and its limit.
+	snapHolds snapshotHoldBudget
 }
 
 type remoteUsage struct {
@@ -429,6 +433,7 @@ func (s *Server) initJetStreamEncryption() (err error) {
 // enableJetStream will start up the JetStream subsystem.
 func (s *Server) enableJetStream(cfg JetStreamConfig) error {
 	js := &jetStream{srv: s, config: cfg, accounts: make(map[string]*jsAccount), apiSubs: NewSublistNoCache(), infoSubs: gsl.NewSimpleSublist()}
+	js.snapHolds.max = defaultMaxSnapshotHoldBytes
 	s.gcbMu.Lock()
 	if s.gcbOutMax = s.getOpts().JetStreamMaxCatchup; s.gcbOutMax == 0 {
 		s.gcbOutMax = defaultMaxTotalCatchupOutBytes
