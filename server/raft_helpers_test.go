@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -470,4 +471,46 @@ func encode(t *testing.T, ae *appendEntry) *appendEntry {
 	require_NoError(t, err)
 	ae.buf = buf
 	return ae
+}
+
+// runRaftTestServer runs a JetStream server to host Raft nodes, as
+// RunBasicJetStreamServer isn't built with skip_js_tests.
+func runRaftTestServer(t *testing.T) *Server {
+	t.Helper()
+	o := DefaultTestOptions
+	o.Port = -1
+	o.JetStream = true
+	o.StoreDir = t.TempDir()
+	return RunServer(&o)
+}
+
+// runServerWaitingForRouting starts a single-member clustered JetStream server
+// whose route never connects, so its meta group keeps waiting for routing.
+func runServerWaitingForRouting(t *testing.T) *Server {
+	t.Helper()
+	o := DefaultTestOptions
+	o.Port = -1
+	o.ServerName = "S"
+	o.JetStream = true
+	o.StoreDir = t.TempDir()
+	o.Cluster.Name = "R1S"
+	o.Cluster.Host = o.Host
+	o.Cluster.Port = -1
+	o.Routes = RoutesFromStr("nats://127.0.0.1:1")
+	return RunServer(&o)
+}
+
+// requireRaftNodeReleased checks that a stopped node closed its WAL and its
+// commit file, if it had one, and is no longer registered with the server.
+func requireRaftNodeReleased(t *testing.T, s *Server, n *raft) {
+	t.Helper()
+	n.RLock()
+	fs, cf := n.wal.(*fileStore), n.cf
+	n.RUnlock()
+	require_True(t, fs.isClosed())
+	if cf != nil {
+		_, err := cf.Stat()
+		require_Error(t, err, os.ErrClosed)
+	}
+	require_True(t, s.lookupRaftNode(n.group) == nil)
 }

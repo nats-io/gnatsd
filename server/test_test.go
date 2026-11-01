@@ -96,6 +96,10 @@ func require_NotNil[T any](t testing.TB, vs ...T) {
 	for _, v := range vs {
 		r := reflect.ValueOf(v)
 		switch k := r.Kind(); k {
+		// A nil interface value has no dynamic type, so reflect reports it as invalid.
+		case reflect.Invalid:
+			antithesis.AssertUnreachable(t, "Failed require_NotNil check", nil)
+			t.Fatalf("require not nil, but got nil")
 		case reflect.Pointer, reflect.Interface, reflect.Slice,
 			reflect.Map, reflect.Chan, reflect.Func:
 			if r.IsNil() {

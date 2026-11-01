@@ -290,6 +290,8 @@ func (c *client) processRoutedHeaderMsgArgs(arg []byte) error {
 		if an = c.route.accName; len(an) > 0 {
 			args = append(args, an)
 		}
+	} else if c.kind == GATEWAY && c.gw.outbound {
+		return fmt.Errorf("processRoutedHeaderMsgArgs received HMSG from gateway on outbound connection")
 	}
 	start := -1
 	for i, b := range arg {
@@ -386,6 +388,8 @@ func (c *client) processRoutedMsgArgs(arg []byte) error {
 		if an = c.route.accName; len(an) > 0 {
 			args = append(args, an)
 		}
+	} else if c.kind == GATEWAY && c.gw.outbound {
+		return fmt.Errorf("processRoutedMsgArgs received RMSG from gateway on outbound connection")
 	}
 	start := -1
 	for i, b := range arg {
@@ -1529,8 +1533,8 @@ func (c *client) processRemoteSub(argo []byte, leafSub, hasOrigin bool) (err err
 	c.mu.Lock()
 	accountName := string(c.route.accName)
 	lnSupport := c.route.ln
-	c.mu.Unlock()
 	oldStyle := !c.route.lnocu && !(leafSub && !hasOrigin)
+	c.mu.Unlock()
 
 	// Indicate if the account name should be in the protocol. It would be the
 	// case if accountName is empty.
@@ -1588,14 +1592,12 @@ func (c *client) processRemoteSub(argo []byte, leafSub, hasOrigin bool) (err err
 	case subjIdx + 3:
 		sub.queue = args[subjIdx+1]
 		sub.qw = int32(parseSize(args[subjIdx+2]))
-		// TODO: (ik) We should have a non empty queue name and a queue
-		// weight >= 1. For 2.11, we may want to return an error if that
-		// is not the case, but for now just overwrite `delta` if queue
-		// weight is greater than 1 (it is possible after a reconnect/
-		// server restart to receive a queue weight > 1 for a new sub).
-		if sub.qw > 1 {
-			delta = sub.qw
+		// A missing or malformed weight counts as a single member.
+		if sub.qw < 1 {
+			sub.qw = 1
 		}
+		// A new sub can have a weight > 1 after a reconnect or server restart.
+		delta = sub.qw
 	default:
 		return fmt.Errorf("processRemoteSub Parse Error: '%s'", arg)
 	}
@@ -1887,7 +1889,7 @@ func (s *Server) sendSubsToRoute(route *client, idx int, account string) {
 			if !route.canImport(s[1]) {
 				continue
 			}
-			sub := subscription{leaf: forLeaf, origin: origin, subject: subj, queue: qn, qw: n}
+			sub := subscription{leaf: forLeaf, origin: origin, subject: subj, queue: qn, qw: queueWeight(n)}
 			buf = route.addRouteSubOrUnsubProtoToBuf(buf, a.Name, &sub, true)
 		}
 		a.mu.RUnlock()
@@ -2101,7 +2103,11 @@ func (s *Server) createRoute(conn net.Conn, rURL *url.URL, rtype RouteType, goss
 	}
 	c.mu.Unlock()
 
-	c.Noticef("Route connection created")
+	if didSolicit {
+		c.Noticef("Route connection created (%s)", rURL.Host)
+	} else {
+		c.Noticef("Route connection created")
+	}
 	return c
 }
 
@@ -2180,6 +2186,9 @@ func (s *Server) addRoute(c *client, didSolicit, sendDelayedInfo bool, gossipMod
 			invProtoErr = fmt.Sprintf("Not possible to have a dedicated route for account %q between those servers", accName)
 			// In this case, make sure this route does not attempt to reconnect
 			c.setNoReconnect()
+		} else if info.RoutePoolIdx != 0 {
+			// Without pooling, the incoming's RoutePoolIdx should not be set.
+			invProtoErr = fmt.Sprintf("Route pool index should not be set but is set to %v", info.RoutePoolIdx)
 		} else {
 			// We will accept, but treat this remote has "no pool"
 			pool, noReconnectForOldServer = false, true
@@ -2565,7 +2574,7 @@ func (s *Server) updateRouteSubscriptionMap(acc *Account, sub *subscription, del
 	}
 
 	// Copy to hold outside acc lock.
-	var n int32
+	var n int64
 	var ok bool
 
 	isq := len(sub.queue) > 0
@@ -2607,7 +2616,7 @@ func (s *Server) updateRouteSubscriptionMap(acc *Account, sub *subscription, del
 	// special care that this order of updates is same as what is sent out
 	// over routes.
 	if n, ok = rm[key]; ok {
-		n += delta
+		n += int64(delta)
 		if n <= 0 {
 			delete(rm, key)
 			delete(lws, key)
@@ -2616,8 +2625,8 @@ func (s *Server) updateRouteSubscriptionMap(acc *Account, sub *subscription, del
 			rm[key] = n
 		}
 	} else if delta > 0 {
-		n = delta
-		rm[key] = delta
+		n = int64(delta)
+		rm[key] = n
 		update = true // Adding a new entry for normal sub means update (0->1)
 	}
 
@@ -2633,7 +2642,7 @@ func (s *Server) updateRouteSubscriptionMap(acc *Account, sub *subscription, del
 		sub.client.mu.Lock()
 		nsub := *sub
 		sub.client.mu.Unlock()
-		nsub.qw = n
+		nsub.qw = queueWeight(n)
 		sub = &nsub
 	}
 
@@ -2696,16 +2705,17 @@ func (s *Server) updateRouteSubscriptionMap(acc *Account, sub *subscription, del
 
 	acc.mu.Lock()
 	n = rm[key]
+	qw := queueWeight(n)
 	if isq {
-		sub.qw = n
+		sub.qw = qw
 	}
 	// Check the last sent value here. If same, then someone beat us to it and
 	// we can just return here. Otherwise update.
-	if ls, ok := lws[key]; ok && ls == n {
+	if ls, ok := lws[key]; ok && ls == qw {
 		acc.mu.Unlock()
 		return
 	} else if n > 0 {
-		lws[key] = n
+		lws[key] = qw
 	}
 	acc.mu.Unlock()
 

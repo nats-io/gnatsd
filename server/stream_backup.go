@@ -189,8 +189,13 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 					errCh <- fmt.Errorf("failed to get consumer state for '%s > %s'", sa.Config.Name, ca.Name)
 					return
 				}
+				// Ephemeral clustered consumers are named by their assignment. Their
+				// original config may not carry that generated name, but snapshots
+				// need it both for the archive entry and for restoration.
+				config := *ca.Config
+				config.Name = ca.Name
 				if err := writeConsumerMsg(SnapshotConsumerState{
-					ConsumerConfig: ca.Config,
+					ConsumerConfig: &config,
 					ConsumerState:  consumerStateFromInfo(ci),
 				}); err != nil {
 					errCh <- err

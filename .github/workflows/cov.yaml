@@ -18,12 +18,12 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: src/github.com/nats-io/nats-server
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: stable
           cache-dependency-path: src/github.com/nats-io/nats-server/go.sum
@@ -46,8 +46,8 @@ jobs:
 
       - name: Coveralls
         # Use commit hash here to avoid a re-tagging attack, as this is a third-party action
-        # Commit 5cbfd81b66ca5d10c19b062c04de0199c215fb6e = tag v2.3.7
-        uses: coverallsapp/github-action@5cbfd81b66ca5d10c19b062c04de0199c215fb6e
+        # Commit 8d6379e14d29928660c4ba802d8e85393440b329 = tag v2.3.8
+        uses: coverallsapp/github-action@8d6379e14d29928660c4ba802d8e85393440b329
         with:
           github-token: ${{ secrets.github_token }}
           file: src/github.com/nats-io/nats-server/coverage.lcov

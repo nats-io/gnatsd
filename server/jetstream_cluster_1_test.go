@@ -2687,6 +2687,27 @@ func TestJetStreamClusterUserSnapshotAndRestore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
+	// Clustered ephemeral consumers use the assignment name as their identity,
+	// while the original consumer config can have an empty Name. Make sure a
+	// snapshot remains restorable in that case.
+	ephSubj := nats.NewInbox()
+	ephSub, err := nc.Subscribe(ephSubj, func(*nats.Msg) {})
+	if err != nil {
+		t.Fatalf("Unexpected error subscribing for ephemeral consumer: %v", err)
+	}
+	defer ephSub.Unsubscribe()
+	if err := nc.Flush(); err != nil {
+		t.Fatalf("Unexpected error flushing ephemeral consumer subscription: %v", err)
+	}
+	eph, err := js.AddConsumer("TEST", &nats.ConsumerConfig{
+		DeliverSubject:    ephSubj,
+		DeliverPolicy:     nats.DeliverNewPolicy,
+		AckPolicy:         nats.AckNonePolicy,
+		InactiveThreshold: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Unexpected error creating ephemeral consumer: %v", err)
+	}
 
 	jsub, err := js.PullSubscribe("foo", "dlc")
 	if err != nil {
@@ -2840,6 +2861,7 @@ func TestJetStreamClusterUserSnapshotAndRestore(t *testing.T) {
 
 	// Wait on the system to elect a leader for the restored consumer.
 	c.waitOnConsumerLeader("$G", "TEST", "dlc")
+	c.waitOnConsumerLeader("$G", "TEST", eph.Name)
 
 	// Now check for the consumer being recreated.
 	nci, err := js.ConsumerInfo("TEST", "dlc")
@@ -2857,6 +2879,14 @@ func TestJetStreamClusterUserSnapshotAndRestore(t *testing.T) {
 	nci.AckFloor.Last, ci.AckFloor.Last = nil, nil
 	if nci.AckFloor != ci.AckFloor {
 		t.Fatalf("Ack floors did not match %+v vs %+v", nci.AckFloor, ci.AckFloor)
+	}
+
+	ephInfo, err := js.ConsumerInfo("TEST", eph.Name)
+	if err != nil {
+		t.Fatalf("Unexpected error getting restored ephemeral consumer info: %v", err)
+	}
+	if ephInfo.Config.Durable != _EMPTY_ {
+		t.Fatalf("Expected restored consumer to remain ephemeral, got durable %q", ephInfo.Config.Durable)
 	}
 
 	// Make sure consumer works.
@@ -3946,7 +3976,7 @@ func TestJetStreamClusterPeerRemovalAndStreamReassignmentOnNewServer(t *testing.
 	sjs := ml.getJetStream()
 	sjs.mu.RLock()
 	defer sjs.mu.RUnlock()
-	sa := sjs.streamAssignment(globalAccountName, "TEST")
+	sa := sjs.streamAssignmentOrInflight(globalAccountName, "TEST")
 	require_NotNil(t, sa)
 	require_Len(t, len(sa.Group.Excluded), 0)
 }
@@ -4148,8 +4178,8 @@ func TestJetStreamClusterUnderReplicatedNotMigrating(t *testing.T) {
 		require_NotNil(t, l)
 		ljs := l.getJetStream()
 		ljs.mu.RLock()
-		sa := ljs.streamAssignment(globalAccountName, "TEST")
-		ca := ljs.consumerAssignment(globalAccountName, "TEST", "dur")
+		sa := ljs.streamAssignmentOrInflight(globalAccountName, "TEST")
+		ca := ljs.consumerAssignmentOrInflight(globalAccountName, "TEST", "dur")
 		streamChurning := sa != nil && sa.Group != nil && sa.Group.Desired != nil
 		consumerChurning := ca != nil && ca.Group != nil && ca.Group.Desired != nil
 		ljs.mu.RUnlock()
@@ -4653,7 +4683,7 @@ func TestJetStreamClusterAccountUsageAfterServerRemove(t *testing.T) {
 
 	c.waitOnPeerCount(3)
 	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
-		si, err := js.StreamInfo("TEST")
+		si, err := js.StreamInfo("TEST", nats.MaxWait(time.Second))
 		if err != nil {
 			return err
 		}
@@ -4712,7 +4742,7 @@ func TestJetStreamClusterStreamPeerRemoveNoReplacementIsRejected(t *testing.T) {
 
 			sjs := ml.getJetStream()
 			sjs.mu.RLock()
-			sa := sjs.streamAssignment(globalAccountName, "TEST")
+			sa := sjs.streamAssignmentOrInflight(globalAccountName, "TEST")
 			peers := append([]string(nil), sa.Group.Peers...)
 			sjs.mu.RUnlock()
 			require_Len(t, len(peers), 3)
@@ -4748,6 +4778,16 @@ func TestJetStreamClusterStreamPeerRemoveNoReplacementIsRejected(t *testing.T) {
 				require_True(t, slices.Equal(sa.Group.Peers, peers))
 				require_True(t, sjs.cluster.inflightStreams[globalAccountName]["TEST"] == nil)
 			}
+			// The meta leader could still be applying the create.
+			checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+				sjs := ml.getJetStream()
+				sjs.mu.RLock()
+				defer sjs.mu.RUnlock()
+				if sjs.cluster.inflightStreams[globalAccountName]["TEST"] != nil {
+					return errors.New("stream assignment still inflight")
+				}
+				return nil
+			})
 			checkPeers()
 
 			// A meta leader change runs reconcilePeerAssignments, which must find
@@ -5332,7 +5372,7 @@ func TestJetStreamClusterConsumerPeerRemoveAndEvacuateMatrix(t *testing.T) {
 
 			sjs := ml.getJetStream()
 			sjs.mu.RLock()
-			sa := sjs.streamAssignment(globalAccountName, stream)
+			sa := sjs.streamAssignmentOrInflight(globalAccountName, stream)
 			streamPeers := append([]string(nil), sa.Group.Peers...)
 			sjs.mu.RUnlock()
 			require_Len(t, len(streamPeers), test.streamReplicas)
@@ -5443,7 +5483,7 @@ func TestJetStreamClusterConsumerPeerRemoveNoReplacementIsRejected(t *testing.T)
 
 			sjs := ml.getJetStream()
 			sjs.mu.RLock()
-			ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+			ca := sjs.consumerAssignmentOrInflight(globalAccountName, "TEST", "CONSUMER")
 			peers := append([]string(nil), ca.Group.Peers...)
 			sjs.mu.RUnlock()
 			require_Len(t, len(peers), 3)
@@ -5476,6 +5516,16 @@ func TestJetStreamClusterConsumerPeerRemoveNoReplacementIsRejected(t *testing.T)
 				require_True(t, slices.Equal(ca.Group.Peers, peers))
 				require_True(t, sjs.cluster.inflightConsumers[globalAccountName]["TEST"]["CONSUMER"] == nil)
 			}
+			// The meta leader could still be applying the create.
+			checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+				sjs := ml.getJetStream()
+				sjs.mu.RLock()
+				defer sjs.mu.RUnlock()
+				if sjs.cluster.inflightConsumers[globalAccountName]["TEST"]["CONSUMER"] != nil {
+					return errors.New("consumer assignment still inflight")
+				}
+				return nil
+			})
 			checkPeers()
 
 			// A meta leader change runs reconcilePeerAssignments, which must find
@@ -5534,7 +5584,7 @@ func TestJetStreamClusterConsumerPeerRemoveInvalidRequestIsRejected(t *testing.T
 
 	sjs := ml.getJetStream()
 	sjs.mu.RLock()
-	ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+	ca := sjs.consumerAssignmentOrInflight(globalAccountName, "TEST", "CONSUMER")
 	peers := append([]string(nil), ca.Group.Peers...)
 	sjs.mu.RUnlock()
 	require_Len(t, len(peers), 1)
@@ -5584,7 +5634,7 @@ func TestJetStreamClusterConsumerPeerRemoveInvalidRequestIsRejected(t *testing.T
 			// The consumer that was named is left where it was.
 			sjs.mu.RLock()
 			defer sjs.mu.RUnlock()
-			ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+			ca := sjs.consumerAssignmentOrInflight(globalAccountName, "TEST", "CONSUMER")
 			require_NotNil(t, ca)
 			require_True(t, slices.Equal(ca.Group.Peers, peers))
 		})
@@ -9498,8 +9548,12 @@ func TestJetStreamClusterProcessClusterUpdateStreamNilStreamAssignment(t *testin
 	s := c.randomServer()
 	acc, err := s.lookupAccount(globalAccountName)
 	require_NoError(t, err)
-	mset, err := acc.lookupStream("TEST")
-	require_NoError(t, err)
+	// Only the stream leader is known to have created the stream when it responds.
+	var mset *stream
+	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+		mset, err = acc.lookupStream("TEST")
+		return err
+	})
 
 	// Capture osa and build a sa that reflects the post-restart meta-replay
 	// conditions: a scale-up path where both the old and new raftGroup nodes
@@ -9859,7 +9913,7 @@ func TestJetStreamClusterConsumerInfoAfterCreate(t *testing.T) {
 	// This is fine for the RAFT log and allowing the consumer to be created,
 	// but we will not be able to apply the consumer assignment for some time.
 	mjs := nl.getJetStream()
-	require_NotNil(t, js)
+	require_NotNil(t, mjs)
 	mg := mjs.getMetaGroup()
 	require_NotNil(t, mg)
 	err = mg.(*raft).PauseApply()
@@ -10071,7 +10125,7 @@ func TestJetStreamClusterStreamHealthCheckMustNotRecreate(t *testing.T) {
 		acc, err := rs.lookupAccount(globalAccountName)
 		require_NoError(t, err)
 		mset, err := acc.lookupStream("TEST")
-		require_NotNil(t, err)
+		require_NoError(t, err)
 
 		sjs := rs.getJetStream()
 		sjs.mu.Lock()
@@ -10182,7 +10236,7 @@ func TestJetStreamClusterStreamHealthCheckMustNotDeleteEarly(t *testing.T) {
 		acc, err := rs.lookupAccount(globalAccountName)
 		require_NoError(t, err)
 		mset, err := acc.lookupStream("TEST")
-		require_NotNil(t, err)
+		require_NoError(t, err)
 
 		sjs := rs.getJetStream()
 		sjs.mu.Lock()
@@ -10256,7 +10310,7 @@ func TestJetStreamClusterStreamHealthCheckOnlyReportsSkew(t *testing.T) {
 		acc, err := rs.lookupAccount(globalAccountName)
 		require_NoError(t, err)
 		mset, err := acc.lookupStream("TEST")
-		require_NotNil(t, err)
+		require_NoError(t, err)
 
 		sjs := rs.getJetStream()
 		sjs.mu.Lock()
@@ -10373,26 +10427,11 @@ func TestJetStreamClusterConsumerHealthCheckMustNotRecreate(t *testing.T) {
 			return nil
 		})
 	}
-	waitForNoConsumerAssignments := func() {
-		t.Helper()
-		checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
-			for _, s := range c.servers {
-				sjs := s.getJetStream()
-				sjs.mu.RLock()
-				ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
-				sjs.mu.RUnlock()
-				if ca != nil {
-					return fmt.Errorf("stream assignment still available on %s", s.Name())
-				}
-			}
-			return nil
-		})
-	}
 	getConsumerAssignment := func(rs *Server) (*jetStream, *streamAssignment, *consumerAssignment, *stream) {
 		acc, err := rs.lookupAccount(globalAccountName)
 		require_NoError(t, err)
 		mset, err := acc.lookupStream("TEST")
-		require_NotNil(t, err)
+		require_NoError(t, err)
 
 		sjs := rs.getJetStream()
 		sjs.mu.Lock()
@@ -10468,7 +10507,18 @@ func TestJetStreamClusterConsumerHealthCheckMustNotRecreate(t *testing.T) {
 
 	err = js.DeleteConsumer("TEST", "CONSUMER")
 	require_NoError(t, err)
-	waitForNoConsumerAssignments()
+
+	// Wait for deletion to clear the node on the other replica,
+	// otherwise cleanup could later remove the node that is
+	// restored below.
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		sjs.mu.RLock()
+		defer sjs.mu.RUnlock()
+		if ca.Group.node != nil {
+			return errors.New("consumer node cleanup still in progress")
+		}
+		return nil
+	})
 
 	// Underlying layer would be aware the health check made a copy.
 	// So we sneakily set these values back, which simulates a race condition where
@@ -10514,7 +10564,7 @@ func TestJetStreamClusterConsumerHealthCheckMustNotDeleteEarly(t *testing.T) {
 		acc, err := rs.lookupAccount(globalAccountName)
 		require_NoError(t, err)
 		mset, err := acc.lookupStream("TEST")
-		require_NotNil(t, err)
+		require_NoError(t, err)
 		o := mset.lookupConsumer("CONSUMER")
 
 		sjs := rs.getJetStream()
@@ -10594,7 +10644,7 @@ func TestJetStreamClusterConsumerHealthCheckOnlyReportsSkew(t *testing.T) {
 		acc, err := rs.lookupAccount(globalAccountName)
 		require_NoError(t, err)
 		mset, err := acc.lookupStream("TEST")
-		require_NotNil(t, err)
+		require_NoError(t, err)
 		o := mset.lookupConsumer("CONSUMER")
 
 		sjs := rs.getJetStream()
@@ -10842,6 +10892,16 @@ func TestJetStreamClusterProcessStreamAssignmentResults(t *testing.T) {
 	require_NoError(t, err)
 	mjs.processStreamAssignmentResults(nil, nil, nil, _EMPTY_, _EMPTY_, badAcc)
 
+	// The stream leader responds to a create, wait for the meta leader to apply it.
+	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+		mjs.mu.RLock()
+		defer mjs.mu.RUnlock()
+		if mjs.streamAssignment(globalAccountName, "TEST") == nil {
+			return errors.New("stream assignment not applied")
+		}
+		return nil
+	})
+
 	// Reset the assignment so it's treated as not-yet-responded, and ensure we're
 	// inside the canDelete window.
 	mjs.mu.Lock()
@@ -10901,6 +10961,16 @@ func TestJetStreamClusterProcessStreamAssignmentResultsRetry(t *testing.T) {
 	ml := sc.leader()
 	require_NotNil(t, ml)
 	mjs := ml.getJetStream()
+
+	// The stream leader responds to a create, wait for the meta leader to apply it.
+	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+		mjs.mu.RLock()
+		defer mjs.mu.RUnlock()
+		if mjs.streamAssignment(globalAccountName, "TEST") == nil {
+			return errors.New("stream assignment not applied")
+		}
+		return nil
+	})
 
 	// Determine the assigned cluster and an alternate to retry into.
 	mjs.mu.Lock()
@@ -10975,6 +11045,16 @@ func TestJetStreamClusterProcessConsumerAssignmentResults(t *testing.T) {
 	badAcc, err := json.Marshal(&consumerAssignmentResult{Account: "DOES_NOT_EXIST", Stream: "TEST", Consumer: "CONSUMER"})
 	require_NoError(t, err)
 	mjs.processConsumerAssignmentResults(nil, nil, nil, _EMPTY_, _EMPTY_, badAcc)
+
+	// The consumer leader responds to a create, wait for the meta leader to apply it.
+	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+		mjs.mu.RLock()
+		defer mjs.mu.RUnlock()
+		if mjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER") == nil {
+			return errors.New("consumer assignment not applied")
+		}
+		return nil
+	})
 
 	mjs.mu.Lock()
 	ca := mjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
@@ -12808,7 +12888,8 @@ func TestJetStreamClusterWALReplayPreservesFirstSeq(t *testing.T) {
 
 type snapshotlessRaftNode struct {
 	RaftNode
-	id string
+	id    string
+	peers []string
 }
 
 func (n *snapshotlessRaftNode) ID() string                         { return n.id }
@@ -12816,51 +12897,132 @@ func (n *snapshotlessRaftNode) Progress() (uint64, uint64, uint64) { return 1, 1
 func (n *snapshotlessRaftNode) LoadLastSnapshot() (uint64, []byte, error) {
 	return 0, nil, errNoSnapAvailable
 }
+func (n *snapshotlessRaftNode) Peers() []*Peer {
+	peers := make([]*Peer, 0, len(n.peers))
+	for _, p := range n.peers {
+		peers = append(peers, &Peer{ID: p})
+	}
+	return peers
+}
 
 func TestJetStreamClusterPrepareForWALReplayPreservesR1ScaleUpSource(t *testing.T) {
+	const source = "source"
+	for _, test := range []struct {
+		title   string
+		peers   []string
+		origin  *desiredRaftGroupOrigin
+		desired []string
+		msgs    uint64
+	}{
+		// The original R1 peer restarting before bootstrap completed.
+		{"R1 origin", []string{source}, &desiredRaftGroupOrigin{Peers: []string{source}, Replicas: 1}, []string{source, "peer-2", "peer-3"}, 3},
+		// After stacked updates the origin needn't name the source, only the membership does.
+		{"stacked origin", []string{source}, &desiredRaftGroupOrigin{Peers: []string{source, "peer-2", "peer-3"}, Replicas: 3}, []string{source, "peer-4", "peer-5"}, 3},
+		// The source only adds peers after snapshotting, so a WAL without one is complete.
+		{"not sole member", []string{source, "peer-2"}, &desiredRaftGroupOrigin{Peers: []string{source}, Replicas: 1}, []string{source, "peer-2", "peer-3"}, 0},
+		// A plain R1 isn't scaling up, its WAL is complete.
+		{"plain R1", []string{source}, nil, nil, 0},
+		// A scale down to R1 doesn't grow, its WAL is complete.
+		{"scale down to R1", []string{source}, &desiredRaftGroupOrigin{Peers: []string{source, "peer-2", "peer-3"}, Replicas: 3}, []string{source}, 0},
+	} {
+		t.Run(test.title, func(t *testing.T) {
+			s := RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+
+			nc, js := jsClientConnect(t, s)
+			defer nc.Close()
+
+			_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}, Storage: nats.FileStorage})
+			require_NoError(t, err)
+			for range 3 {
+				_, err = js.Publish("foo", []byte("msg"))
+				require_NoError(t, err)
+			}
+
+			mset, err := s.GlobalAccount().lookupStream("TEST")
+			require_NoError(t, err)
+			fs := mset.store.(*fileStore)
+			fs.syncOnFlush.Store(true)
+
+			n := &snapshotlessRaftNode{id: source, peers: test.peers}
+			mset.mu.Lock()
+			mset.node = n
+			mset.sa = &streamAssignment{Group: &raftGroup{}}
+			if test.desired != nil {
+				mset.sa.Group.Desired = &desiredRaftGroup{Peers: test.desired, Origin: test.origin}
+			}
+			mset.mu.Unlock()
+			defer func() {
+				mset.mu.Lock()
+				mset.node, mset.sa = nil, nil
+				mset.mu.Unlock()
+			}()
+
+			// A sole member's new WAL can't reconstruct the existing stream state, so its store must be preserved.
+			require_NoError(t, prepareStreamRecovery(mset, n))
+			state := mset.state()
+			require_Equal(t, state.Msgs, test.msgs)
+			require_Equal(t, state.LastSeq, test.msgs)
+		})
+	}
+}
+
+func TestJetStreamClusterInterestCheckDoesNotCompactPastReplay(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
 
 	nc, js := jsClientConnect(t, s)
 	defer nc.Close()
 
-	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}, Storage: nats.FileStorage})
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:      "TEST",
+		Subjects:  []string{"foo"},
+		Storage:   nats.FileStorage,
+		Retention: nats.InterestPolicy,
+	})
 	require_NoError(t, err)
-	for range 3 {
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "C", AckPolicy: nats.AckExplicitPolicy})
+	require_NoError(t, err)
+
+	const numMsgs = 3
+	for range numMsgs {
 		_, err = js.Publish("foo", []byte("msg"))
 		require_NoError(t, err)
+	}
+	sub, err := js.PullSubscribe("foo", "C")
+	require_NoError(t, err)
+	msgs, err := sub.Fetch(numMsgs)
+	require_NoError(t, err)
+	for _, m := range msgs {
+		require_NoError(t, m.AckSync())
 	}
 
 	mset, err := s.GlobalAccount().lookupStream("TEST")
 	require_NoError(t, err)
-	fs := mset.store.(*fileStore)
-	fs.syncOnFlush.Store(true)
+	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		if state := mset.state(); state.Msgs != 0 {
+			return fmt.Errorf("expected acked messages to be removed, got %d", state.Msgs)
+		}
+		return nil
+	})
 
-	// Simulate the original R1 peer restarting before bootstrap completed.
-	const source = "source"
-	n := &snapshotlessRaftNode{id: source}
-	mset.mu.Lock()
-	mset.node = n
-	mset.sa = &streamAssignment{Group: &raftGroup{Desired: &desiredRaftGroup{
-		Peers: []string{source, "peer-2", "peer-3"},
-		Origin: &desiredRaftGroupOrigin{
-			Peers:    []string{source},
-			Replicas: 1,
-		},
-	}}}
-	mset.mu.Unlock()
-	defer func() {
-		mset.mu.Lock()
-		mset.node, mset.sa = nil, nil
-		mset.mu.Unlock()
-	}()
+	// Checking interest on the full store leaves the consumer's check floor
+	// past the last message, as when a replicated stream starts up.
+	mset.checkInterestState()
 
-	// Its new WAL cannot reconstruct the existing R1 stream state,
-	// prepareStreamRecovery must preserve the stream store
-	require_NoError(t, prepareStreamRecovery(mset, n))
-	state := mset.state()
-	require_Equal(t, state.Msgs, 3)
-	require_Equal(t, state.LastSeq, 3)
+	// Recovery truncates the store to replay the Raft log, while the
+	// consumer's ack and check floors are still at the last message.
+	require_NoError(t, mset.prepareForWALReplay(nil))
+	require_Equal(t, mset.lastSeq(), 0)
+
+	// A leader change checks interest before the replay has caught up. It
+	// must not compact the store past the messages that are still to come.
+	mset.checkInterestState()
+	require_Equal(t, mset.state().LastSeq, 0)
+	for seq := uint64(1); seq <= numMsgs; seq++ {
+		require_NoError(t, mset.store.StoreRawMsg("foo", nil, []byte("msg"), seq, time.Now().UnixNano(), 0, false))
+	}
+	require_Equal(t, mset.state().LastSeq, numMsgs)
 }
 
 func TestJetStreamClusterPrepareForWALReplayTruncatesStore(t *testing.T) {
@@ -15931,7 +16093,7 @@ func TestJetStreamClusterStreamPeerRemovePeerSetDesync(t *testing.T) {
 	// Get the stream's current peer set from the meta leader.
 	mjs := ml.getJetStream()
 	mjs.mu.RLock()
-	sa := mjs.streamAssignment(globalAccountName, "TEST")
+	sa := mjs.streamAssignmentOrInflight(globalAccountName, "TEST")
 	var origPeers []string
 	if sa != nil {
 		origPeers = copyStrings(sa.Group.Peers)
@@ -16466,7 +16628,7 @@ func TestJetStreamClusterRetentionChangeWaitsForConsumerParity(t *testing.T) {
 		mjs := ml.getJetStream()
 		mjs.mu.RLock()
 		defer mjs.mu.RUnlock()
-		ca := mjs.consumerAssignment(globalAccountName, "TEST", cname)
+		ca := mjs.consumerAssignmentOrInflight(globalAccountName, "TEST", cname)
 		if ca == nil || ca.Group == nil {
 			return 0
 		}
@@ -16662,10 +16824,10 @@ func TestJetStreamClusterRetentionChangeOriginSurvivesScale(t *testing.T) {
 		mjs := ml.getJetStream()
 		mjs.mu.RLock()
 		defer mjs.mu.RUnlock()
-		if sa := mjs.streamAssignment(globalAccountName, "TEST"); sa != nil && sa.Group != nil {
+		if sa := mjs.streamAssignmentOrInflight(globalAccountName, "TEST"); sa != nil && sa.Group != nil {
 			speers = sa.Group.Peers
 		}
-		if ca := mjs.consumerAssignment(globalAccountName, "TEST", cname); ca != nil && ca.Group != nil {
+		if ca := mjs.consumerAssignmentOrInflight(globalAccountName, "TEST", cname); ca != nil && ca.Group != nil {
 			cpeers = ca.Group.Peers
 		}
 		return speers, cpeers
@@ -16779,7 +16941,7 @@ func TestJetStreamClusterScaleStackingMoveExclusion(t *testing.T) {
 	mjs.mu.RLock()
 	var replicas, originReplicas int
 	var hasDesired bool
-	if sa := mjs.streamAssignment(globalAccountName, "TEST"); sa != nil && sa.Config != nil && sa.Group != nil {
+	if sa := mjs.streamAssignmentOrInflight(globalAccountName, "TEST"); sa != nil && sa.Config != nil && sa.Group != nil {
 		replicas = sa.Config.Replicas
 		if sa.Group.Desired != nil {
 			hasDesired = true
@@ -16865,7 +17027,7 @@ func TestJetStreamClusterRetentionChangeMoveExclusion(t *testing.T) {
 	require_NoError(t, err)
 
 	mjs.mu.RLock()
-	sa := mjs.streamAssignment(globalAccountName, "TEST")
+	sa := mjs.streamAssignmentOrInflight(globalAccountName, "TEST")
 	var hasDesired, isMove bool
 	var originReplicas int
 	if sa != nil && sa.Group != nil && sa.Group.Desired != nil {

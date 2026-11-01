@@ -15,15 +15,18 @@ package test
 
 import (
 	"context"
+	"crypto"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1330,6 +1333,11 @@ func TestOCSPPeerMonitor(t *testing.T) {
 			if test.WSClient {
 				if !v.Websocket.TLSOCSPPeerVerify {
 					t.Fatalf("Expected WS Client TLSOCSPPeerVerify to be true, got false")
+				}
+			}
+			if test.MQTTClient {
+				if !v.MQTT.TLSOCSPPeerVerify {
+					t.Fatalf("Expected MQTT Client TLSOCSPPeerVerify to be true, got false")
 				}
 			}
 			if test.LeafClient {
@@ -3097,5 +3105,81 @@ func TestOCSPMonitoringPort(t *testing.T) {
 				t.Errorf("Unexpected status: %v", resp.Status)
 			}
 		})
+	}
+}
+
+// TestOCSPPeerResponseSerialMismatch is test of a CA signed OCSP response for a different certificate than the one presented
+func TestOCSPPeerResponseSerialMismatch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rootCAResponder := NewOCSPResponderRootCA(t)
+	rootCAResponderURL := fmt.Sprintf("http://%s", rootCAResponder.Addr)
+	defer rootCAResponder.Shutdown(ctx)
+	SetOCSPStatus(t, rootCAResponderURL, "configs/certs/ocsp_peer/mini-ca/intermediate1/intermediate1_cert.pem", ocsp.Good)
+
+	// Intermediate CA responder always answers good for UserA2, regardless of the requested certificate
+	ca, err := tls.LoadX509KeyPair("configs/certs/ocsp_peer/mini-ca/intermediate1/intermediate1_cert.pem", "configs/certs/ocsp_peer/mini-ca/intermediate1/private/intermediate1_keypair.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := tls.LoadX509KeyPair("configs/certs/ocsp_peer/mini-ca/client1/UserA2_bundle.pem", "configs/certs/ocsp_peer/mini-ca/client1/private/UserA2_keypair.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := ocsp.CreateResponse(ca.Leaf, ca.Leaf, ocsp.Response{
+		Status:       ocsp.Good,
+		SerialNumber: other.Leaf.SerialNumber,
+		ThisUpdate:   time.Now(),
+		NextUpdate:   time.Now().Add(time.Hour),
+	}, ca.PrivateKey.(crypto.Signer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Listen synchronously, the server must not silently fail to reach the responder.
+	ln, err := net.Listen("tcp", "127.0.0.1:18888")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	intermediateCA1Responder := &http.Server{Handler: http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		rw.Header().Set("Content-Type", "application/ocsp-response")
+		rw.Write(resp)
+	})}
+	go intermediateCA1Responder.Serve(ln)
+	defer intermediateCA1Responder.Shutdown(ctx)
+
+	deleteLocalStore(t, "")
+	conf := createConfFile(t, []byte(`
+		port: -1
+		tls: {
+			cert_file: "configs/certs/ocsp_peer/mini-ca/server1/TestServer1_bundle.pem"
+			key_file: "configs/certs/ocsp_peer/mini-ca/server1/private/TestServer1_keypair.pem"
+			ca_file: "configs/certs/ocsp_peer/mini-ca/root/root_cert.pem"
+			timeout: 5
+			verify: true
+			# Turn on CA OCSP check so unvalidated clients can't connect
+			ocsp_peer: true
+		}
+	`))
+	s, opts := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	// UserA1 must be rejected, the only response available is for UserA2
+	nc, err := nats.Connect(fmt.Sprintf("tls://localhost:%d", opts.Port),
+		nats.ClientCert("./configs/certs/ocsp_peer/mini-ca/client1/UserA1_bundle.pem", "./configs/certs/ocsp_peer/mini-ca/client1/private/UserA1_keypair.pem"),
+		nats.RootCAs("./configs/certs/ocsp_peer/mini-ca/root/root_cert.pem"),
+		nats.ErrorHandler(noOpErrHandler),
+	)
+	if err == nil {
+		nc.Close()
+		t.Fatalf("Expected error on connect")
+	}
+	if err.Error() != "remote error: tls: bad certificate" {
+		t.Fatalf("Expected error remote error: tls: bad certificate, got: %s", err)
+	}
+	if requests.Load() == 0 {
+		t.Fatal("Expected the intermediate CA responder to be queried")
 	}
 }

@@ -5054,7 +5054,9 @@ func TestNoRaceJetStreamAccountLimitsAndRestartForceSnapshot(t *testing.T) {
 	c.waitOnLeader()
 	c.waitOnStreamLeader("$JS", "TEST")
 
-	checkFor(t, 2*time.Second, 500*time.Millisecond, func() error {
+	// The first catchup request can race the leader's sync subscription.
+	// It's only retried after streamCatchupStartInterval.
+	checkFor(t, 2*streamCatchupStartInterval, 200*time.Millisecond, func() error {
 		return checkState(t, c, "$JS", "TEST")
 	})
 	for _, cs := range c.servers {
@@ -5612,38 +5614,56 @@ func TestNoRaceJetStreamFileStoreLargeKVAccessTiming(t *testing.T) {
 	first := fmt.Sprintf(tmpl, 1)
 	last := fmt.Sprintf(tmpl, nkeys)
 
-	start := time.Now()
-	sm, err := fs.LoadLastMsg(last, nil)
-	require_NoError(t, err)
-	base := time.Since(start)
-
-	if !bytes.Equal(sm.msg, val) {
-		t.Fatalf("Retrieved value did not match")
+	// Timings are sensitive to machine load and IO, so allow a few attempts.
+	attempt := func(measure func() error) {
+		t.Helper()
+		var err error
+		for range 5 {
+			if err = measure(); err == nil {
+				return
+			}
+		}
+		t.Fatal(err)
 	}
 
-	start = time.Now()
-	_, err = fs.LoadLastMsg(first, nil)
-	require_NoError(t, err)
-	slow := time.Since(start)
+	attempt(func() error {
+		start := time.Now()
+		sm, err := fs.LoadLastMsg(last, nil)
+		require_NoError(t, err)
+		base := time.Since(start)
 
-	if base > 100*time.Microsecond || slow > 200*time.Microsecond {
-		t.Fatalf("Took too long to look up first key vs last: %v vs %v", base, slow)
-	}
+		if !bytes.Equal(sm.msg, val) {
+			t.Fatalf("Retrieved value did not match")
+		}
+
+		start = time.Now()
+		_, err = fs.LoadLastMsg(first, nil)
+		require_NoError(t, err)
+		slow := time.Since(start)
+
+		if base > 100*time.Microsecond || slow > 200*time.Microsecond {
+			return fmt.Errorf("Took too long to look up first key vs last: %v vs %v", base, slow)
+		}
+		return nil
+	})
 
 	// time first seq lookup for both as well.
 	// Base will be first in this case.
-	fs.mu.Lock()
-	start = time.Now()
-	fs.firstSeqForSubj(first)
-	base = time.Since(start)
-	start = time.Now()
-	fs.firstSeqForSubj(last)
-	slow = time.Since(start)
-	fs.mu.Unlock()
+	attempt(func() error {
+		fs.mu.Lock()
+		start := time.Now()
+		fs.firstSeqForSubj(first)
+		base := time.Since(start)
+		start = time.Now()
+		fs.firstSeqForSubj(last)
+		slow := time.Since(start)
+		fs.mu.Unlock()
 
-	if base > 100*time.Microsecond || slow > 200*time.Microsecond {
-		t.Fatalf("Took too long to look up last key by subject vs first: %v vs %v", base, slow)
-	}
+		if base > 100*time.Microsecond || slow > 200*time.Microsecond {
+			return fmt.Errorf("Took too long to look up last key by subject vs first: %v vs %v", base, slow)
+		}
+		return nil
+	})
 }
 
 func TestNoRaceJetStreamKVLock(t *testing.T) {

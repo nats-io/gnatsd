@@ -442,6 +442,46 @@ func TestConfigReloadRotateTLS(t *testing.T) {
 	}
 }
 
+func TestConfigReloadTLSPinnedCertsDisconnectsClient(t *testing.T) {
+	const config = `
+		host: localhost
+		port: -1
+		tls {
+			ca_file: "../test/configs/certs/ca.pem"
+			cert_file: "../test/configs/certs/server-cert.pem"
+			key_file: "../test/configs/certs/server-key.pem"
+			verify: true
+			pinned_certs: ["%s"]
+		}
+	`
+	const (
+		clientCertPin = "bf6f821f09fde09451411ba3b42c0f74727d61a974c69fd3cf5257f39c75f0e9"
+		otherCertPin  = "aaaaaaaa09fde09451411ba3b42c0f74727d61a974c69fd3cf5257f39c75f0e9"
+	)
+
+	conf := createConfFile(t, fmt.Appendf(nil, config, clientCertPin))
+	srv, _ := RunServerWithConfig(conf)
+	defer srv.Shutdown()
+
+	nc, err := nats.Connect(srv.ClientURL(),
+		nats.RootCAs("../test/configs/certs/ca.pem"),
+		nats.ClientCert("../test/configs/certs/client-cert.pem", "../test/configs/certs/client-key.pem"),
+		nats.NoReconnect(),
+	)
+	require_NoError(t, err)
+	defer nc.Close()
+
+	require_NoError(t, os.WriteFile(conf, fmt.Appendf(nil, config, otherCertPin), 0660))
+	require_NoError(t, srv.Reload())
+
+	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+		if !nc.IsClosed() {
+			return fmt.Errorf("client with removed certificate pin is still connected")
+		}
+		return nil
+	})
+}
+
 // Ensure Reload supports enabling TLS. Test this by starting a server without
 // TLS enabled, connect to it to verify, reload config with TLS enabled, ensure
 // reconnect fails, then ensure reconnect succeeds when using secure.
@@ -4443,7 +4483,7 @@ func TestConfigReloadAuthDoesNotBreakRouteInterest(t *testing.T) {
 	sa.Shutdown()
 
 	// Now force reload on seed server of auth.
-	s.reloadAuthorization()
+	s.reloadAuthorization(false)
 
 	// Restart both server A and client 2.
 	sa = RunServer(optsA)
@@ -7745,4 +7785,283 @@ func TestConfigReloadDoesNotDisconnectJWTClientSendingNkey(t *testing.T) {
 	l, err = cr.ReadString('\n')
 	require_NoError(t, err)
 	require_True(t, strings.HasPrefix(l, "PONG"))
+}
+
+func TestConfigReloadKeepsJetStreamAPIImportLinkedToSystemExport(t *testing.T) {
+	tmpl := jsClusterTempl + `
+		authorization {
+			users = [
+				{user: app, password: pwd}
+			]
+		}
+	`
+	c := createJetStreamClusterWithTemplate(t, tmpl, "R3S", 3)
+	defer c.shutdown()
+
+	s := c.randomServer()
+	nc, js := jsClientConnect(t, s, nats.UserInfo("app", "pwd"))
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}, Replicas: 3})
+	require_NoError(t, err)
+	sub, err := js.PullSubscribe("foo", "dur")
+	require_NoError(t, err)
+
+	fetch := func() {
+		t.Helper()
+		for i := 0; i < 50; i++ {
+			_, err := js.Publish("foo", []byte("msg"))
+			require_NoError(t, err)
+			msgs, err := sub.Fetch(1, nats.MaxWait(time.Second))
+			require_NoError(t, err)
+			for _, m := range msgs {
+				require_NoError(t, m.AckSync())
+			}
+		}
+	}
+	numResponses := func() int {
+		sacc := s.SystemAccount()
+		sacc.mu.RLock()
+		defer sacc.mu.RUnlock()
+		return len(sacc.exports.responses)
+	}
+	checkImportLinked := func() {
+		t.Helper()
+		gacc := s.GlobalAccount()
+		gacc.mu.RLock()
+		defer gacc.mu.RUnlock()
+		sis := gacc.imports.services[jsAllAPI]
+		require_Len(t, len(sis), 1)
+		if se := sis[0].se; se == nil || se.acc != s.SystemAccount() {
+			t.Fatalf("Expected %q import to be linked to the system account export, got %+v", jsAllAPI, se)
+		}
+	}
+
+	fetch()
+	checkImportLinked()
+	before := numResponses()
+
+	// Any authorization change reconfigures the accounts on reload.
+	for _, srv := range c.servers {
+		cf := srv.getOpts().ConfigFile
+		buf, err := os.ReadFile(cf)
+		require_NoError(t, err)
+		nbuf := bytes.Replace(buf, []byte("{user: app, password: pwd}"), []byte("{user: app, password: pwd}\n\t\t\t\t{user: other, password: pwd}"), 1)
+		require_NoError(t, os.WriteFile(cf, nbuf, defaultFilePerms))
+		require_NoError(t, srv.Reload())
+	}
+
+	checkImportLinked()
+	// Pull requests must still bypass the service import, otherwise each one
+	// leaves behind a response service import that never expires.
+	fetch()
+	require_Equal(t, numResponses(), before)
+}
+
+func TestConfigReloadNoRaceWithServiceImports(t *testing.T) {
+	kp, err := nkeys.CreateUser()
+	require_NoError(t, err)
+	pub, _ := kp.PublicKey()
+
+	storeDir := t.TempDir()
+	mkOpts := func() *Options {
+		return &Options{
+			Host:      "127.0.0.1",
+			Port:      -1,
+			JetStream: true,
+			StoreDir:  storeDir,
+			NoSigs:    true,
+			NoLog:     true,
+			Nkeys:     []*NkeyUser{{Nkey: pub}},
+		}
+	}
+	srv := RunServer(mkOpts())
+	defer srv.Shutdown()
+
+	sign := func(nonce []byte) ([]byte, error) { return kp.Sign(nonce) }
+	nc, js := jsClientConnect(t, srv, nats.Nkey(pub, sign), nats.Timeout(5*time.Second))
+	defer nc.Close()
+
+	_, err = js.AddStream(&nats.StreamConfig{Name: "S", Subjects: []string{"js.>"}})
+	require_NoError(t, err)
+	pull, err := js.PullSubscribe("js.>", "dur")
+	require_NoError(t, err)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ { // concurrent JetStream publishers ($JS.API service imports)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_, _ = js.Publish("js.x", []byte("x"), nats.AckWait(500*time.Millisecond))
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() { // consumer fetch loop: delivery is the read side
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			msgs, _ := pull.Fetch(20, nats.MaxWait(200*time.Millisecond))
+			for _, m := range msgs {
+				_ = m.Ack()
+			}
+		}
+	}()
+	wg.Add(1)
+	errCh := make(chan error, 1)
+	go func() { // ReloadOptions loop: the write side
+		defer wg.Done()
+		tk := time.NewTicker(5 * time.Millisecond)
+		defer tk.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tk.C:
+				if err := srv.ReloadOptions(mkOpts()); err != nil {
+					errCh <- fmt.Errorf("reload error: %v", err)
+					return
+				}
+			}
+		}
+	}()
+
+	time.Sleep(3 * time.Second)
+	close(stop)
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	default:
+	}
+}
+
+func TestCalloutInputsChanged(t *testing.T) {
+	newOptions := func() *Options {
+		return &Options{
+			AuthCallout: &AuthCallout{AuthUsers: []string{"auth", "key"}},
+			Users: []*User{
+				{Username: "auth", Password: "pwd", Account: NewAccount("A")},
+				{Username: "other", Password: "pwd", Account: NewAccount("A")},
+			},
+			Nkeys: []*NkeyUser{
+				{Nkey: "key", Account: NewAccount("A")},
+				{Nkey: "otherkey", Account: NewAccount("A")},
+			},
+		}
+	}
+	for _, test := range []struct {
+		name string
+		edit func(*Options)
+		want bool
+	}{
+		{"unchanged", func(*Options) {}, false},
+		{"tags", func(o *Options) { o.Tags = append(o.Tags, "updated") }, true},
+		{"permissions", func(o *Options) {
+			o.Users[0].Permissions = &Permissions{Publish: &SubjectPermission{Allow: []string{"foo"}}}
+		}, false},
+		{"nkey permissions", func(o *Options) { o.Nkeys[0].Permissions = &Permissions{} }, false},
+		{"password", func(o *Options) { o.Users[0].Password = "changed" }, true},
+		{"other password", func(o *Options) { o.Users[1].Password = "changed" }, true},
+		{"account", func(o *Options) { o.Users[0].Account = NewAccount("B") }, true},
+		{"account limits", func(o *Options) { o.Users[0].Account.mconns = 10 }, false},
+		{"connection types", func(o *Options) { o.Users[0].AllowedConnectionTypes = map[string]struct{}{"STANDARD": {}} }, true},
+		{"empty connection types", func(o *Options) { o.Users[0].AllowedConnectionTypes = map[string]struct{}{} }, false},
+		{"proxy", func(o *Options) { o.Users[0].ProxyRequired = true }, true},
+		{"delegated user deadline", func(o *Options) { o.Users[1].ConnectionDeadline = time.Now().Add(time.Hour) }, true},
+		{"delegated user proxy", func(o *Options) { o.Users[1].ProxyRequired = true }, true},
+		{"delegated nkey proxy", func(o *Options) { o.Nkeys[1].ProxyRequired = true }, true},
+		{"global proxy", func(o *Options) { o.ProxyRequired = true }, true},
+		{"removed user", func(o *Options) { o.Users = o.Users[1:] }, true},
+		{"removed unrelated user", func(o *Options) { o.Users = o.Users[:1] }, true},
+		{"added unrelated nkey", func(o *Options) { o.Nkeys = append(o.Nkeys, &NkeyUser{Nkey: "unrelated"}) }, true},
+		{"added unrelated user", func(o *Options) { o.Users = append(o.Users, &User{Username: "new"}) }, true},
+		{"removed nkey", func(o *Options) { o.Nkeys = nil }, true},
+		{"nkey account", func(o *Options) { o.Nkeys[0].Account = NewAccount("B") }, true},
+		{"identity kind", func(o *Options) {
+			o.Nkeys = nil
+			o.Users = append(o.Users, &User{Username: "key", Account: NewAccount("A")})
+		}, true},
+		{"user order", func(o *Options) { o.Users[0], o.Users[1] = o.Users[1], o.Users[0] }, false},
+		{"single auth user", func(o *Options) { o.Username = "auth" }, true},
+		{"single unrelated user", func(o *Options) { o.Username = "other" }, true},
+		{"single user password", func(o *Options) { o.Password = "changed" }, true},
+		{"token", func(o *Options) { o.Authorization = "changed" }, true},
+		{"TLS mapping", func(o *Options) { o.TLSMap = true }, true},
+	} {
+		for _, allowed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/allowed_accounts=%v", test.name, allowed), func(t *testing.T) {
+				old, updated := newOptions(), newOptions()
+				if allowed {
+					old.AuthCallout.AllowedAccounts = []string{"A"}
+					updated.AuthCallout.AllowedAccounts = []string{"A"}
+				}
+				test.edit(updated)
+				// Match the ordering established by diffOptions.
+				for _, o := range []*Options{old, updated} {
+					require_NoError(t, imposeOrder(o.Users))
+					require_NoError(t, imposeOrder(o.Nkeys))
+				}
+				require_Equal(t, calloutInputsChanged(old, updated), test.want)
+				updated.AuthCallout = nil
+				require_False(t, calloutInputsChanged(old, updated))
+			})
+		}
+	}
+}
+
+// Readloading the config must not race against startup.
+// A race could cause JetStream to appear un-enabled, and the reload would attempt to start it again.
+// That would make Start() fail ("jetstream already enabled"), or register every JetStream API handler twice.
+func TestConfigReloadDuringStartupWithJetStream(t *testing.T) {
+	for i := 0; i < 50; i++ { // Kinda arbitrary count, based on TestConfigReloadNoPanicOnShutdown
+		func() {
+			opts, _ := newOptionsFromContent(t, []byte(fmt.Sprintf(`
+				listen: 127.0.0.1:-1
+				jetstream { store_dir: %q }
+			`, t.TempDir())))
+			opts.NoLog = true
+			s, err := NewServer(opts)
+			require_NoError(t, err)
+			defer s.Shutdown()
+			l := &captureFatalLogger{fatalCh: make(chan string, 1)}
+			s.SetLogger(l, false, false)
+
+			go s.Start()
+			// Reload as soon as Start() is under way, before it has enabled JetStream.
+			for !s.isRunning() {
+				runtime.Gosched()
+			}
+			require_NoError(t, s.Reload())
+
+			if !s.ReadyForConnections(5 * time.Second) {
+				select {
+				case msg := <-l.fatalCh:
+					t.Fatalf("Iteration %d: server failed to start after a reload during startup: %s", i, msg)
+				default:
+					t.Fatalf("Iteration %d: server did not finish starting after a reload during startup", i)
+				}
+			}
+			nc := natsConnect(t, s.ClientURL())
+			defer nc.Close()
+			resp, err := nc.Request(JSApiAccountInfo, nil, 2*time.Second)
+			require_NoError(t, err)
+			var info JSApiAccountInfoResponse
+			require_NoError(t, json.Unmarshal(resp.Data, &info))
+			if info.Error != nil {
+				t.Fatalf("Iteration %d: JetStream API request failed after a reload during startup: %+v", i, info.Error)
+			}
+		}()
+	}
 }

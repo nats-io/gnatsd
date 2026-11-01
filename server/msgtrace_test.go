@@ -5181,6 +5181,12 @@ func TestMsgTraceJetStreamWithSuperCluster(t *testing.T) {
 
 			traceSub := natsSubSync(t, nct, traceDest)
 			natsFlush(t, nct)
+			if mainIter == 2 {
+				// The account is in interest-only mode, wait for c1 to know about the trace sub in c2.
+				for _, cs := range c1.servers {
+					checkGWInterestOnlyModeInterestOn(t, cs, c2.name, globalAccountName, traceDest)
+				}
+			}
 
 			for _, test := range []struct {
 				name       string

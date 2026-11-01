@@ -49,6 +49,7 @@ const (
 )
 
 // Individual sort options provide the Less for sort.Interface. Len and Swap are on cList.
+// Ties are broken by cid, so the order is the same on every call, e.g. when paging.
 // CID
 type SortByCid struct{ ConnInfos }
 
@@ -57,38 +58,78 @@ func (l SortByCid) Less(i, j int) bool { return l.ConnInfos[i].Cid < l.ConnInfos
 // Number of Subscriptions
 type SortBySubs struct{ ConnInfos }
 
-func (l SortBySubs) Less(i, j int) bool { return l.ConnInfos[i].NumSubs < l.ConnInfos[j].NumSubs }
+func (l SortBySubs) Less(i, j int) bool {
+	ci, cj := l.ConnInfos[i], l.ConnInfos[j]
+	if ci.NumSubs != cj.NumSubs {
+		return ci.NumSubs < cj.NumSubs
+	}
+	return SortByCid(l).Less(i, j)
+}
 
 // Pending Bytes
 type SortByPending struct{ ConnInfos }
 
-func (l SortByPending) Less(i, j int) bool { return l.ConnInfos[i].Pending < l.ConnInfos[j].Pending }
+func (l SortByPending) Less(i, j int) bool {
+	ci, cj := l.ConnInfos[i], l.ConnInfos[j]
+	if ci.Pending != cj.Pending {
+		return ci.Pending < cj.Pending
+	}
+	return SortByCid(l).Less(i, j)
+}
 
 // Outbound Msgs
 type SortByOutMsgs struct{ ConnInfos }
 
-func (l SortByOutMsgs) Less(i, j int) bool { return l.ConnInfos[i].OutMsgs < l.ConnInfos[j].OutMsgs }
+func (l SortByOutMsgs) Less(i, j int) bool {
+	ci, cj := l.ConnInfos[i], l.ConnInfos[j]
+	if ci.OutMsgs != cj.OutMsgs {
+		return ci.OutMsgs < cj.OutMsgs
+	}
+	return SortByCid(l).Less(i, j)
+}
 
 // Inbound Msgs
 type SortByInMsgs struct{ ConnInfos }
 
-func (l SortByInMsgs) Less(i, j int) bool { return l.ConnInfos[i].InMsgs < l.ConnInfos[j].InMsgs }
+func (l SortByInMsgs) Less(i, j int) bool {
+	ci, cj := l.ConnInfos[i], l.ConnInfos[j]
+	if ci.InMsgs != cj.InMsgs {
+		return ci.InMsgs < cj.InMsgs
+	}
+	return SortByCid(l).Less(i, j)
+}
 
 // Outbound Bytes
 type SortByOutBytes struct{ ConnInfos }
 
-func (l SortByOutBytes) Less(i, j int) bool { return l.ConnInfos[i].OutBytes < l.ConnInfos[j].OutBytes }
+func (l SortByOutBytes) Less(i, j int) bool {
+	ci, cj := l.ConnInfos[i], l.ConnInfos[j]
+	if ci.OutBytes != cj.OutBytes {
+		return ci.OutBytes < cj.OutBytes
+	}
+	return SortByCid(l).Less(i, j)
+}
 
 // Inbound Bytes
 type SortByInBytes struct{ ConnInfos }
 
-func (l SortByInBytes) Less(i, j int) bool { return l.ConnInfos[i].InBytes < l.ConnInfos[j].InBytes }
+func (l SortByInBytes) Less(i, j int) bool {
+	ci, cj := l.ConnInfos[i], l.ConnInfos[j]
+	if ci.InBytes != cj.InBytes {
+		return ci.InBytes < cj.InBytes
+	}
+	return SortByCid(l).Less(i, j)
+}
 
 // Last Activity
 type SortByLast struct{ ConnInfos }
 
 func (l SortByLast) Less(i, j int) bool {
-	return l.ConnInfos[i].LastActivity.UnixNano() < l.ConnInfos[j].LastActivity.UnixNano()
+	lasti, lastj := l.ConnInfos[i].LastActivity.UnixNano(), l.ConnInfos[j].LastActivity.UnixNano()
+	if lasti != lastj {
+		return lasti < lastj
+	}
+	return SortByCid(l).Less(i, j)
 }
 
 // Idle time
@@ -98,7 +139,11 @@ type SortByIdle struct {
 }
 
 func (l SortByIdle) Less(i, j int) bool {
-	return l.now.Sub(l.ConnInfos[i].LastActivity) < l.now.Sub(l.ConnInfos[j].LastActivity)
+	idlei, idlej := l.now.Sub(l.ConnInfos[i].LastActivity), l.now.Sub(l.ConnInfos[j].LastActivity)
+	if idlei != idlej {
+		return idlei < idlej
+	}
+	return SortByCid{l.ConnInfos}.Less(i, j)
 }
 
 // Uptime
@@ -121,7 +166,10 @@ func (l SortByUptime) Less(i, j int) bool {
 	} else {
 		upj = cj.Stop.Sub(cj.Start)
 	}
-	return upi < upj
+	if upi != upj {
+		return upi < upj
+	}
+	return SortByCid{l.ConnInfos}.Less(i, j)
 }
 
 // Stop
@@ -130,20 +178,33 @@ type SortByStop struct{ ConnInfos }
 func (l SortByStop) Less(i, j int) bool {
 	ciStop := l.ConnInfos[i].Stop
 	cjStop := l.ConnInfos[j].Stop
-	return ciStop.Before(*cjStop)
+	if !ciStop.Equal(*cjStop) {
+		return ciStop.Before(*cjStop)
+	}
+	return SortByCid(l).Less(i, j)
 }
 
 // Reason
 type SortByReason struct{ ConnInfos }
 
 func (l SortByReason) Less(i, j int) bool {
-	return l.ConnInfos[i].Reason < l.ConnInfos[j].Reason
+	ci, cj := l.ConnInfos[i], l.ConnInfos[j]
+	if ci.Reason != cj.Reason {
+		return ci.Reason < cj.Reason
+	}
+	return SortByCid(l).Less(i, j)
 }
 
 // RTT - Default is descending
 type SortByRTT struct{ ConnInfos }
 
-func (l SortByRTT) Less(i, j int) bool { return l.ConnInfos[i].rtt < l.ConnInfos[j].rtt }
+func (l SortByRTT) Less(i, j int) bool {
+	ci, cj := l.ConnInfos[i], l.ConnInfos[j]
+	if ci.rtt != cj.rtt {
+		return ci.rtt < cj.rtt
+	}
+	return SortByCid(l).Less(i, j)
+}
 
 // IsValid determines if a sort option is valid
 func (s SortOpt) IsValid() bool {

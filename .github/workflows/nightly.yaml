@@ -20,7 +20,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout NATS
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: src/github.com/nats-io/nats-server
           ref: ${{ inputs.target || 'main' }}
@@ -28,7 +28,7 @@ jobs:
           fetch-tags: true
 
       - name: Checkout NSC
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: nats-io/nsc
           path: src/github.com/nats-io/nsc
@@ -36,7 +36,7 @@ jobs:
           fetch-tags: true
 
       - name: Checkout NATS CLI
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: nats-io/natscli
           path: src/github.com/nats-io/natscli

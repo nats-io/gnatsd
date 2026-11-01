@@ -548,16 +548,23 @@ func TestNoRaceJetStreamClusterStreamSnapshotCatchup(t *testing.T) {
 	c.waitOnServerCurrent(sr)
 	c.waitOnStreamCurrent(sr, globalAccountName, "TEST")
 
-	mset, err := sr.GlobalAccount().lookupStream("TEST")
-	require_NoError(t, err)
+	// Current can be reported before the leader's snapshot catchup has started, so wait for the state.
+	checkCaughtUp := func(msgs, lseq uint64) {
+		t.Helper()
+		mset, err := sr.GlobalAccount().lookupStream("TEST")
+		require_NoError(t, err)
+		checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+			var state StreamState
+			mset.store.FastState(&state)
+			if state.Msgs != msgs || state.FirstSeq != 1 || state.LastSeq != lseq || state.NumDeleted != int(lseq-msgs) {
+				return fmt.Errorf("not caught up: %+v", state)
+			}
+			return nil
+		})
+	}
 
 	// Make sure it's caught up
-	var state StreamState
-	mset.store.FastState(&state)
-	require_Equal(t, state.Msgs, 2)
-	require_Equal(t, state.FirstSeq, 1)
-	require_Equal(t, state.LastSeq, 51_000)
-	require_Equal(t, state.NumDeleted, 51_000-2)
+	checkCaughtUp(2, 51_000)
 
 	sr.Shutdown()
 
@@ -570,15 +577,7 @@ func TestNoRaceJetStreamClusterStreamSnapshotCatchup(t *testing.T) {
 	c.checkClusterFormed()
 	c.waitOnServerCurrent(sr)
 	c.waitOnStreamCurrent(sr, globalAccountName, "TEST")
-
-	mset, err = sr.GlobalAccount().lookupStream("TEST")
-	require_NoError(t, err)
-	mset.store.FastState(&state)
-
-	require_Equal(t, state.Msgs, 3)
-	require_Equal(t, state.FirstSeq, 1)
-	require_Equal(t, state.LastSeq, 51_001)
-	require_Equal(t, state.NumDeleted, 51_001-3)
+	checkCaughtUp(3, 51_001)
 }
 
 func TestNoRaceStoreStreamEncoderDecoder(t *testing.T) {

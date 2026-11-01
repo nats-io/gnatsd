@@ -22,10 +22,10 @@ jobs:
     runs-on: ${{ vars.GHA_WORKER_MEDIUM || 'ubuntu-latest' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: stable
 

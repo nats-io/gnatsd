@@ -123,8 +123,9 @@ func TestQueueSub(t *testing.T) {
 		t.Fatalf("Expected only 2 sids, got %d\n", len(sids))
 	}
 	for k, c := range sids {
-		if c < 35 {
-			t.Fatalf("Expected ~50 (+-15) msgs for sid:'%s', got %d\n", k, c)
+		// Queue member selection is random, allow for ~5 standard deviations.
+		if c < 25 {
+			t.Fatalf("Expected ~50 (+-25) msgs for sid:'%s', got %d\n", k, c)
 		}
 	}
 }
@@ -160,8 +161,9 @@ func TestMultipleQueueSub(t *testing.T) {
 		t.Fatalf("Expected 4 sids, got %d\n", len(sids))
 	}
 	for k, c := range sids {
-		if c < 35 {
-			t.Fatalf("Expected ~50 (+-15) msgs for '%s', got %d\n", k, c)
+		// Queue member selection is random, allow for ~5 standard deviations.
+		if c < 25 {
+			t.Fatalf("Expected ~50 (+-25) msgs for '%s', got %d\n", k, c)
 		}
 	}
 }

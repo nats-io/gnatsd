@@ -46,6 +46,7 @@ import (
 	"unsafe"
 
 	"github.com/klauspost/compress/s2"
+	"github.com/minio/highwayhash"
 	"github.com/nats-io/nats-server/v2/server/ats"
 	"github.com/nats-io/nats-server/v2/server/avl"
 	"github.com/nats-io/nats-server/v2/server/gsl"
@@ -4792,7 +4793,7 @@ func TestFileStoreExpireOnRecoverSubjectAccounting(t *testing.T) {
 
 	testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
 		fcfg.BlockSize = 100
-		ttl := 200 * time.Millisecond
+		ttl := 400 * time.Millisecond
 		cfg := StreamConfig{Name: "zzz", Subjects: []string{"*"}, Storage: FileStorage, MaxAge: ttl}
 		created := time.Now()
 		fs, err := newFileStoreWithCreated(fcfg, cfg, created, prf(&fcfg), nil)
@@ -4802,12 +4803,14 @@ func TestFileStoreExpireOnRecoverSubjectAccounting(t *testing.T) {
 		// These are in first block.
 		fs.StoreMsg("A", nil, msg, 0)
 		fs.StoreMsg("B", nil, msg, 0)
-		time.Sleep(ttl / 2)
+		stored := time.Now()
+		// Leave a large margin so C doesn't expire as well if the restart is slow.
+		time.Sleep(ttl * 3 / 4)
 		// This one in 2nd block.
 		fs.StoreMsg("C", nil, msg, 0)
 
 		fs.Stop()
-		time.Sleep(ttl/2 + 10*time.Millisecond)
+		time.Sleep(time.Until(stored.Add(ttl + 10*time.Millisecond)))
 		fs, err = newFileStoreWithCreated(fcfg, cfg, created, prf(&fcfg), nil)
 		require_NoError(t, err)
 		defer fs.Stop()
@@ -6900,6 +6903,64 @@ func TestFileStoreSubjectCorruption(t *testing.T) {
 	}
 }
 
+func TestFileStoreNumPendingCanSkipStartingBlock(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		lastPerSubject bool
+		maxMsgsPer     int64
+	}{
+		{"LastPerSubject", true, 0},
+		{"MaxMsgsPerSubjectOne", false, 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fs, err := newFileStore(
+				FileStoreConfig{StoreDir: t.TempDir(), BlockSize: 1024},
+				StreamConfig{Name: "TEST", Subjects: []string{"foo.*", "bar.*"}, Storage: FileStorage, MaxMsgsPer: test.maxMsgsPer})
+			require_NoError(t, err)
+			defer fs.Stop()
+
+			// Keep the first block full of non-matching subjects, with all
+			// matching subjects' last messages in later blocks.
+			msg := bytes.Repeat([]byte("A"), 100)
+			for _, prefix := range []string{"bar", "foo"} {
+				for i := range 20 {
+					_, _, err := fs.StoreMsg(fmt.Sprintf("%s.%d", prefix, i), nil, msg, 0)
+					require_NoError(t, err)
+				}
+			}
+
+			const startSeq = uint64(2)
+			fs.mu.RLock()
+			seqStart, _ := fs.selectMsgBlockWithIndex(startSeq)
+			require_Equal(t, seqStart, 0)
+			mb := fs.blks[seqStart]
+			fs.psim.Match([]byte("foo.*"), func(_ []byte, info *psi) {
+				require_True(t, info.lblk > mb.index)
+			})
+			fs.mu.RUnlock()
+
+			// Start inside an unloaded block so the correction scan would
+			// have to load it without the empty-lbm early return.
+			require_NoError(t, mb.flushPendingMsgs())
+			mb.mu.Lock()
+			require_True(t, startSeq > mb.first.seq && startSeq <= mb.last.seq)
+			mb.clearCacheAndOffset()
+			require_True(t, mb.cacheNotLoaded())
+			loads := mb.cloads
+			mb.mu.Unlock()
+
+			total, validThrough, err := fs.NumPending(startSeq, "foo.*", test.lastPerSubject)
+			require_NoError(t, err)
+			require_Equal(t, total, uint64(20))
+			require_Equal(t, validThrough, uint64(40))
+			mb.mu.RLock()
+			defer mb.mu.RUnlock()
+			require_Equal(t, mb.cloads, loads)
+			require_True(t, mb.cacheNotLoaded())
+		})
+	}
+}
+
 // Since 2.10 we no longer have fss, and the approach for calculating NumPending would branch
 // based on the old fss metadata being present. This meant that calculating NumPending in >= 2.10.x
 // would load all blocks to complete. This test makes sure we do not do that anymore.
@@ -7406,6 +7467,114 @@ func TestFileStoreMultiLastSeqs(t *testing.T) {
 	seqs, err = fs.MultiLastSeqs([]string{">"}, 99, -1)
 	require_NoError(t, err)
 	checkResults(seqs, []uint64{97, 98, 99})
+
+	// No subjects match the filter.
+	seqs, err = fs.MultiLastSeqs([]string{"missing.*"}, 0, -1)
+	require_NoError(t, err)
+	checkResults(seqs, nil)
+}
+
+func TestFileStoreMultiLastSeqsDeletedBlocks(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		subjects []string
+		deletes  []uint64
+		filters  []string
+		maxSeq   uint64
+		want     []uint64
+	}{
+		{
+			name:     "removed last block",
+			subjects: []string{"foo.a", "foo.b", "foo.b", "foo.a", "foo.a", "foo.a", "foo.b", "foo.b", "foo.b"},
+			deletes:  []uint64{4, 5, 6},
+			filters:  []string{"foo.a"},
+			maxSeq:   8,
+			want:     []uint64{1},
+		},
+		{
+			name:     "multiple subjects with removed last block",
+			subjects: []string{"foo.a", "foo.c", "foo.c", "foo.a", "foo.c", "foo.c", "foo.b", "foo.b", "foo.b"},
+			deletes:  []uint64{4, 5, 6},
+			filters:  []string{"foo.a", "foo.c"},
+			maxSeq:   8,
+			want:     []uint64{1, 3},
+		},
+		{
+			name:     "subjects with existing and removed last blocks",
+			subjects: []string{"foo.a", "foo.c", "foo.c", "foo.a", "foo.a", "foo.a", "foo.b", "foo.b", "foo.b"},
+			deletes:  []uint64{4, 5, 6},
+			filters:  []string{"foo.a", "foo.c"},
+			maxSeq:   8,
+			want:     []uint64{1, 3},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// Each block holds three messages, so deleting 4-6 removes block 2.
+			fs, err := newFileStore(
+				FileStoreConfig{StoreDir: t.TempDir(), BlockSize: 128},
+				StreamConfig{Name: "TEST", Subjects: []string{"foo.*"}, Storage: FileStorage})
+			require_NoError(t, err)
+			defer fs.Stop()
+			for _, subject := range test.subjects {
+				_, _, err := fs.StoreMsg(subject, nil, []byte("x"), 0)
+				require_NoError(t, err)
+			}
+			for _, seq := range test.deletes {
+				removed, err := fs.RemoveMsg(seq)
+				require_NoError(t, err)
+				require_True(t, removed)
+			}
+			seqs, err := fs.MultiLastSeqs(test.filters, test.maxSeq, 0)
+			require_NoError(t, err)
+			if !slices.Equal(seqs, test.want) {
+				t.Errorf("MultiLastSeqs: expected %v, got %v", test.want, seqs)
+			}
+			var delivered []uint64
+			total, pending, err := fs.MultiLastMsgs(test.filters, 0, test.maxSeq, 1024, func(sm *StoreMsg, _ uint64) bool {
+				delivered = append(delivered, sm.seq)
+				return true
+			})
+			require_NoError(t, err)
+			require_Equal(t, total, uint64(len(test.want)))
+			require_Equal(t, pending, uint64(0))
+			if !slices.Equal(delivered, test.want) {
+				t.Errorf("MultiLastMsgs: expected %v, got %v", test.want, delivered)
+			}
+		})
+	}
+}
+
+func TestFileStoreMultiLastSeqsOverlappingFilters(t *testing.T) {
+	// Each block holds three messages, placing foo.a and foo.b in separate blocks.
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: t.TempDir(), BlockSize: 128},
+		StreamConfig{Name: "TEST", Subjects: []string{"foo.*"}, Storage: FileStorage})
+	require_NoError(t, err)
+	defer fs.Stop()
+	for _, subject := range []string{"foo.a", "foo.a", "foo.a", "foo.b", "foo.b", "foo.b"} {
+		_, _, err := fs.StoreMsg(subject, nil, []byte("x"), 0)
+		require_NoError(t, err)
+	}
+
+	filters := []string{"foo.*", "foo.a"}
+	const maxSeq = 5
+	want := []uint64{3, 5}
+	seqs, err := fs.MultiLastSeqs(filters, maxSeq, 0)
+	require_NoError(t, err)
+	if !slices.Equal(seqs, want) {
+		t.Errorf("MultiLastSeqs: expected %v, got %v", want, seqs)
+	}
+	var delivered []uint64
+	total, pending, err := fs.MultiLastMsgs(filters, 0, maxSeq, 1024, func(sm *StoreMsg, _ uint64) bool {
+		delivered = append(delivered, sm.seq)
+		return true
+	})
+	require_NoError(t, err)
+	require_Equal(t, total, uint64(len(want)))
+	require_Equal(t, pending, uint64(0))
+	if !slices.Equal(delivered, want) {
+		t.Errorf("MultiLastMsgs: expected %v, got %v", want, delivered)
+	}
 }
 
 func TestFileStoreMultiLastSeqsMaxAllowed(t *testing.T) {
@@ -8960,6 +9129,82 @@ func Benchmark_FileStoreCreateConsumerStores(b *testing.B) {
 	}
 }
 
+func BenchmarkFileStoreLoadNextMsgMultiRepeatedSubjects(b *testing.B) {
+	benchmarkFileStoreLoadMsgMulti(b, false)
+}
+
+func BenchmarkFileStoreLoadPrevMsgMultiRepeatedSubjects(b *testing.B) {
+	benchmarkFileStoreLoadMsgMulti(b, true)
+}
+
+func benchmarkFileStoreLoadMsgMulti(b *testing.B, reverse bool) {
+	for _, test := range []struct {
+		name   string
+		keys   int
+		msgs   int
+		pad    int
+		blocks int
+		filter string
+	}{
+		{"RepeatedMoreSubjects", 4000, 40000, 0, 1, "data.*.*"},
+		{"RepeatedAcrossBlocks", 2000, 16000, 2048, 5, "data.*.*"},
+		{"RepeatedWildcardIndex", 256, 8192, 0, 1, "data.>"},
+		{"Unique", 20000, 80000, 0, 1, "data.*.*"},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			fs, err := newFileStore(
+				FileStoreConfig{StoreDir: b.TempDir(), BlockSize: 8 * 1024 * 1024},
+				StreamConfig{Name: "bench", Subjects: []string{"data.*.*"}, Storage: FileStorage})
+			require_NoError(b, err)
+			defer fs.Stop()
+
+			payload := append([]byte(`{"v": 1}`), bytes.Repeat([]byte(" "), test.pad)...)
+			for i := range test.msgs {
+				subj := fmt.Sprintf("data.%016x.k%d", (i/4)%test.keys, i%4+1)
+				_, _, err := fs.StoreMsg(subj, nil, payload, 0)
+				require_NoError(b, err)
+			}
+			require_Equal(b, fs.numMsgBlocks(), test.blocks)
+
+			loadMsg := fs.LoadNextMsgMulti
+			first, end, step := 1, test.msgs+1, 1
+			if reverse {
+				loadMsg = fs.LoadPrevMsgMulti
+				first, end, step = test.msgs, 0, -1
+			}
+
+			for _, multi := range []bool{true, false} {
+				name := "Single"
+				sl := gsl.NewSublist[struct{}]()
+				if multi {
+					name = "Multi"
+					for kind := 1; kind <= 4; kind++ {
+						require_NoError(b, sl.Insert(fmt.Sprintf("data.*.k%d", kind), struct{}{}))
+					}
+				} else {
+					require_NoError(b, sl.Insert(test.filter, struct{}{}))
+				}
+				b.Run(name, func(b *testing.B) {
+					var smv StoreMsg
+					b.ReportAllocs()
+					b.ResetTimer()
+					for range b.N {
+						for seq := first; seq != end; seq += step {
+							sm, nseq, err := loadMsg(sl, uint64(seq), &smv)
+							if err != nil {
+								b.Fatal(err)
+							}
+							if nseq != uint64(seq) || sm.seq != uint64(seq) {
+								b.Fatalf("Expected sequence %d, got %d (%d)", seq, nseq, sm.seq)
+							}
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestFileStoreMaxMsgsPerSubjectOneStaleFblkAfterRestart(t *testing.T) {
 	sd := t.TempDir()
 	fcfg := FileStoreConfig{StoreDir: sd, BlockSize: 256}
@@ -9296,6 +9541,57 @@ func TestFileStoreRecoverFullStateDetectCorruptState(t *testing.T) {
 
 	err = fs.recoverFullState()
 	require_Error(t, err, errCorruptState)
+}
+
+func TestFileStoreRecoverFullStateBoundsCounts(t *testing.T) {
+	fcfg := FileStoreConfig{StoreDir: t.TempDir()}
+	cfg := StreamConfig{Name: "zzz", Subjects: []string{"foo.*"}, Storage: FileStorage}
+	fs, err := newFileStore(fcfg, cfg)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	msg := []byte("abc")
+	for i := 1; i <= 10; i++ {
+		_, _, err = fs.StoreMsg(fmt.Sprintf("foo.%d", i), nil, msg, 0)
+		require_NoError(t, err)
+	}
+
+	key := sha256.Sum256([]byte(cfg.Name))
+	hh, err := highwayhash.NewDigest64(key[:])
+	require_NoError(t, err)
+
+	for _, test := range []struct {
+		title  string
+		fields []uint64
+	}{
+		{"SubjectCount", []uint64{1 << 40}},
+		{"SubjectLen", []uint64{1, math.MaxInt64}},
+		{"BlockCount", []uint64{0, 1 << 62}},
+	} {
+		t.Run(test.title, func(t *testing.T) {
+			fs.Stop()
+
+			// Empty stream state, followed by the counts under test and some padding.
+			buf := []byte{fullStateMagic, fullStateVersion, 0, 0, 0, 0, 0, 0}
+			for _, f := range test.fields {
+				buf = binary.AppendUvarint(buf, f)
+			}
+			buf = append(buf, make([]byte, 32)...)
+			hh.Reset()
+			hh.Write(buf)
+			buf = hh.Sum(buf)
+			sfile := filepath.Join(fcfg.StoreDir, msgDir, streamStreamStateFile)
+			require_NoError(t, os.WriteFile(sfile, buf, defaultFilePerms))
+
+			// Must reject the state and rebuild from the blocks.
+			fs, err = newFileStore(fcfg, cfg)
+			require_NoError(t, err)
+			state := fs.State()
+			require_Equal(t, state.Msgs, 10)
+			require_Equal(t, state.FirstSeq, 1)
+			require_Equal(t, state.LastSeq, 10)
+		})
+	}
 }
 
 func TestFileStoreResetConsumerToStreamState(t *testing.T) {
@@ -10681,9 +10977,25 @@ func TestFileStoreRecoverDoesNotResetStreamState(t *testing.T) {
 }
 
 func TestFileStoreAccessTimeSpinUp(t *testing.T) {
-	// In case running lots of tests.
-	time.Sleep(time.Second)
-	ngr := runtime.NumGoroutine()
+	// Only count the access time Go routine, other tests may still be spinning down theirs.
+	numAtsGoroutines := func() int {
+		buf := make([]byte, 1<<20)
+		for {
+			n := runtime.Stack(buf, true)
+			if n < len(buf) {
+				return strings.Count(string(buf[:n]), "server/ats.Register.func")
+			}
+			buf = make([]byte, 2*len(buf))
+		}
+	}
+
+	// In case running lots of tests, give other filestores a chance to stop.
+	// Another filestore could still be registered, so this is our baseline.
+	baseline := numAtsGoroutines()
+	for start := time.Now(); baseline > 0 && time.Since(start) < 2*time.Second; {
+		time.Sleep(50 * time.Millisecond)
+		baseline = numAtsGoroutines()
+	}
 
 	fs, err := newFileStore(
 		FileStoreConfig{StoreDir: t.TempDir()},
@@ -10693,12 +11005,16 @@ func TestFileStoreAccessTimeSpinUp(t *testing.T) {
 
 	at := ats.AccessTime()
 	require_True(t, at != 0)
+	require_True(t, numAtsGoroutines() >= 1)
 
 	// Now check we also cleanup.
 	fs.Stop()
-	time.Sleep(2 * ats.TickInterval)
-	ngra := runtime.NumGoroutine()
-	require_Equal(t, ngr, ngra)
+	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		if n := numAtsGoroutines(); n > baseline {
+			return fmt.Errorf("expected access time Go routines to return to %d, got %d", baseline, n)
+		}
+		return nil
+	})
 }
 
 func TestFileStoreUpdateConfigTTLState(t *testing.T) {
@@ -13816,6 +14132,80 @@ func TestFileStoreLoadNextMsgSkipAhead(t *testing.T) {
 	}
 }
 
+func TestFileStoreLoadNextMsgSkipCheckNotOnSecondToLastBlock(t *testing.T) {
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: t.TempDir()},
+		StreamConfig{Name: "zzz", Subjects: []string{"foo.>"}, Storage: FileStorage})
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	// The filtered subject first appears at the head of the stream, so psim's fblk
+	// for it points at the first block, like long-lived subjects in a stream with MaxAge.
+	_, _, err = fs.StoreMsg("foo.a1.b.c0.d.e.hit", nil, nil, 0)
+	require_NoError(t, err)
+
+	// Just under the subject count where the single wildcard check is skipped.
+	const filler = 60_000
+	for i := range filler {
+		_, _, err = fs.StoreMsg(fmt.Sprintf("foo.a%d.b.%d.d.e.row", i%50, i), nil, nil, 0)
+		require_NoError(t, err)
+	}
+
+	// A caught-up consumer resumes from a sequence in the second-to-last block,
+	// and the next message for it lands in the last block.
+	_, err = fs.newMsgBlockForWrite()
+	require_NoError(t, err)
+	start, _, err := fs.StoreMsg("foo.a2.b.other.d.e.row", nil, nil, 0)
+	require_NoError(t, err)
+	_, err = fs.newMsgBlockForWrite()
+	require_NoError(t, err)
+	target, _, err := fs.StoreMsg("foo.a1.b.c0.d.e.hit", nil, nil, 0)
+	require_NoError(t, err)
+
+	fs.mu.RLock()
+	psimSize, nblks := fs.psim.Size(), len(fs.blks)
+	bi, _ := fs.selectMsgBlockWithIndex(start)
+	fs.mu.RUnlock()
+	require_True(t, psimSize < 64*1024)
+	require_Equal(t, bi, nblks-2)
+
+	sl := gsl.NewSublist[struct{}]()
+	for i := range 45 {
+		require_NoError(t, sl.Insert(fmt.Sprintf("foo.*.*.c%d.*.e.>", i), struct{}{}))
+	}
+
+	for _, test := range []struct {
+		title string
+		load  func(smp *StoreMsg) (*StoreMsg, uint64, error)
+	}{
+		// The selective token comes last, so matching this filter visits every subject.
+		{"Wildcard", func(smp *StoreMsg) (*StoreMsg, uint64, error) {
+			return fs.LoadNextMsg("foo.*.*.*.*.*.hit", true, start, smp)
+		}},
+		// Wildcards come before the selective token, so the intersect can't prune early.
+		{"Multi", func(smp *StoreMsg) (*StoreMsg, uint64, error) {
+			return fs.LoadNextMsgMulti(sl, start, smp)
+		}},
+	} {
+		t.Run(test.title, func(t *testing.T) {
+			// Take the fastest of a few calls so scheduling noise can't fail the test.
+			var smv StoreMsg
+			took := time.Duration(math.MaxInt64)
+			for range 5 {
+				s := time.Now()
+				sm, _, err := test.load(&smv)
+				elapsed := time.Since(s)
+				require_NoError(t, err)
+				require_Equal(t, sm.seq, target)
+				took = min(took, elapsed)
+			}
+			t.Logf("Load took %v with %d subjects", took, psimSize)
+			// Only the last block is left to scan, so this should not cost anything near a psim walk.
+			require_LessThan(t, took, time.Millisecond)
+		})
+	}
+}
+
 func TestFileStoreLoadNextMsgMultiSkipAhead(t *testing.T) {
 	test := func(t *testing.T, headStart, singleSubjPerBlock bool) {
 		testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
@@ -15121,6 +15511,37 @@ func TestFileStoreNoDirectoryNotEmptyError(t *testing.T) {
 		err = obs.Delete()
 		require_NoError(t, err)
 		wg.Wait()
+	}
+}
+
+func TestFileStoreConsumerNoMetaWriteAfterClose(t *testing.T) {
+	for _, op := range []string{"Stop", "Delete"} {
+		t.Run(op, func(t *testing.T) {
+			// Writes after close would end up in the working directory.
+			cwd := t.TempDir()
+			t.Chdir(cwd)
+
+			fs, err := newFileStore(FileStoreConfig{StoreDir: t.TempDir()}, StreamConfig{Name: "TEST", Storage: FileStorage, Subjects: []string{"foo"}})
+			require_NoError(t, err)
+			defer fs.Stop()
+
+			cfg := ConsumerConfig{Durable: "CONSUMER", AckPolicy: AckExplicit}
+			obs, err := fs.ConsumerStore("CONSUMER", time.Time{}, &cfg)
+			require_NoError(t, err)
+			o := obs.(*consumerFileStore)
+
+			if op == "Stop" {
+				require_NoError(t, o.Stop())
+			} else {
+				require_NoError(t, o.Delete())
+			}
+			require_Error(t, o.UpdateConfig(&cfg), ErrStoreClosed)
+			require_Error(t, o.updateConfig(cfg), ErrStoreClosed)
+
+			entries, err := os.ReadDir(cwd)
+			require_NoError(t, err)
+			require_Len(t, len(entries), 0)
+		})
 	}
 }
 

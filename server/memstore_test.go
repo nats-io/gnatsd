@@ -339,6 +339,46 @@ func TestMemStoreMsgHeaders(t *testing.T) {
 	}
 }
 
+func TestMemStoreStoreMsgPrivateCopy(t *testing.T) {
+	tests := []struct {
+		name string
+		hdr  []byte
+		msg  []byte
+	}{
+		{"body", nil, []byte("message")},
+		{"header and body", []byte("NATS/1.0 200 OK\r\n\r\n"), []byte("message")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ms, err := newMemStore(&StreamConfig{Name: "priv", Storage: MemoryStorage})
+			require_NoError(t, err)
+			defer ms.Stop()
+
+			wantHdr := bytes.Clone(tt.hdr)
+			wantMsg := bytes.Clone(tt.msg)
+			seq, _, err := ms.StoreMsg("priv", tt.hdr, tt.msg, 0)
+			require_NoError(t, err)
+
+			for i := range tt.hdr {
+				tt.hdr[i] = 0xEE
+			}
+			for i := range tt.msg {
+				tt.msg[i] = 0xEE
+			}
+
+			sm, err := ms.LoadMsg(seq, nil)
+			require_NoError(t, err)
+			if !bytes.Equal(sm.hdr, wantHdr) {
+				t.Fatalf("Stored header changed: got %q, want %q", sm.hdr, wantHdr)
+			}
+			if !bytes.Equal(sm.msg, wantMsg) {
+				t.Fatalf("Stored message changed: got %q, want %q", sm.msg, wantMsg)
+			}
+		})
+	}
+}
+
 func TestMemStoreStreamStateDeleted(t *testing.T) {
 	ms, err := newMemStore(&StreamConfig{Storage: MemoryStorage})
 	require_NoError(t, err)
@@ -1628,6 +1668,39 @@ func TestMemStoreMultiLastSeqsDoesNotUseStaleLastValue(t *testing.T) {
 ///////////////////////////////////////////////////////////////////////////
 // Benchmarks
 ///////////////////////////////////////////////////////////////////////////
+
+func Benchmark_MemStoreStoreMsg(b *testing.B) {
+	for _, size := range []int{64, 256, 1024, 4096, 16384, 65536, 131072, 262144, 524288, 983040} {
+		b.Run(fmt.Sprintf("payload=%d", size), func(b *testing.B) {
+			benchMemStoreStore(b, 0, size)
+		})
+	}
+}
+
+func Benchmark_MemStoreStoreMsgHdr(b *testing.B) {
+	for _, size := range []int{64, 4096, 65536, 262144, 983040} {
+		b.Run(fmt.Sprintf("payload=%d", size), func(b *testing.B) {
+			benchMemStoreStore(b, 512, size)
+		})
+	}
+}
+
+func benchMemStoreStore(b *testing.B, hdrSize, msgSize int) {
+	ms, err := newMemStore(&StreamConfig{Name: "bench", Storage: MemoryStorage, MaxMsgs: 1024})
+	require_NoError(b, err)
+	defer ms.Stop()
+
+	hdr := make([]byte, hdrSize)
+	msg := make([]byte, msgSize)
+	b.SetBytes(int64(hdrSize + msgSize))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, _, err := ms.StoreMsg("bench", hdr, msg, 0); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
 
 func Benchmark_MemStoreNumPendingWithLargeInteriorDeletesScan(b *testing.B) {
 	cfg := &StreamConfig{

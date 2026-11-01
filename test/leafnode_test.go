@@ -23,6 +23,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1579,7 +1580,7 @@ func TestLeafNodeOperatorAndPermissions(t *testing.T) {
 	defer os.Remove(conf)
 	defer s.Shutdown()
 
-	acc, akp := createAccount(t, s)
+	_, akp := createAccount(t, s)
 	kp, _ := nkeys.CreateUser()
 	pub, _ := kp.PublicKey()
 
@@ -1669,8 +1670,22 @@ func TestLeafNodeOperatorAndPermissions(t *testing.T) {
 	}
 	leafnc.Flush()
 
-	// Make sure the interest on "bar" from "sl" server makes it to the "s" server.
-	checkSubInterest(t, s, acc.GetName(), "bar", time.Second)
+	// Make sure the interest on "bar" and "*" from "sl" server makes it to the "s" server.
+	// Can't use checkSubInterest since the local sub on "*" on "s" already matches.
+	checkFor(t, time.Second, 15*time.Millisecond, func() error {
+		leafz, err := s.Leafz(&server.LeafzOptions{Subscriptions: true})
+		if err != nil {
+			return err
+		}
+		if len(leafz.Leafs) != 1 {
+			return fmt.Errorf("expected 1 leaf, got %d", len(leafz.Leafs))
+		}
+		subs := leafz.Leafs[0].Subs
+		if !slices.Contains(subs, "bar") || !slices.Contains(subs, "*") {
+			return fmt.Errorf("leaf interest not registered yet: %v", subs)
+		}
+		return nil
+	})
 	// Check for local interest too.
 	checkSubInterest(t, sl, "$G", "bar", time.Second)
 

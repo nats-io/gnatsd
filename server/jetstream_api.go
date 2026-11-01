@@ -402,6 +402,15 @@ func generateJSMappingTable(domain string) map[string]string {
 // JSMaxDescription is the maximum description length for streams and consumers.
 const JSMaxDescriptionLen = 4 * 1024
 
+const (
+	// S2 framing constants, mirrored from github.com/klauspost/compress/s2 where they are unexported.
+	s2MagicChunk      = "\xff\x06\x00\x00S2sTwO"
+	s2ChunkHeaderSize = 4
+	s2MaxChunkSize    = 1<<24 - 1
+	// jsRestoreFormatDetectLimit bounds bytes buffered while detecting the snapshot format: the S2 stream identifier plus one maximum-sized S2 chunk.
+	jsRestoreFormatDetectLimit = len(s2MagicChunk) + s2ChunkHeaderSize + s2MaxChunkSize
+)
+
 // JSMaxMetadataLen is the maximum length for streams and consumers metadata map.
 // It's calculated by summing length of all keys and values.
 const JSMaxMetadataLen = 128 * 1024
@@ -4492,10 +4501,12 @@ func (s *Server) processStreamRestore(ci *ClientInfo, acc *Account, cfg *StreamC
 
 		// Determine the snapshot format.
 		var consumed bytes.Buffer
-		tee := io.TeeReader(pr, &consumed)
+		tee := io.TeeReader(io.LimitReader(pr, int64(jsRestoreFormatDetectLimit)), &consumed)
 		sr := s2.NewReader(tee)
 		var preamble [8]byte
-		if _, err = io.ReadFull(sr, preamble[:]); err == nil {
+		if _, err = io.ReadFull(sr, preamble[:]); err != nil && consumed.Len() >= jsRestoreFormatDetectLimit {
+			err = errors.New("snapshot format not detected within size limit")
+		} else if err == nil {
 			replay := io.MultiReader(&consumed, pr)
 			if bytes.Equal(preamble[:], []byte(archive.MagicBytes)) {
 				mset, err = acc.RestoreStreamV2(cfg, replay)
@@ -4700,7 +4711,11 @@ func (s *Server) processStreamRestore(ci *ClientInfo, acc *Account, cfg *StreamC
 			case <-notActive.C:
 				err := fmt.Errorf("restore for stream '%s > %s' is stalled", acc.Name, streamName)
 				closeWithError(err)
-				doneCh <- err
+				// Wait for the restore to unwind, it may have created the stream already.
+				if !restoreDone {
+					restoreResult = <-restoreCh
+				}
+				finish(replySubj, err, restoreResult.mset)
 				return
 			}
 		}
@@ -5673,21 +5688,10 @@ func (s *Server) jsConsumerInfoRequest(sub *subscription, c *client, _ *Account,
 
 			// Check if we should ignore all together.
 			if node == nil {
-				// We have been assigned but have not created a node yet. If we are a member return
-				// our config and defaults for state and no cluster info.
+				// We have been assigned but have not created a node yet.
 				if isMember {
-					// Since we access consumerAssignment, need js lock.
-					js.mu.RLock()
-					resp.ConsumerInfo = &ConsumerInfo{
-						Stream:    ca.Stream,
-						Name:      ca.Name,
-						Created:   ca.Created,
-						Config:    setDynamicConsumerMetadata(ca.Config),
-						TimeStamp: time.Now().UTC(),
-					}
-					b := s.jsonResponse(resp)
-					js.mu.RUnlock()
-					s.sendAPIResponse(ci, acc, subject, reply, string(msg), b)
+					resp.Error = NewJSConsumerNotFoundError()
+					s.sendDelayedAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp), nil, errRespDelay)
 				}
 				return
 			}

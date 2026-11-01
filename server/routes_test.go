@@ -1372,6 +1372,52 @@ func TestRouteCloseTLSConnection(t *testing.T) {
 	ch <- true
 }
 
+func TestRouteNoPoolRejectsRoutePoolIdx(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		poolSize int
+		info     string
+	}{
+		{"remote out of range", 0, `"route_pool_size":0,"route_pool_idx":3`},
+		{"remote in range", 0, `"route_pool_size":0,"route_pool_idx":2`},
+		{"remote negative", 0, `"route_pool_size":0,"route_pool_idx":-1`},
+		{"local out of range", -1, `"route_pool_size":3,"route_pool_idx":3`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			o := DefaultOptions()
+			o.Cluster.Name = "A"
+			o.Cluster.Host = "127.0.0.1"
+			o.Cluster.Port = -1
+			o.Cluster.PoolSize = test.poolSize
+			s := RunServer(o)
+			defer s.Shutdown()
+
+			conn, err := net.DialTimeout("tcp", net.JoinHostPort(o.Cluster.Host, fmt.Sprintf("%d", o.Cluster.Port)), 2*time.Second)
+			require_NoError(t, err)
+			defer conn.Close()
+
+			_, err = conn.Write([]byte("CONNECT {\"name\":\"route\",\"verbose\":false,\"pedantic\":false,\"cluster\":\"A\"}\r\n"))
+			require_NoError(t, err)
+			_, err = conn.Write(fmt.Appendf(nil, "INFO {\"server_id\":\"route\",\"name\":\"route\",\"cluster\":\"A\",%s}\r\n", test.info))
+			require_NoError(t, err)
+
+			// The route must be rejected as a protocol violation.
+			require_NoError(t, conn.SetReadDeadline(time.Now().Add(2*time.Second)))
+			br := bufio.NewReader(conn)
+			for {
+				line, err := br.ReadString('\n')
+				require_NoError(t, err)
+				if strings.HasPrefix(line, "-ERR") {
+					require_Contains(t, line, "Route pool index should not be set")
+					break
+				}
+			}
+			require_True(t, s.Running())
+			require_Equal(t, s.NumRoutes(), 0)
+		})
+	}
+}
+
 func TestRouteClusterNameConflictBetweenStaticAndDynamic(t *testing.T) {
 	o1 := DefaultOptions()
 	o1.Cluster.Name = "AAAAAAAAAAAAAAAAAAAA" // make it alphabetically the "smallest"
@@ -2798,6 +2844,78 @@ func TestRoutePerAccountImplicit(t *testing.T) {
 	// Wait a bit to make sure there is a disconnect, then check the cluster is ok
 	time.Sleep(250 * time.Millisecond)
 	checkClusterFormed(t, s1, s2, s3)
+}
+
+func TestRoutePerAccountInboundStatsCountedOnce(t *testing.T) {
+	tmpl := `
+		port: -1
+		accounts {
+			A { users: [{user: "a", password: "a"}] }
+			B { users: [{user: "b", password: "b"}] }
+		}
+		cluster {
+			port: -1
+			name: "local"
+			accounts: ["A"]
+			%s
+		}
+	`
+	conf1 := createConfFile(t, []byte(fmt.Sprintf(tmpl, _EMPTY_)))
+	s1, o1 := RunServerWithConfig(conf1)
+	defer s1.Shutdown()
+
+	conf2 := createConfFile(t, []byte(fmt.Sprintf(tmpl,
+		fmt.Sprintf("routes: [\"nats://127.0.0.1:%d\"]", o1.Cluster.Port))))
+	s2, _ := RunServerWithConfig(conf2)
+	defer s2.Shutdown()
+
+	checkClusterFormed(t, s1, s2)
+
+	const n = 10
+	payload := []byte("hello")
+
+	// Account A has a dedicated route, account B uses the pool. Messages that
+	// reach s2 only over a route must count once in the account's received
+	// totals either way, matching the route breakdown and the sender's count.
+	for _, acc := range []string{"A", "B"} {
+		t.Run(acc, func(t *testing.T) {
+			user := strings.ToLower(acc)
+			s2nc := natsConnect(t, s2.ClientURL(), nats.UserInfo(user, user))
+			defer s2nc.Close()
+			sub := natsSubSync(t, s2nc, "foo")
+			natsFlush(t, s2nc)
+
+			s1nc := natsConnect(t, s1.ClientURL(), nats.UserInfo(user, user))
+			defer s1nc.Close()
+			checkSubInterest(t, s1, acc, "foo", time.Second)
+
+			for i := 0; i < n; i++ {
+				natsPub(t, s1nc, "foo", payload)
+			}
+			for i := 0; i < n; i++ {
+				natsNexMsg(t, sub, time.Second)
+			}
+
+			checkFor(t, time.Second, 15*time.Millisecond, func() error {
+				stz, err := s2.AccountStatz(&AccountStatzOptions{Accounts: []string{acc}})
+				if err != nil {
+					return err
+				}
+				if len(stz.Accounts) != 1 {
+					return fmt.Errorf("expected 1 account, got %d", len(stz.Accounts))
+				}
+				recv := stz.Accounts[0].Received
+				if recv.Routes == nil || recv.Routes.Msgs != n {
+					return fmt.Errorf("expected %d route msgs received, got %+v", n, recv.Routes)
+				}
+				if recv.Msgs != n || recv.Bytes != int64(n*len(payload)) {
+					return fmt.Errorf("expected %d msgs and %d bytes received, got %d and %d",
+						n, n*len(payload), recv.Msgs, recv.Bytes)
+				}
+				return nil
+			})
+		})
+	}
 }
 
 func TestRoutePerAccountDefaultForSysAccount(t *testing.T) {
@@ -5911,4 +6029,27 @@ func TestRouteReconnectAfterDuplicateRouteAdoptsConfiguredURL(t *testing.T) {
 	checkSubInterest(t, sa, globalAccountName, "pinned.echo", 2*time.Second)
 	_, err = nca.Request("pinned.echo", []byte("ping"), time.Second)
 	require_NoError(t, err)
+}
+
+func TestRouteLogsRemoteURL(t *testing.T) {
+	o1 := DefaultOptions()
+	o1.Cluster.Username = remoteURLLogUser
+	o1.Cluster.Password = remoteURLLogPassword
+	s1 := RunServer(o1)
+	defer s1.Shutdown()
+
+	routeHost := fmt.Sprintf("localhost:%d", o1.Cluster.Port)
+	o2 := DefaultOptions()
+	o2.Cluster.resolver = &localhostResolver{}
+	o2.Routes = []*url.URL{{Scheme: "nats", Host: routeHost, User: url.UserPassword(remoteURLLogUser, remoteURLLogPassword)}}
+	s2, l := runServerWithNoticeLogger(t, o2)
+	defer s2.Shutdown()
+
+	checkClusterFormed(t, s1, s2)
+	checkNoticeContains(t, l, "Route connection created ("+routeHost+")")
+
+	s1.Shutdown()
+	checkNoticeContains(t, l, "Router connection closed: "+ClientClosed.String()+" - Remote: "+s1.Name()+", Host: "+routeHost)
+	s2.Shutdown()
+	checkNoticeNotContains(t, l, remoteURLLogUser, remoteURLLogPassword)
 }

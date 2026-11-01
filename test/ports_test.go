@@ -30,11 +30,12 @@ import (
 func waitForFile(path string, dur time.Duration) ([]byte, error) {
 	end := time.Now().Add(dur)
 	for time.Now().Before(end) {
-		if _, err := os.Stat(path); os.IsNotExist(err) {
+		// The file is created before it's written to, so also wait for it to be non-empty.
+		if buf, err := os.ReadFile(path); os.IsNotExist(err) || (err == nil && len(buf) == 0) {
 			time.Sleep(25 * time.Millisecond)
 			continue
 		} else {
-			return os.ReadFile(path)
+			return buf, err
 		}
 	}
 	return nil, errors.New("Timeout")

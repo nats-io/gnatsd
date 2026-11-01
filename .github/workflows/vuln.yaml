@@ -19,8 +19,8 @@ jobs:
     steps:
       - name: Run govulncheck
         # Use commit hash here to avoid a re-tagging attack, as this is a third-party action
-        # Commit b625fbe08f3bccbe446d94fbf87fcc875a4f50ee = tag v1.0.4
-        uses: golang/govulncheck-action@b625fbe08f3bccbe446d94fbf87fcc875a4f50ee
+        # Commit 032d45514ae346b1db93c04b0c90b841c370344f = tag v1.1.0
+        uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f
         with:
           go-package: ./...
           output-format: sarif

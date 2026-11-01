@@ -977,6 +977,36 @@ func TestMonitorConnzOffsetOverflow(t *testing.T) {
 	require_NoError(t, err)
 }
 
+func TestMonitorConnzSortedPaging(t *testing.T) {
+	s := runMonitorServer()
+	defer s.Shutdown()
+
+	// All clients tie on these sort options.
+	clients := make([]*nats.Conn, 50)
+	for i := range clients {
+		clients[i] = createClientConnSubscribeAndPublish(t, s)
+		defer clients[i].Close()
+	}
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
+	for _, sortOpt := range []SortOpt{BySubs, ByPending, ByOutMsgs, ByInMsgs, ByOutBytes, ByInBytes} {
+		for mode := range 2 {
+			// Paging must return every connection exactly once.
+			seen := make(map[uint64]struct{})
+			for offset := 0; offset < 50; offset += 10 {
+				c := pollConnz(t, s, mode, fmt.Sprintf("%sconnz?sort=%s&offset=%d&limit=10", url, sortOpt, offset),
+					&ConnzOptions{Sort: sortOpt, Offset: offset, Limit: 10})
+				require_Equal(t, c.Total, 50)
+				require_Len(t, len(c.Conns), 10)
+				for _, ci := range c.Conns {
+					seen[ci.Cid] = struct{}{}
+				}
+			}
+			require_Len(t, len(seen), 50)
+		}
+	}
+}
+
 func TestMonitorConnzDefaultSorted(t *testing.T) {
 	s := runMonitorServer()
 	defer s.Shutdown()
@@ -1966,6 +1996,40 @@ func TestMonitorSubszMultiAccount(t *testing.T) {
 				t.Fatalf("Expected account information to be present and be 'A', got %q", sd.Account)
 			}
 		}
+	}
+}
+
+func TestMonitorSubszMultiAccountPaging(t *testing.T) {
+	s := runMonitorServer()
+	defer s.Shutdown()
+
+	ncA := createClientConnWithUserSubscribeAndPublish(t, s, "a", "a")
+	defer ncA.Close()
+	ncB := createClientConnWithUserSubscribeAndPublish(t, s, "b", "b")
+	defer ncB.Close()
+
+	for _, nc := range []*nats.Conn{ncA, ncB} {
+		for i := range 200 {
+			_, err := nc.Subscribe(fmt.Sprintf("foo.%d", i), func(m *nats.Msg) {})
+			require_NoError(t, err)
+		}
+		require_NoError(t, nc.Flush())
+	}
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
+	for mode := range 2 {
+		// Paging must return every subscription exactly once.
+		seen := make(map[SubDetail]struct{})
+		for offset := 0; offset < 400; offset += 100 {
+			sl := pollSubsz(t, s, mode, fmt.Sprintf("%ssubsz?subs=1&offset=%d&limit=100", url, offset),
+				&SubszOptions{Subscriptions: true, Offset: offset, Limit: 100})
+			require_Equal(t, sl.Total, 400)
+			require_Len(t, len(sl.Subs), 100)
+			for _, sd := range sl.Subs {
+				seen[sd] = struct{}{}
+			}
+		}
+		require_Len(t, len(seen), 400)
 	}
 }
 
@@ -6359,6 +6423,49 @@ func TestMonitorConnzOperatorModeFilterByUser(t *testing.T) {
 	}
 }
 
+func TestMonitorConnzTotalReflectsFilters(t *testing.T) {
+	s := runMonitorServerWithAccounts()
+	defer s.Shutdown()
+
+	ncA := createClientConnWithUserSubscribeAndPublish(t, s, "a", "a")
+	defer ncA.Close()
+	for i := 0; i < 3; i++ {
+		nc := createClientConnWithUserSubscribeAndPublish(t, s, "b", "b")
+		defer nc.Close()
+	}
+	ncSub := createClientConnWithUserSubscribeAndPublish(t, s, "b", "b")
+	defer ncSub.Close()
+	sub, err := ncSub.SubscribeSync("only.here")
+	require_NoError(t, err)
+	defer sub.Unsubscribe()
+	require_NoError(t, ncSub.Flush())
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
+	for _, tc := range []struct {
+		name     string
+		url      string
+		opts     *ConnzOptions
+		expected int
+	}{
+		{"user", "connz?user=a", &ConnzOptions{User: "a"}, 1},
+		{"user no match", "connz?user=nobody", &ConnzOptions{User: "nobody"}, 0},
+		{"user paged", "connz?user=b&limit=1", &ConnzOptions{User: "b", Limit: 1}, 4},
+		// filter_subject is not an HTTP query parameter, only via Connz()/system request.
+		{"filter subject", _EMPTY_, &ConnzOptions{Account: "B", FilterSubject: "only.here"}, 1},
+		{"account", "connz?acc=B", &ConnzOptions{Account: "B"}, 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for mode := 0; mode < 2; mode++ {
+				if mode == 0 && tc.url == _EMPTY_ {
+					continue
+				}
+				c := pollConnz(t, s, mode, url+tc.url, tc.opts)
+				require_Equal(t, c.Total, tc.expected)
+			}
+		})
+	}
+}
+
 func TestMonitorConnzSortByRTT(t *testing.T) {
 	s := runMonitorServer()
 	defer s.Shutdown()
@@ -7113,4 +7220,188 @@ func TestConnzClosedSubsDetailNoSharedMutation(t *testing.T) {
 	if c.Conns[0].SubsDetail != nil {
 		t.Fatalf("Plain closed-conn query unexpectedly carried SubsDetail: %+v", c.Conns[0].SubsDetail)
 	}
+}
+
+// Returns a listener that is never accepted from, so that a leafnode remote
+// pointed at it can dial but never completes the connect process, and no other
+// process can take its port while the test runs.
+func monitorHealthzStalledRemoteURL(t *testing.T) *url.URL {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require_NoError(t, err)
+	t.Cleanup(func() { ln.Close() })
+	u, err := url.Parse(fmt.Sprintf("nats://%s", ln.Addr()))
+	require_NoError(t, err)
+	return u
+}
+
+func TestMonitorHealthzLeafRemotes(t *testing.T) {
+	ho := DefaultOptions()
+	ho.Port = -1
+	ho.Cluster.Name = "hub"
+	ho.LeafNode.Host = "127.0.0.1"
+	ho.LeafNode.Port = -1
+	hub := RunServer(ho)
+	defer hub.Shutdown()
+
+	u, err := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", ho.LeafNode.Port))
+	require_NoError(t, err)
+
+	lo := DefaultOptions()
+	lo.Port = -1
+	lo.Cluster.Name = "leaf"
+	lo.HTTPHost = "127.0.0.1"
+	lo.HTTPPort = -1
+	lo.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{u}}}
+	leaf := RunServer(lo)
+	defer leaf.Shutdown()
+
+	addr := leaf.MonitorAddr().String()
+	get := func(query string) (int, HealthStatus) {
+		t.Helper()
+		resp, err := http.Get(fmt.Sprintf("http://%s/healthz%s", addr, query))
+		require_NoError(t, err)
+		defer resp.Body.Close()
+		var hs HealthStatus
+		require_NoError(t, json.NewDecoder(resp.Body).Decode(&hs))
+		return resp.StatusCode, hs
+	}
+	checkStatus := func(query string, expected int) {
+		t.Helper()
+		checkFor(t, 10*time.Second, 50*time.Millisecond, func() error {
+			if code, hs := get(query); code != expected {
+				return fmt.Errorf("status %d, expected %d: %s", code, expected, hs.Error)
+			}
+			return nil
+		})
+	}
+
+	// Remote connects.
+	checkStatus("?leaf-remotes-connected=true", http.StatusOK)
+	code, hs := get("?leaf-remotes-connected=true&details=true")
+	require_Equal(t, code, http.StatusOK)
+	require_Equal(t, len(hs.Errors), 0)
+
+	// Drop the link and prevent it from coming back.
+	leaf.closeAndDisableLeafnodes()
+	checkStatus("?leaf-remotes-connected=true", http.StatusServiceUnavailable)
+	// Plain healthz is unaffected by the remote being down.
+	code, _ = get("")
+	require_Equal(t, code, http.StatusOK)
+	code, hs = get("?leaf-remotes-connected=true")
+	require_Equal(t, code, http.StatusServiceUnavailable)
+	require_True(t, strings.Contains(hs.Error, "is not connected"))
+	code, hs = get("?leaf-remotes-connected=true&details=true")
+	require_Equal(t, code, http.StatusServiceUnavailable)
+	require_Equal(t, len(hs.Errors), 1)
+	require_Equal(t, hs.Errors[0].Type, HealthzErrorConn)
+
+	// Allow it to reconnect.
+	leaf.reEnableLeafnodes()
+	checkStatus("?leaf-remotes-connected=true", http.StatusOK)
+}
+
+func TestMonitorHealthzLeafRemotesMultipleAndDisabled(t *testing.T) {
+	// None of these remotes can complete a connection.
+	a, b, c := monitorHealthzStalledRemoteURL(t), monitorHealthzStalledRemoteURL(t), monitorHealthzStalledRemoteURL(t)
+	conf := createConfFile(t, fmt.Appendf(nil, `
+		listen: 127.0.0.1:-1
+		http: 127.0.0.1:-1
+		accounts {
+			A { users = [ { user: "a", pass: "p" } ] }
+			B { users = [ { user: "b", pass: "p" } ] }
+			C { users = [ { user: "c", pass: "p" } ] }
+		}
+		leafnodes {
+			remotes = [
+				{ url: "%s", account: "A" }
+				{ url: "%s", account: "B" }
+				{ url: "%s", account: "C", disabled: true }
+			]
+		}
+	`, a, b, c))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	hs := s.Healthz(&HealthzOptions{LeafRemotesConnected: true, Details: true})
+	require_Equal(t, hs.StatusCode, http.StatusServiceUnavailable)
+	require_Equal(t, hs.Status, "error")
+	// Both enabled remotes are reported, in a stable order, and the disabled one is not.
+	require_Equal(t, len(hs.Errors), 2)
+	require_True(t, strings.Contains(hs.Errors[0].Error, `account "A"`))
+	require_True(t, strings.Contains(hs.Errors[1].Error, `account "B"`))
+	for _, he := range hs.Errors {
+		require_Equal(t, he.Type, HealthzErrorConn)
+		require_False(t, strings.Contains(he.Error, `account "C"`))
+	}
+
+	// Without details, only the first error is returned.
+	hs = s.Healthz(&HealthzOptions{LeafRemotesConnected: true})
+	require_Equal(t, hs.StatusCode, http.StatusServiceUnavailable)
+	require_True(t, strings.Contains(hs.Error, `account "A"`))
+	require_False(t, strings.Contains(hs.Error, `account "B"`))
+	require_False(t, strings.Contains(hs.Error, `account "C"`))
+
+	// Same server without the option is healthy.
+	hs = s.Healthz(nil)
+	require_Equal(t, hs.StatusCode, http.StatusOK)
+}
+
+func TestMonitorHealthzLeafRemotesErrorDoesNotLeakSecrets(t *testing.T) {
+	u := monitorHealthzStalledRemoteURL(t)
+	creds := filepath.Join(t.TempDir(), "secret-creds-file.creds")
+	conf := createConfFile(t, fmt.Appendf(nil, `
+		listen: 127.0.0.1:-1
+		leafnodes {
+			remotes = [ { url: "nats://user:s3cr3tpass@%s", credentials: %q } ]
+		}
+	`, u.Host, creds))
+	// The credentials file does not need to be valid for the remote to be configured.
+	require_NoError(t, os.WriteFile(creds, []byte("x"), 0600))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	hs := s.Healthz(&HealthzOptions{LeafRemotesConnected: true})
+	require_Equal(t, hs.StatusCode, http.StatusServiceUnavailable)
+	for _, secret := range []string{"s3cr3tpass", "secret-creds-file", "credentials"} {
+		require_False(t, strings.Contains(hs.Error, secret))
+	}
+}
+
+func TestMonitorHealthzLeafRemotesSystemAccountRequest(t *testing.T) {
+	u := monitorHealthzStalledRemoteURL(t)
+	conf := createConfFile(t, fmt.Appendf(nil, `
+		listen: 127.0.0.1:-1
+		accounts {
+			A { users = [ { user: "a", pass: "p" } ] }
+			$SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] }
+		}
+		leafnodes {
+			remotes = [ { url: "%s", account: "A" } ]
+		}
+	`, u))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	nc, err := nats.Connect(s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+
+	request := func(payload string) HealthStatus {
+		t.Helper()
+		msg, err := nc.Request(fmt.Sprintf("$SYS.REQ.SERVER.%s.HEALTHZ", s.ID()), []byte(payload), 2*time.Second)
+		require_NoError(t, err)
+		var resp struct {
+			Data HealthStatus `json:"data"`
+		}
+		require_NoError(t, json.Unmarshal(msg.Data, &resp))
+		return resp.Data
+	}
+
+	hs := request(`{"leaf-remotes-connected":true}`)
+	require_Equal(t, hs.StatusCode, http.StatusServiceUnavailable)
+	require_True(t, strings.Contains(hs.Error, "is not connected"))
+
+	hs = request(`{}`)
+	require_Equal(t, hs.StatusCode, http.StatusOK)
 }

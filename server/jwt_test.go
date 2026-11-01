@@ -2067,8 +2067,8 @@ func TestJWTAccountURLResolverPermanentFetchFailure(t *testing.T) {
 	o := LoadConfig(confA)
 	sA := RunServer(o)
 	defer sA.Shutdown()
-	l := &captureDebugLogger{dbgCh: make(chan string, 100)} // has enough space to not block
-	sA.SetLogger(l, true, false)
+	l := &captureErrorLogger{errCh: make(chan string, 100)} // has enough space to not block
+	sA.SetLogger(l, false, false)
 	// Create clients
 	ncA := natsConnect(t, sA.ClientURL(), createUserCreds(t, nil, impkp))
 	defer ncA.Close()
@@ -2085,14 +2085,14 @@ func TestJWTAccountURLResolverPermanentFetchFailure(t *testing.T) {
 	defer tmr.Stop()
 	for {
 		select {
-		case line := <-l.dbgCh:
-			if strings.HasPrefix(line, "Error adding stream import to account") {
+		case line := <-l.errCh:
+			if strings.HasPrefix(line, "Error adding stream import") {
 				importErrCnt++
 			}
 		case <-tmr.C:
-			// connecting and updating, each cause 3 traces (2 + 1 on iteration) + 1 xtra fetch
+			// connecting and updating, each cause 3 errors (2 + 1 on iteration) + 1 extra fetch
 			if importErrCnt != 7 {
-				t.Fatalf("Expected 7 debug traces, got %d", importErrCnt)
+				t.Fatalf("Expected 7 import errors, got %d", importErrCnt)
 			}
 			return
 		}
@@ -4670,6 +4670,53 @@ func TestJWTLimitsTemplate(t *testing.T) {
 			require_True(t, false)
 		}
 	})
+}
+
+func TestJWTScopedSigningKeyTemplateProxyRequired(t *testing.T) {
+	kp, _ := nkeys.CreateAccount()
+	aPub, _ := kp.PublicKey()
+	claim := jwt.NewAccountClaims(aPub)
+	aSignScopedKp, aSignScopedPub := createKey(t)
+	signer := jwt.NewUserScope()
+	signer.Key = aSignScopedPub
+	signer.Template.ProxyRequired = true
+	claim.SigningKeys.AddScopedSigner(signer)
+	aJwt, err := claim.Encode(oKp)
+	require_NoError(t, err)
+	conf := createConfFile(t, fmt.Appendf(nil, `
+		listen: 127.0.0.1:-1
+		operator: %s
+		resolver: MEM
+		resolver_preload: {
+			%s: %s
+		}
+    `, ojwt, aPub, aJwt))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	l := &captureProxyRequiredLogger{ch: make(chan string, 1)}
+	s.SetLogger(l, true, false)
+
+	// The user JWT itself doesn't require a proxy, only the scoped template does.
+	ukp, _ := nkeys.CreateUser()
+	seed, _ := ukp.Seed()
+	upub, _ := ukp.PublicKey()
+	uclaim := newJWTTestUserClaims()
+	uclaim.Subject = upub
+	uclaim.SetScoped(true)
+	uclaim.IssuerAccount = aPub
+	require_False(t, uclaim.ProxyRequired)
+	ujwt, err := uclaim.Encode(aSignScopedKp)
+	require_NoError(t, err)
+	creds := genCredsFile(t, ujwt, seed)
+
+	_, err = nats.Connect(s.ClientURL(), nats.UserCredentials(creds))
+	require_True(t, errors.Is(err, nats.ErrAuthorization))
+	select {
+	case <-l.ch:
+	case <-time.After(time.Second):
+		t.Fatal("Expected proxy required error")
+	}
 }
 
 func TestJWTNoOperatorMode(t *testing.T) {
@@ -8227,4 +8274,154 @@ func TestJWTSystemAccountJetStreamDomainMapping(t *testing.T) {
 	defer nc.Close()
 	_, err := nc.Request(domainAPI[:len(domainAPI)-1]+"INFO", nil, 2*time.Second)
 	require_NoError(t, err)
+}
+
+func TestJWTAccountImportExportAccountFunctions(t *testing.T) {
+	sysKp, syspub := createKey(t)
+	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
+	sysCreds := newUser(t, sysKp)
+
+	expKp, expPub := createKey(t)
+	impKp, impPub := createKey(t)
+	expHash, impHash := getHash(expPub), getHash(impPub)
+
+	expAC := jwt.NewAccountClaims(expPub)
+	expAC.Exports.Add(&jwt.Export{Subject: "$JS.FC._.{{account-hash()}}.>", Type: jwt.Service})
+	expAC.Exports.Add(&jwt.Export{Subject: "events.{{account-hash()}}.*", Type: jwt.Stream})
+	expJwt := encodeClaim(t, expAC, expPub)
+
+	impAC := jwt.NewAccountClaims(impPub)
+	impAC.Imports.Add(&jwt.Import{Account: expPub, Subject: "$JS.FC._.{{account-hash-import()}}.>", Type: jwt.Service})
+	impAC.Imports.Add(&jwt.Import{Account: expPub, Subject: "events.{{account-hash-import()}}.*", LocalSubject: "in.{{account-hash()}}.*", Type: jwt.Stream})
+	impAC.AddMapping("m.{{account-hash()}}", jwt.WeightedMapping{Subject: "mapped.{{account-hash()}}"})
+	impJwtMap := encodeClaim(t, impAC, impPub)
+	impAC.Mappings = nil
+	impJwtNoMap := encodeClaim(t, impAC, impPub)
+
+	dirSrv := t.TempDir()
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:-1
+		operator: %s
+		system_account: %s
+		resolver: {
+			type: full
+			dir: '%s'
+		}
+    `, ojwt, syspub, dirSrv)))
+	srv, _ := RunServerWithConfig(conf)
+	defer srv.Shutdown()
+	require_Len(t, 1, updateJwt(t, srv.ClientURL(), sysCreds, sysJwt, 1))
+	require_Len(t, 1, updateJwt(t, srv.ClientURL(), sysCreds, expJwt, 1))
+	require_Len(t, 1, updateJwt(t, srv.ClientURL(), sysCreds, impJwtMap, 1))
+
+	ncExp := natsConnect(t, srv.ClientURL(), createUserCreds(t, srv, expKp))
+	defer ncExp.Close()
+	ncImp := natsConnect(t, srv.ClientURL(), createUserCreds(t, srv, impKp))
+	defer ncImp.Close()
+
+	// Service import: the importer reaches the exporter's hash scoped subject.
+	expSub := natsSubSync(t, ncExp, "$JS.FC._."+expHash+".>")
+	natsFlush(t, ncExp)
+	natsPub(t, ncImp, "$JS.FC._."+expHash+".ping", []byte("fc"))
+	m := natsNexMsg(t, expSub, time.Second)
+	require_Equal(t, m.Subject, "$JS.FC._."+expHash+".ping")
+
+	// Stream import with a renamed local subject.
+	impSub := natsSubSync(t, ncImp, "in."+impHash+".*")
+	natsFlush(t, ncImp)
+	natsPub(t, ncExp, "events."+expHash+".x", []byte("ev"))
+	m = natsNexMsg(t, impSub, time.Second)
+	require_Equal(t, m.Subject, "in."+impHash+".x")
+
+	// Account mapping.
+	mapSub := natsSubSync(t, ncImp, "mapped."+impHash)
+	natsFlush(t, ncImp)
+	natsPub(t, ncImp, "m."+impHash, []byte("map"))
+	natsNexMsg(t, mapSub, time.Second)
+
+	// Updating the claims with the same mapping must keep it (the stored source is the resolved one).
+	require_Len(t, 1, updateJwt(t, srv.ClientURL(), sysCreds, impJwtMap, 1))
+	natsPub(t, ncImp, "m."+impHash, []byte("map"))
+	natsNexMsg(t, mapSub, time.Second)
+
+	// Removing it from the claims removes it, the imports are still in place.
+	require_Len(t, 1, updateJwt(t, srv.ClientURL(), sysCreds, impJwtNoMap, 1))
+	natsPub(t, ncImp, "m."+impHash, []byte("map"))
+	natsFlush(t, ncImp)
+	if _, err := mapSub.NextMsg(100 * time.Millisecond); err == nil {
+		t.Fatalf("Did not expect the mapping to still be in place")
+	}
+	natsPub(t, ncImp, "$JS.FC._."+expHash+".ping", []byte("fc"))
+	m = natsNexMsg(t, expSub, time.Second)
+	require_Equal(t, m.Subject, "$JS.FC._."+expHash+".ping")
+}
+
+func TestClaimValidateAccountFunctionMappings(t *testing.T) {
+	_, aPub := createKey(t)
+
+	claim := jwt.NewAccountClaims(aPub)
+	claim.AddMapping("foo.{{account-hash()}}", jwt.WeightedMapping{Subject: "bar.{{account-hash()}}"})
+	require_NoError(t, claimValidate(claim))
+
+	claim = jwt.NewAccountClaims(aPub)
+	claim.AddMapping("foo", jwt.WeightedMapping{Subject: "{{account-hash-import()}}"})
+	require_Error(t, claimValidate(claim), ErrMappingFunctionNotAvailable)
+
+	claim = jwt.NewAccountClaims(aPub)
+	claim.AddMapping("foo.{{account-hash-leaf-remote()}}", jwt.WeightedMapping{Subject: "bar"})
+	require_Error(t, claimValidate(claim), ErrMappingFunctionNotAvailable)
+}
+
+// A real account connection limit must still be reported as such, and not
+// as an authentication error.
+func TestJWTAccountMaxConnsStillReportedAsAccountLimit(t *testing.T) {
+	s := opTrustBasicSetup()
+	defer s.Shutdown()
+	buildMemAccResolver(s)
+
+	okp, _ := nkeys.FromSeed(oSeed)
+
+	fooKP, _ := nkeys.CreateAccount()
+	fooPub, _ := fooKP.PublicKey()
+	fooAC := jwt.NewAccountClaims(fooPub)
+	fooAC.Limits.Conn = 1
+	fooJWT, err := fooAC.Encode(okp)
+	require_NoError(t, err)
+	addAccountToMemResolver(s, fooPub, fooJWT)
+
+	c1, cr1, cs1 := createClient(t, s, fooKP)
+	defer c1.close()
+	c1.parseAsync(cs1)
+	l, _ := cr1.ReadString('\n')
+	if !strings.HasPrefix(l, "PONG") {
+		t.Fatalf("Expected PONG, got %q", l)
+	}
+
+	el := &captureErrorLogger{errCh: make(chan string, 10)}
+	s.SetLogger(el, false, false)
+
+	// This one exceeds the account connection limit.
+	c2, cr2, cs2 := createClient(t, s, fooKP)
+	defer c2.close()
+	c2.parseAsync(cs2)
+	l, _ = cr2.ReadString('\n')
+	if !strings.Contains(l, ErrTooManyAccountConnections.Error()) {
+		t.Fatalf("Expected the account connection limit error, got %q", l)
+	}
+
+	// The server must report the limit, not an authentication violation.
+	var errs []string
+	for done := false; !done; {
+		select {
+		case e := <-el.errCh:
+			errs = append(errs, e)
+		case <-time.After(500 * time.Millisecond):
+			done = true
+		}
+	}
+	for _, e := range errs {
+		if strings.Contains(e, ErrAuthentication.Error()) {
+			t.Fatalf("account connection limit was reported as an authentication error: %q", e)
+		}
+	}
 }

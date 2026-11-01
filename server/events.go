@@ -682,7 +682,7 @@ func (s *Server) sendLDMShutdownEventLocked() {
 	}
 	subj := fmt.Sprintf(lameDuckEventSubj, s.info.ID)
 	si := &ServerInfo{}
-	s.sys.sendq.push(newPubMsg(nil, subj, _EMPTY_, si, nil, si, noCompression, false, true))
+	s.sys.sendq.push(newPubMsg(nil, subj, _EMPTY_, si, nil, si, noCompression, false, false))
 }
 
 // Will send a shutdown message.
@@ -1100,6 +1100,12 @@ func (s *Server) limitStatsz(subj string) bool {
 	// Only limit the normal broadcast subject.
 	if subj != fmt.Sprintf(serverStatsSubj, s.ID()) {
 		return false
+	}
+
+	// Peers mark us offline when we enter lame duck mode. A broadcast
+	// statsz would mark us online again and make us a placement target.
+	if s.ldm {
+		return true
 	}
 
 	interval := statszRateLimit
@@ -3025,13 +3031,15 @@ func totalSubs(rr *SublistResult, qg []byte) (nsubs int32) {
 	if rr == nil {
 		return
 	}
+	var total uint64
 	checkSub := func(sub *subscription) {
 		// TODO(dlc) - This could be smarter.
 		if qg != nil && !bytes.Equal(qg, sub.queue) {
 			return
 		}
+		// A leaf queue sub counts as the number of members it represents.
 		if sub.client.kind == CLIENT || sub.client.isHubLeafNode() {
-			nsubs++
+			total += qsubWeight(sub)
 		}
 	}
 	if qg == nil {
@@ -3044,7 +3052,7 @@ func totalSubs(rr *SublistResult, qg []byte) (nsubs int32) {
 			checkSub(sub)
 		}
 	}
-	return
+	return int32(min(total, math.MaxInt32))
 }
 
 // Allows users of large systems to debug active subscribers for a given subject.

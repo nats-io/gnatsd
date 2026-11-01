@@ -109,6 +109,14 @@ loop:
 	return n
 }
 
+// Largest queue weight parseSize accepts on the wire.
+const maxQueueWeight = 999_999_999
+
+// Converts a queue weight total to the weight sent to a route or leaf.
+func queueWeight(n int64) int32 {
+	return int32(min(n, maxQueueWeight))
+}
+
 // parseInt64 expects decimal positive numbers. We
 // return -1 to signal error
 func parseInt64(d []byte) (n int64) {

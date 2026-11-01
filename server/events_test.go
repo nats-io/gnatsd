@@ -1333,7 +1333,10 @@ func TestAccountReqMonitoring(t *testing.T) {
 	require_NoError(t, nc.Publish("foo", nil))
 	require_NoError(t, nc.Flush())
 	checkFor(t, time.Second, 10*time.Millisecond, func() error {
-		if stats := acc.statz(); stats.Received.Msgs == 0 {
+		acc.mu.RLock()
+		stats := acc.statz()
+		acc.mu.RUnlock()
+		if stats.Received.Msgs == 0 {
 			return fmt.Errorf("publish not accounted for yet")
 		}
 		return nil

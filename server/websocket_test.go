@@ -4776,6 +4776,37 @@ func testWSNoCorruptionWithFrameSizeLimit(t *testing.T, total int) {
 		s.mu.RUnlock()
 	}
 
+	// Wait until both subscribers have received at least target messages in
+	// total. Delivery can be slow on a loaded machine, so only give up once
+	// it has stopped making progress.
+	waitForCount := func(target int) {
+		t.Helper()
+		last, lastProgress := int32(-1), time.Now()
+		for {
+			n := atomic.LoadInt32(&count)
+			if int(n) >= target {
+				return
+			}
+			if n != last {
+				last, lastProgress = n, time.Now()
+			} else if time.Since(lastProgress) > 10*time.Second {
+				t.Fatalf("Test timed out: received %d of %d messages, slow consumers: %d, %d, %d",
+					n, target, s1.NumSlowConsumers(), s2.NumSlowConsumers(), s3.NumSlowConsumers())
+			}
+			select {
+			case err := <-errCh:
+				t.Fatalf("Error: %v", err)
+			case <-doneCh:
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+	}
+
+	// Bound how far the publisher gets ahead of the subscribers. Without it,
+	// a slow machine lets the backlog to a subscriber outgrow max_pending, the
+	// server drops it as a slow consumer, and the messages never arrive.
+	const maxInFlight = 2000
 	for i := 0; i < total; i++ {
 		natsPub(t, nc1, "foo", payload)
 		if i%100 == 0 {
@@ -4784,16 +4815,12 @@ func testWSNoCorruptionWithFrameSizeLimit(t *testing.T, total int) {
 				t.Fatalf("Error: %v", err)
 			default:
 			}
+			if i >= maxInFlight {
+				waitForCount(2 * (i - maxInFlight))
+			}
 		}
 	}
-	select {
-	case err := <-errCh:
-		t.Fatalf("Error: %v", err)
-	case <-doneCh:
-		return
-	case <-time.After(10 * time.Second):
-		t.Fatalf("Test timed out")
-	}
+	waitForCount(2 * total)
 }
 
 func TestWSNoCorruptionWithFrameSizeLimit(t *testing.T) {

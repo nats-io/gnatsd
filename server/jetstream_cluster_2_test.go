@@ -1077,10 +1077,18 @@ func metaPeerRemove(t *testing.T, nc *nats.Conn, subject, peer string) *ApiError
 	t.Helper()
 	req, err := json.Marshal(&JSApiMetaServerRemoveRequest{Server: peer})
 	require_NoError(t, err)
-	rmsg, err := nc.Request(subject, req, 5*time.Second)
-	require_NoError(t, err)
 	var resp JSApiMetaServerRemoveResponse
-	require_NoError(t, json.Unmarshal(rmsg.Data, &resp))
+	// A previous membership change can still be committing, retry until it's done.
+	checkFor(t, 5*time.Second, 50*time.Millisecond, func() error {
+		rmsg, err := nc.Request(subject, req, 5*time.Second)
+		require_NoError(t, err)
+		resp = JSApiMetaServerRemoveResponse{}
+		require_NoError(t, json.Unmarshal(rmsg.Data, &resp))
+		if resp.Error != nil && resp.Error.ErrCode == uint16(JSClusterServerMemberChangeInflightErr) {
+			return resp.Error
+		}
+		return nil
+	})
 	return resp.Error
 }
 
@@ -5301,6 +5309,22 @@ func TestJetStreamClusterStreamAdvisories(t *testing.T) {
 			t.Fatalf("Got an unexpected error response: %+v", resresp.Error)
 		}
 
+		// The restore subscription may live on another server, so retry until its interest has propagated.
+		sendChunk := func(data []byte) *nats.Msg {
+			t.Helper()
+			var rmsg *nats.Msg
+			checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+				var err error
+				rmsg, err = nc.Request(resresp.DeliverSubject, data, time.Second)
+				if errors.Is(err, nats.ErrNoResponders) {
+					return err
+				}
+				require_NoError(t, err)
+				return nil
+			})
+			return rmsg
+		}
+
 		// Send our snapshot back in to restore the stream.
 		// Can be any size message.
 		var chunk [1024]byte
@@ -5309,12 +5333,9 @@ func TestJetStreamClusterStreamAdvisories(t *testing.T) {
 			if err != nil {
 				break
 			}
-			nc.Request(resresp.DeliverSubject, chunk[:n], time.Second)
+			sendChunk(chunk[:n])
 		}
-		rmsg, err = nc.Request(resresp.DeliverSubject, nil, time.Second)
-		if err != nil {
-			t.Fatalf("Unexpected error: %v", err)
-		}
+		rmsg = sendChunk(nil)
 		resresp.Error = nil
 		json.Unmarshal(rmsg.Data, &resresp)
 		if resresp.Error != nil {
@@ -5421,7 +5442,7 @@ func TestJetStreamClusterDuplicateMsgIdsOnCatchupAndLeaderTakeover(t *testing.T)
 	require_NoError(t, err)
 	if node := mset.raftNode(); node == nil {
 		t.Fatalf("Could not get stream group name")
-	} else if err := node.InstallSnapshot(mset.stateSnapshot(), false); err != nil {
+	} else if err := node.InstallSnapshot(mset.stateSnapshot(), true); err != nil {
 		t.Fatalf("Error installing snapshot: %v", err)
 	}
 
@@ -7028,8 +7049,10 @@ func TestJetStreamClusterEncryptedDoubleSnapshotBug(t *testing.T) {
 	nl := c.randomNonStreamLeader("$G", "TEST")
 	mset, err := nl.GlobalAccount().lookupStream("TEST")
 	require_NoError(t, err)
-	err = mset.raftNode().InstallSnapshot(mset.stateSnapshot(), false)
-	require_NoError(t, err)
+	// The follower might not have applied any entries yet, so retry until a snapshot can be made.
+	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		return mset.raftNode().InstallSnapshot(mset.stateSnapshot(), false)
+	})
 
 	_, err = js.Publish("foo", []byte("SNAP2"))
 	require_NoError(t, err)
@@ -7398,7 +7421,13 @@ func TestJetStreamClusterStreamResetWithLargeFirstSeq(t *testing.T) {
 	// We want to make sure we do not send unnecessary skip msgs when we know we do not have all of these messages.
 	ncs, _ := jsClientConnect(t, sl, nats.UserInfo("admin", "s3cr3t!"))
 	defer nc.Close()
-	sub, err := ncs.SubscribeSync("$JSC.R.>")
+	// Stream info answers to the leader share the reply prefix, only count catchup msgs.
+	var catchupMsgs atomic.Int64
+	_, err = ncs.Subscribe("$JSC.R.>", func(msg *nats.Msg) {
+		if len(msg.Data) == 0 || msg.Data[0] != '{' {
+			catchupMsgs.Add(1)
+		}
+	})
 	require_NoError(t, err)
 
 	// Now scale up to R3.
@@ -7412,7 +7441,7 @@ func TestJetStreamClusterStreamResetWithLargeFirstSeq(t *testing.T) {
 
 	// Make sure we only sent the number of catchup msgs we expected.
 	checkFor(t, 5*time.Second, 50*time.Millisecond, func() error {
-		if nmsgs, _, _ := sub.Pending(); nmsgs != (cfg.Replicas-1)*(num+1) {
+		if nmsgs := int(catchupMsgs.Load()); nmsgs != (cfg.Replicas-1)*(num+1) {
 			return fmt.Errorf("expected %d catchup msgs, but got %d", (cfg.Replicas-1)*(num+1), nmsgs)
 		}
 		return nil
@@ -8903,8 +8932,7 @@ func TestJetStreamClusterDesyncAfterFailedScaleUp(t *testing.T) {
 		require_NoError(t, o.raftNode().InstallSnapshot(state, false))
 		consumerGroup := o.raftNode().Group()
 
-		// Stop stream/consumer leader, and clear state on the followers except for meta.
-		sl.Shutdown()
+		// Clear state on the followers except for meta, and stop stream/consumer leader.
 		for _, s := range c.servers {
 			if s == sl {
 				continue
@@ -8917,6 +8945,8 @@ func TestJetStreamClusterDesyncAfterFailedScaleUp(t *testing.T) {
 				require_NoError(t, os.RemoveAll(filepath.Join(sd, DEFAULT_SYSTEM_ACCOUNT, defaultStoreDirName, consumerGroup)))
 			}
 		}
+		// Stop the leader last, otherwise its stepdown on shutdown lets a follower get ahead of its log.
+		sl.Shutdown()
 
 		// Restart all servers except the leader.
 		for _, s := range c.servers {
@@ -9032,17 +9062,21 @@ func TestJetStreamClusterSelectPeerToAdd(t *testing.T) {
 			peers[id] = &lps{ts: ts}
 			s.nodeToInfo.Store(id, nodeInfo{})
 		}
-		for id := range observed {
+		// Observed learners have caught up, unless a test says otherwise.
+		learners := make(map[string]*lps, len(observed))
+		for id, ts := range observed {
 			s.nodeToInfo.Store(id, nodeInfo{})
+			learners[id] = &lps{ts: ts, li: 1}
 		}
-		return &raft{peers: peers, observed: observed}
+		return &raft{peers: peers, observed: learners}
 	}
 	selectFor := func(n *raft, candidates []string) string {
 		var current []*Peer
 		for id, ps := range n.peers {
 			current = append(current, &Peer{ID: id, Last: ps.ts})
 		}
-		return s.selectPeerToAdd(n, "A", current, candidates)
+		add, _ := s.selectPeerToAdd(n, "A", current, candidates)
+		return add
 	}
 
 	// No candidates to add.
@@ -9061,6 +9095,22 @@ func TestJetStreamClusterSelectPeerToAdd(t *testing.T) {
 	// A candidate heard too long ago doesn't count as heard.
 	n = newNode(map[string]time.Time{"A": {}}, map[string]time.Time{"B": now.Add(-4 * hbInterval)})
 	require_Equal(t, selectFor(n, []string{"B"}), _EMPTY_)
+
+	// A live candidate is only added once caught up.
+	n = newNode(map[string]time.Time{"A": {}}, map[string]time.Time{"D": now})
+	n.observed["D"].ci = 2
+	add, catchingUp := s.selectPeerToAdd(n, "A", nil, []string{"D"})
+	require_Equal(t, add, _EMPTY_)
+	require_True(t, catchingUp)
+
+	// A live candidate catching up is waited for, rather than adding an unheard one.
+	n = newNode(map[string]time.Time{"A": {}, "B": now, "C": now}, map[string]time.Time{"D": now})
+	n.observed["D"].ci = 2
+	require_Equal(t, selectFor(n, []string{"D", "E"}), _EMPTY_)
+
+	// Once caught up, the live candidate is preferred.
+	n.observed["D"].li = 2
+	require_Equal(t, selectFor(n, []string{"D", "E"}), "D")
 
 	// An unheard candidate can't be added to a group that would then require
 	// a quorum larger than its live members, e.g. growing R1 with an offline
@@ -9088,6 +9138,32 @@ func TestJetStreamClusterSelectPeerToAdd(t *testing.T) {
 	n = newNode(map[string]time.Time{"A": {}, "B": now, "C": now}, nil)
 	s.nodeToInfo.Store("C", nodeInfo{offline: true})
 	require_Equal(t, selectFor(n, []string{"D"}), _EMPTY_)
+
+	// As the only member, learners that aren't caught up are waited for at first.
+	n = newNode(map[string]time.Time{"A": {}}, map[string]time.Time{"E": now, "F": now})
+	for id, li := range map[string]uint64{"E": 5, "F": 7} {
+		n.observed[id].li, n.observed[id].ci, n.observed[id].fs = li, 10, now
+	}
+	add, catchingUp = s.selectPeerToAdd(n, "A", []*Peer{{ID: "A"}}, []string{"E", "F"})
+	require_Equal(t, add, _EMPTY_)
+	require_True(t, catchingUp)
+
+	// But our writes don't wait on them, so after a grace period the most caught up learner is added.
+	for _, id := range []string{"E", "F"} {
+		n.observed[id].fs = now.Add(-migrateFirstPeerGrace)
+	}
+	require_Equal(t, selectFor(n, []string{"E", "F"}), "F")
+
+	// A caught up learner is also preferred by how far it's caught up, rather than when we last heard from it.
+	n = newNode(map[string]time.Time{"A": {}}, map[string]time.Time{"E": now.Add(-hbInterval), "F": now})
+	n.observed["E"].li = 3
+	require_Equal(t, selectFor(n, []string{"E", "F"}), "E")
+
+	// The grace period doesn't apply with other members, as they already pace our writes.
+	n = newNode(map[string]time.Time{"A": {}, "B": now}, map[string]time.Time{"E": now})
+	ps := n.observed["E"]
+	ps.li, ps.ci, ps.fs = 5, 10, now.Add(-migrateFirstPeerGrace)
+	require_Equal(t, selectFor(n, []string{"E"}), _EMPTY_)
 }
 
 func TestJetStreamClusterStreamCatchupPeers(t *testing.T) {
@@ -9398,7 +9474,7 @@ func TestJetStreamClusterDesyncAfterDiskResetDuringRollout(t *testing.T) {
 }
 
 func TestJetStreamClusterEncryptedReplicaRecoversFromCorruptKeyFile(t *testing.T) {
-	test := func(truncateTo int64) {
+	test := func(t *testing.T, truncateTo int64) {
 		c := createJetStreamClusterWithTemplate(t, jsClusterEncryptedTempl, "C", 3)
 		defer c.shutdown()
 
@@ -9411,6 +9487,13 @@ func TestJetStreamClusterEncryptedReplicaRecoversFromCorruptKeyFile(t *testing.T
 			Replicas: 3,
 		})
 		require_NoError(t, err)
+
+		// Connect to the stream leader. The client must not be on the follower we shut down.
+		sl := c.streamLeader(globalAccountName, "TEST")
+		require_NotNil(t, sl)
+		nc.Close()
+		nc, js = jsClientConnect(t, sl)
+		defer nc.Close()
 
 		for range 100 {
 			_, err = js.Publish("foo", nil)
@@ -9463,7 +9546,7 @@ func TestJetStreamClusterEncryptedReplicaRecoversFromCorruptKeyFile(t *testing.T
 	// 64-71 bytes passes the size check but fails to open/convert the key.
 	for _, size := range []int64{0, 70} {
 		t.Run(fmt.Sprintf("TruncateTo%d", size), func(t *testing.T) {
-			test(size)
+			test(t, size)
 		})
 	}
 }

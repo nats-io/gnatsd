@@ -79,6 +79,75 @@ func (ss *SequenceSet) Exists(seq uint64) bool {
 	return false
 }
 
+// SpanEnd returns the last sequence in the consecutive span starting at seq.
+// If seq is not in the set, it returns 0, false.
+func (ss *SequenceSet) SpanEnd(seq uint64) (end uint64, found bool) {
+	if ss == nil {
+		return 0, false
+	}
+
+	// Keep only ancestors that are successors of the node being searched for.
+	var path [32]*node
+	parents := path[:0]
+	n := ss.root
+	for n != nil {
+		if seq < n.base {
+			parents = append(parents, n)
+			n = n.l
+		} else if seq-n.base >= numEntries {
+			n = n.r
+		} else {
+			break
+		}
+	}
+	if n == nil || !n.exists(seq) {
+		return 0, false
+	}
+
+	offset := seq - n.base
+	bucket, bit := offset/bitsPerBucket, offset%bitsPerBucket
+	for {
+		for ; bucket < numBuckets; bucket++ {
+			// Ignore bits before seq and find the first missing sequence.
+			if missing := ^n.bits[bucket] & (^uint64(0) << bit); missing != 0 {
+				delta := uint64(bits.TrailingZeros64(missing)) - bit
+				if delta > ^uint64(0)-seq {
+					return ^uint64(0), true
+				}
+				return seq + delta - 1, true
+			}
+			// A full word can be skipped, unless it reaches the sequence limit.
+			step := uint64(bitsPerBucket) - bit
+			if step > ^uint64(0)-seq {
+				return ^uint64(0), true
+			}
+			seq += step
+			bit = 0
+		}
+
+		// Advance to the next node in tree order without searching from the root.
+		if n.r != nil {
+			n = n.r
+			for n.l != nil {
+				parents = append(parents, n)
+				n = n.l
+			}
+		} else if len(parents) > 0 {
+			n = parents[len(parents)-1]
+			parents = parents[:len(parents)-1]
+		} else {
+			return seq - 1, true
+		}
+		// A gap in node coverage ends the span. SetInitialMin can leave an
+		// unaligned node overlapping its successor, so resume at seq's offset.
+		if n.base > seq || seq-n.base >= numEntries {
+			return seq - 1, true
+		}
+		offset = seq - n.base
+		bucket, bit = offset/bitsPerBucket, offset%bitsPerBucket
+	}
+}
+
 // SetInitialMin should be used to set the initial minimum sequence when known.
 // This will more effectively utilize space versus self selecting.
 // The set should be empty.

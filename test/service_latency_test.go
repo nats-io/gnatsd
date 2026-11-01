@@ -1921,3 +1921,106 @@ func TestServiceLatencyDoubleResponse(t *testing.T) {
 	rsub.NextMsg(time.Second)
 	time.Sleep(time.Second)
 }
+
+func TestServiceLatencyNoRaceOnUpdateClaims(t *testing.T) {
+	okp, _ := nkeys.FromSeed(oSeed)
+
+	// Create three accounts, system, service and normal account.
+	sysJWT, sysKP, _ := createAccountWithJWT(t)
+	sysPub, _ := sysKP.PublicKey()
+
+	_, svcKP, svcAcc := createAccountWithJWT(t)
+	svcPub, _ := svcKP.PublicKey()
+
+	// Add in the service export with latency tracking here.
+	serviceExport := &jwt.Export{Subject: "req.*", Type: jwt.Service}
+	svcAcc.Exports.Add(serviceExport)
+	svcJWT, err := svcAcc.Encode(okp)
+	if err != nil {
+		t.Fatalf("Error encoding service export: %v", err)
+	}
+
+	_, accKP, accAcc := createAccountWithJWT(t)
+	accPub, _ := accKP.PublicKey()
+
+	// Add in the import.
+	serviceImport := &jwt.Import{Account: svcPub, Subject: "request", To: "req.echo", Type: jwt.Service}
+	accAcc.Imports.Add(serviceImport)
+	accJWT, err := accAcc.Encode(okp)
+	if err != nil {
+		t.Fatalf("Error encoding service import: %v", err)
+	}
+
+	cf := `
+	listen: 127.0.0.1:-1
+	operator = "../test/configs/nkeys/op.jwt"
+	system_account = "%s"
+	resolver = MEMORY
+	resolver_preload = {
+		%s : "%s"
+		%s : "%s"
+		%s : "%s"
+	}
+	`
+	contents := strings.Replace(fmt.Sprintf(cf, sysPub, sysPub, sysJWT, svcPub, svcJWT, accPub, accJWT), "\n\t", "\n", -1)
+	conf := createConfFile(t, []byte(contents))
+
+	s, opts := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	// Create service provider.
+	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
+	nc, err := nats.Connect(url, createUserCreds(t, s, svcKP), nats.Name("fooService"))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	// The service listener.
+	nc.Subscribe("req.echo", func(msg *nats.Msg) {
+		time.Sleep(10 * time.Millisecond)
+		msg.Respond(msg.Data)
+	})
+	// Listen for metrics
+	nc.Subscribe("results", func(_ *nats.Msg) {})
+	nc.Flush()
+
+	nc2, err := nats.Connect(url, createUserCreds(t, s, accKP))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc2.Close()
+
+	updateAccount := func() {
+		t.Helper()
+		svcAccount, err := s.LookupAccount(svcPub)
+		if err != nil {
+			t.Fatalf("Could not lookup service account from server %+v", s)
+		}
+		s.UpdateAccountClaims(svcAccount, svcAcc)
+	}
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	doneCh := make(chan struct{})
+	go func() {
+		defer wg.Done()
+		for {
+			nc2.PublishRequest("request", "some.inbox", []byte("hello"))
+			select {
+			case <-doneCh:
+				return
+			default:
+			}
+		}
+	}()
+
+	for i := 99; i > 0; i-- {
+		serviceExport.Latency = &jwt.ServiceLatency{Sampling: jwt.SamplingRate(i), Results: "results"}
+		updateAccount()
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	close(doneCh)
+	wg.Wait()
+}

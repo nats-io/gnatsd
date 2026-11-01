@@ -4129,3 +4129,83 @@ func testOCSPResponderFailing(t *testing.T, method string) {
 		t.Errorf("Expected %q, got: %q", expected, err.Error())
 	}
 }
+
+func TestOCSPAlwaysUnauthorizedSignerDoesNotShutdown(t *testing.T) {
+	const (
+		caCert     = "configs/certs/ocsp/ca-cert.pem"
+		caKey      = "configs/certs/ocsp/ca-key.pem"
+		serverCert = "configs/certs/ocsp/server-cert.pem"
+		serverKey  = "configs/certs/ocsp/server-key.pem"
+		// Issued by the CA, but not authorized by it to act as OCSP signer.
+		badSignerCert = "configs/certs/ocsp/client-cert.pem"
+		badSignerKey  = "configs/certs/ocsp/client-key.pem"
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ocspr := NewOCSPResponder(t, caCert, caKey)
+	defer ocspr.Shutdown(ctx)
+	addr := fmt.Sprintf("http://%s", ocspr.Addr)
+	SetOCSPStatus(t, addr, serverCert, ocsp.Good)
+
+	badOcspr := NewOCSPResponderDesignatedCustomAddress(t, caCert, badSignerCert, badSignerKey, "127.0.0.1:8887")
+	defer badOcspr.Shutdown(ctx)
+	badAddr := fmt.Sprintf("http://%s", badOcspr.Addr)
+	SetOCSPStatus(t, badAddr, serverCert, ocsp.Revoked)
+
+	opts := server.Options{}
+	opts.Host = "127.0.0.1"
+	opts.NoLog = true
+	opts.NoSigs = true
+	opts.MaxControlLine = 4096
+	opts.Port = -1
+	opts.TLSCert = serverCert
+	opts.TLSKey = serverKey
+	opts.TLSCaCert = caCert
+	opts.TLSTimeout = 5
+	tcOpts := &server.TLSConfigOpts{
+		CertFile: opts.TLSCert,
+		KeyFile:  opts.TLSKey,
+		CaFile:   opts.TLSCaCert,
+		Timeout:  opts.TLSTimeout,
+	}
+
+	tlsConf, err := server.GenTLSConfig(tcOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts.TLSConfig = tlsConf
+
+	// The revoked status signed by an unauthorized signer must be ignored, falling back to the CA's responder.
+	opts.OCSPConfig = &server.OCSPConfig{
+		Mode:         server.OCSPModeAlways,
+		OverrideURLs: []string{badAddr, addr},
+	}
+	srv := RunServer(&opts)
+	defer srv.Shutdown()
+	l := &captureErrLogger{ch: make(chan string, 10)}
+	srv.SetLogger(l, false, false)
+
+	// The CA's responder becomes unavailable, so the next fetch of OCSP Staples only gets
+	// the revoked status signed by an unauthorized signer, which must still be ignored.
+	// The OCSP Responder instructs the NATS Server to fetch OCSP Staples every 2 seconds.
+	ocspr.Shutdown(ctx)
+	timeout := time.After(10 * time.Second)
+	for refreshed := false; !refreshed; {
+		select {
+		case msg := <-l.ch:
+			refreshed = strings.Contains(msg, "Bad OCSP status update")
+		case <-timeout:
+			t.Fatal("Expected OCSP status update from the unauthorized signer to be rejected")
+		}
+	}
+
+	nc, err := nats.Connect(fmt.Sprintf("tls://localhost:%d", opts.Port),
+		nats.RootCAs(caCert),
+		nats.ErrorHandler(noOpErrHandler),
+	)
+	if err != nil {
+		t.Fatalf("Expected server to not shutdown, got: %v", err)
+	}
+	nc.Close()
+}

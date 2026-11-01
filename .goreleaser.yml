@@ -21,7 +21,7 @@ builds:
     env:
       # This is the toolchain version we use for releases. To override, set the env var, e.g.:
       # GORELEASER_TOOLCHAIN="go1.22.8" TARGET='linux_amd64' goreleaser build --snapshot --clean --single-target
-      - GOTOOLCHAIN={{ envOrDefault "GORELEASER_TOOLCHAIN" "go1.27.1" }}
+      - GOTOOLCHAIN={{ envOrDefault "GORELEASER_TOOLCHAIN" "go1.27.3" }}
       - GO111MODULE=on
       - CGO_ENABLED=0
     goos:

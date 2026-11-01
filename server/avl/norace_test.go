@@ -125,56 +125,69 @@ func TestNoRaceSeqSetRelativeSpeed(t *testing.T) {
 	max := 3_000_000
 
 	seqs := make([]uint64, 0, num)
-	for i := 0; i < num; i++ {
+	for range num {
 		n := uint64(rand.Int64N(int64(max + 1)))
 		seqs = append(seqs, n)
 	}
 
-	start := time.Now()
-	// Now do SequenceSet on same dataset.
-	var sset SequenceSet
-	for _, n := range seqs {
-		sset.Insert(n)
-	}
-	ssInsertElapsed := time.Since(start)
-	logResults("Inserts SequenceSet: %v for %d items\n", ssInsertElapsed, num)
+	measure := func() error {
+		start := time.Now()
+		// Now do SequenceSet on same dataset.
+		var sset SequenceSet
+		for _, n := range seqs {
+			sset.Insert(n)
+		}
+		ssInsertElapsed := time.Since(start)
+		logResults("Inserts SequenceSet: %v for %d items\n", ssInsertElapsed, num)
 
-	start = time.Now()
-	for _, n := range seqs {
-		if ok := sset.Exists(n); !ok {
-			t.Fatalf("Should exist")
+		start = time.Now()
+		for _, n := range seqs {
+			if ok := sset.Exists(n); !ok {
+				t.Fatalf("Should exist")
+			}
+		}
+		ssLookupElapsed := time.Since(start)
+		logResults("Lookups: %v\n", ssLookupElapsed)
+
+		// Now do a map.
+		dmap := make(map[uint64]struct{})
+		start = time.Now()
+		for _, n := range seqs {
+			dmap[n] = struct{}{}
+		}
+		mapInsertElapsed := time.Since(start)
+		logResults("Inserts Map[uint64]: %v for %d items\n", mapInsertElapsed, num)
+
+		start = time.Now()
+		for _, n := range seqs {
+			if _, ok := dmap[n]; !ok {
+				t.Fatalf("Should exist")
+			}
+		}
+		mapLookupElapsed := time.Since(start)
+		logResults("Lookups: %v\n", mapLookupElapsed)
+
+		// In general we are between 1.5 and 1.75 times slower atm then a straight map.
+		// Let's test an upper bound of 2x for now.
+		if mapInsertElapsed*2 <= ssInsertElapsed {
+			return fmt.Errorf("Expected SequenceSet insert to be no more than 2x slower (%v vs %v)", mapInsertElapsed, ssInsertElapsed)
+		}
+
+		// Map lookups can be much faster on machines with large CPU caches, so allow up to 5x.
+		if mapLookupElapsed*5 <= ssLookupElapsed {
+			return fmt.Errorf("Expected SequenceSet lookups to be no more than 5x slower (%v vs %v)", mapLookupElapsed, ssLookupElapsed)
+		}
+		return nil
+	}
+
+	// Timings are sensitive to machine load, so allow a few attempts.
+	var err error
+	for range 5 {
+		if err = measure(); err == nil {
+			return
 		}
 	}
-	ssLookupElapsed := time.Since(start)
-	logResults("Lookups: %v\n", ssLookupElapsed)
-
-	// Now do a map.
-	dmap := make(map[uint64]struct{})
-	start = time.Now()
-	for _, n := range seqs {
-		dmap[n] = struct{}{}
-	}
-	mapInsertElapsed := time.Since(start)
-	logResults("Inserts Map[uint64]: %v for %d items\n", mapInsertElapsed, num)
-
-	start = time.Now()
-	for _, n := range seqs {
-		if _, ok := dmap[n]; !ok {
-			t.Fatalf("Should exist")
-		}
-	}
-	mapLookupElapsed := time.Since(start)
-	logResults("Lookups: %v\n", mapLookupElapsed)
-
-	// In general we are between 1.5 and 1.75 times slower atm then a straight map.
-	// Let's test an upper bound of 2x for now.
-	if mapInsertElapsed*2 <= ssInsertElapsed {
-		t.Fatalf("Expected SequenceSet insert to be no more than 2x slower (%v vs %v)", mapInsertElapsed, ssInsertElapsed)
-	}
-
-	if mapLookupElapsed*3 <= ssLookupElapsed {
-		t.Fatalf("Expected SequenceSet lookups to be no more than 3x slower (%v vs %v)", mapLookupElapsed, ssLookupElapsed)
-	}
+	t.Fatal(err)
 }
 
 // friendlyBytes returns a string with the given bytes int64
