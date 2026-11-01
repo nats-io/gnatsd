@@ -3530,7 +3530,7 @@ func TestJetStreamSnapshotV2ClampsConsumerStateToStream(t *testing.T) {
 	pr, pw := net.Pipe()
 	defer pr.Close()
 	errCh := make(chan error, 1)
-	go mset.js.streamSnapshotV2(mset.store, &streamState, pw, true, nil, errCh)
+	go mset.js.streamSnapshotV2(mset.store, &streamState, nil, pw, true, nil, errCh)
 
 	dec := s2.NewReader(pr)
 	r := archive.NewReader(dec)
@@ -4461,6 +4461,125 @@ func TestJetStreamSnapshotWithDeletedLastSeq(t *testing.T) {
 	si, err := js.StreamInfo("TEST")
 	require_NoError(t, err)
 	require_Equal(t, si.State.Msgs, uint64(9))
+}
+
+// A snapshot holds the stream as it was when it began, though messages it has
+// yet to read are removed while it reads: here each key of a key-value stream is
+// updated, which removes its older message, and the new one lies past the
+// snapshot's last sequence.
+func TestJetStreamSnapshotV2HoldsMessagesRemovedWhileReading(t *testing.T) {
+	for _, storage := range []StorageType{FileStorage, MemoryStorage} {
+		t.Run(storage.String(), func(t *testing.T) {
+			s := RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+
+			cfg := &StreamConfig{
+				Name:         "KV_TEST",
+				Subjects:     []string{"$KV.TEST.>"},
+				Storage:      storage,
+				MaxMsgsPer:   1,
+				AllowRollup:  true,
+				AllowDirect:  true,
+				DenyDelete:   true,
+				Discard:      DiscardNew,
+				MaxMsgSize:   -1,
+				MaxBytes:     -1,
+				MaxMsgs:      -1,
+				MaxConsumers: -1,
+				Duplicates:   2 * time.Minute,
+				Replicas:     1,
+			}
+			acc := s.GlobalAccount()
+			mset, err := acc.addStream(cfg)
+			require_NoError(t, err)
+
+			// Far more than the pipe and the compressor take before they wait for
+			// the reader, so the snapshot waits partway through.
+			const keys = 2000
+			value := func(key, round int) []byte {
+				v := make([]byte, 4096)
+				crand.Read(v)
+				copy(v, fmt.Sprintf("%d/%d/", key, round))
+				return v
+			}
+			for k := range keys {
+				_, _, err := mset.store.StoreMsg(fmt.Sprintf("$KV.TEST.k%d", k), nil, value(k, 0), 0)
+				require_NoError(t, err)
+			}
+
+			sr, err := mset.snapshot(0, false, true)
+			require_NoError(t, err)
+			require_Equal(t, sr.State.Msgs, keys)
+			require_Equal(t, sr.State.LastSeq, keys)
+
+			// Update every key while the snapshot waits to be read, as a
+			// key-value bucket's puts do: each removes the key's older message.
+			for k := range keys {
+				_, _, err := mset.store.StoreMsg(fmt.Sprintf("$KV.TEST.k%d", k), nil, value(k, 1), 0)
+				require_NoError(t, err)
+			}
+			var live StreamState
+			mset.store.FastState(&live)
+			require_Equal(t, live.Msgs, keys)
+			require_Equal(t, live.FirstSeq, keys+1)
+
+			snapshot, err := io.ReadAll(sr.Reader)
+			require_NoError(t, err)
+			require_NoError(t, <-sr.errCh)
+
+			require_NoError(t, mset.delete())
+			mset, err = acc.RestoreStreamV2(cfg, bytes.NewReader(snapshot))
+			require_NoError(t, err)
+
+			// The restore holds every key, as it was when the snapshot began.
+			var restored StreamState
+			mset.store.FastState(&restored)
+			require_Equal(t, restored.Msgs, sr.State.Msgs)
+			require_Equal(t, restored.FirstSeq, sr.State.FirstSeq)
+			require_Equal(t, restored.LastSeq, sr.State.LastSeq)
+			var smv StoreMsg
+			for k := range keys {
+				sm, err := mset.store.LoadLastMsg(fmt.Sprintf("$KV.TEST.k%d", k), &smv)
+				require_NoError(t, err)
+				require_Equal(t, sm.seq, uint64(k+1))
+				require_True(t, bytes.HasPrefix(sm.msg, fmt.Appendf(nil, "%d/0/", k)))
+			}
+		})
+	}
+}
+
+// A snapshot whose messages are purged before it reads them fails, rather than
+// leave them out.
+func TestJetStreamSnapshotV2FailsWhenPurgedWhileReading(t *testing.T) {
+	for _, storage := range []StorageType{FileStorage, MemoryStorage} {
+		t.Run(storage.String(), func(t *testing.T) {
+			s := RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+
+			mset, err := s.GlobalAccount().addStream(&StreamConfig{
+				Name:     "TEST",
+				Subjects: []string{"foo.>"},
+				Storage:  storage,
+			})
+			require_NoError(t, err)
+
+			v := make([]byte, 4096)
+			for i := range 2000 {
+				crand.Read(v)
+				_, _, err := mset.store.StoreMsg(fmt.Sprintf("foo.%d", i), nil, v, 0)
+				require_NoError(t, err)
+			}
+
+			sr, err := mset.snapshot(0, false, true)
+			require_NoError(t, err)
+			_, err = mset.store.Purge()
+			require_NoError(t, err)
+
+			_, err = io.ReadAll(sr.Reader)
+			require_NoError(t, err)
+			require_Error(t, <-sr.errCh, errSnapshotPurged)
+		})
+	}
 }
 
 func TestJetStreamSnapshotFailedAdvisoryHasError(t *testing.T) {

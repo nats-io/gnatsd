@@ -14,6 +14,7 @@
 package server
 
 import (
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"path"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/klauspost/compress/s2"
@@ -44,21 +46,32 @@ func (js *jetStream) CreateStreamSnapshotV2(store StreamStore, deadline time.Dur
 		pw.SetWriteDeadline(time.Now().Add(deadline))
 	}
 
-	// We can add to our stream while snapshotting but not "user" delete anything.
+	// The stream keeps taking messages while the snapshot reads it, and its limits,
+	// TTLs, deletes and rollups keep removing them. A store that can hold messages
+	// for a snapshot keeps a copy of each one removed before the snapshot reads it,
+	// so the snapshot holds the stream exactly as this state describes it.
 	var state StreamState
-	store.FastState(&state)
+	var hold *snapshotHold
+	if hs, ok := store.(snapshotHolder); ok {
+		hold = hs.holdForSnapshot(&state)
+	} else {
+		store.FastState(&state)
+	}
 
 	// Stream in separate Go routine.
 	errCh := make(chan error, 1)
-	go js.streamSnapshotV2(store, &state, pw, includeConsumers, sa, errCh)
+	go js.streamSnapshotV2(store, &state, hold, pw, includeConsumers, sa, errCh)
 
 	return &SnapshotResult{pr, state, errCh}, nil
 }
 
 // Stream our snapshot through S2 compression and the custom archive format.
-func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w io.WriteCloser, includeConsumers bool, sa *streamAssignment, errCh chan error) {
+func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, hold *snapshotHold, w io.WriteCloser, includeConsumers bool, sa *streamAssignment, errCh chan error) {
 	defer close(errCh)
 	defer w.Close()
+	if hold != nil {
+		defer store.(snapshotHolder).releaseSnapshotHold(hold)
+	}
 
 	enc := s2.NewWriter(w)
 	defer enc.Close()
@@ -221,6 +234,24 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 		}
 	}
 
+	// Write the messages the store removed, after the snapshot began, from before
+	// the sequence upTo, which the store can no longer load.
+	writeHeld := func(upTo uint64) error {
+		if hold == nil {
+			return nil
+		}
+		held, err := hold.through(upTo)
+		if err != nil {
+			return err
+		}
+		for _, hsm := range held {
+			if err := writeStoreMsg(hsm); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
 	var sm StoreMsg
 	for seq := state.FirstSeq - 1; seq < state.LastSeq; {
 		if _, seq, err = store.LoadNextMsg(fwcs, true, seq+1, &sm); err != nil {
@@ -235,7 +266,18 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 		if seq > state.LastSeq {
 			break
 		}
+		if err = writeHeld(seq); err != nil {
+			errCh <- err
+			return
+		}
 		if err = writeStoreMsg(&sm); err != nil {
+			errCh <- err
+			return
+		}
+	}
+	// And those removed after the last message the store still had.
+	if state.LastSeq > 0 {
+		if err = writeHeld(state.LastSeq + 1); err != nil {
 			errCh <- err
 			return
 		}
@@ -255,6 +297,100 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 	if err = tw.Flush(); err != nil {
 		errCh <- err
 	}
+}
+
+// A store that can hold, for a snapshot, the messages it removes while the
+// snapshot reads it.
+type snapshotHolder interface {
+	// holdForSnapshot fills in state as FastState does and, at the same instant,
+	// starts keeping a copy of each message up to state.LastSeq the store removes,
+	// until releaseSnapshotHold.
+	holdForSnapshot(state *StreamState) *snapshotHold
+	releaseSnapshotHold(h *snapshotHold)
+}
+
+// errSnapshotPurged fails a snapshot whose messages were purged, compacted or
+// truncated away in bulk before it read them, which the store does not copy.
+var errSnapshotPurged = errors.New("stream was purged, compacted or truncated while the snapshot read it")
+
+// snapshotHold keeps a copy of each message a store removes before the snapshot
+// reading it gets to it, so that the snapshot holds the stream exactly as it was
+// when it began. Without it, a message removed by a limit, a TTL, a delete or a
+// rollup while the snapshot reads is in neither the snapshot nor, when a newer
+// message removed it (a key-value update, MaxMsgsPerSubject), is its replacement,
+// which lies past the snapshot's last sequence.
+type snapshotHold struct {
+	mu   sync.Mutex
+	last uint64               // The snapshot's last sequence.
+	read uint64               // The snapshot has read every message up to here.
+	held map[uint64]*StoreMsg // Copies of the messages removed, by sequence.
+	err  error                // Set when messages it needs were removed in bulk.
+}
+
+func newSnapshotHold(state *StreamState) *snapshotHold {
+	h := &snapshotHold{last: state.LastSeq, held: make(map[uint64]*StoreMsg)}
+	if state.Msgs == 0 {
+		h.read = state.LastSeq
+	} else {
+		h.read = state.FirstSeq - 1
+	}
+	return h
+}
+
+// keep copies sm when the snapshot has yet to read it.
+// Called by the store, with its lock held, before it removes sm.
+func (h *snapshotHold) keep(sm *StoreMsg) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if sm.seq <= h.read || sm.seq > h.last || h.err != nil {
+		return
+	}
+	if _, ok := h.held[sm.seq]; ok {
+		return
+	}
+	buf := make([]byte, len(sm.hdr)+len(sm.msg))
+	copy(buf, sm.hdr)
+	copy(buf[len(sm.hdr):], sm.msg)
+	h.held[sm.seq] = &StoreMsg{
+		subj: copyString(sm.subj),
+		hdr:  buf[:len(sm.hdr):len(sm.hdr)],
+		msg:  buf[len(sm.hdr):],
+		buf:  buf,
+		seq:  sm.seq,
+		ts:   sm.ts,
+	}
+}
+
+// lost records that the messages from first to last were removed without copies.
+// Called by the store, with its lock held.
+func (h *snapshotHold) lost(first, last uint64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if first <= last && last > h.read && first <= h.last {
+		h.err = errSnapshotPurged
+	}
+}
+
+// through returns, in sequence order, the messages held from before upTo that
+// the snapshot has not read yet, and records it has read everything before upTo.
+func (h *snapshotHold) through(upTo uint64) ([]*StoreMsg, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.err != nil {
+		return nil, h.err
+	}
+	var held []*StoreMsg
+	for seq, sm := range h.held {
+		if seq < upTo {
+			held = append(held, sm)
+		}
+		if seq <= upTo {
+			delete(h.held, seq)
+		}
+	}
+	slices.SortFunc(held, func(a, b *StoreMsg) int { return cmp.Compare(a.seq, b.seq) })
+	h.read = max(h.read, upTo)
+	return held, nil
 }
 
 // RestoreStreamSnapshotV2 will restore a stream from a snapshot.

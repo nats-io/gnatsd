@@ -184,10 +184,11 @@ type fileStore struct {
 	scb         StorageUpdateHandler
 	rmcb        StorageRemoveMsgHandler
 	pmsgcb      ProcessJetStreamMsgHandler
-	ageChk      *time.Timer // Timer to expire messages.
-	ageChkRun   bool        // Whether message expiration is currently running.
-	ageChkTime  int64       // When the message expiration is scheduled to run.
-	recovering  bool        // Timers, schedules, TTLs etc won't fire while set.
+	holds       []*snapshotHold // Snapshots reading the stream, holding what is removed before they read it.
+	ageChk      *time.Timer     // Timer to expire messages.
+	ageChkRun   bool            // Whether message expiration is currently running.
+	ageChkTime  int64           // When the message expiration is scheduled to run.
+	recovering  bool            // Timers, schedules, TTLs etc won't fire while set.
 	syncTmr     *time.Timer
 	syncMu      sync.Mutex // Serializes background and explicit block syncs.
 	cfg         FileStreamInfo
@@ -6296,6 +6297,7 @@ func (fs *fileStore) removeMsgFromBlock(mb *msgBlock, seq uint64, secure, viaLim
 		lhdr = len(sm.hdr)
 		lmsg = len(sm.msg)
 		ttl, _ = getMessageTTL(sm.hdr)
+		fs.keepForSnapshots(sm)
 	}
 
 	// Check if we need to write a deleted record tombstone.
@@ -10078,6 +10080,12 @@ func (fs *fileStore) numConsumers() int {
 // Msgs, Bytes, First and Last Sequence and Time and NumDeleted.
 func (fs *fileStore) FastState(state *StreamState) {
 	fs.mu.RLock()
+	fs.fastStateLocked(state)
+	fs.mu.RUnlock()
+}
+
+// Lock should be held.
+func (fs *fileStore) fastStateLocked(state *StreamState) {
 	state.Msgs = fs.state.Msgs
 	state.Bytes = fs.state.Bytes
 	state.FirstSeq = fs.state.FirstSeq
@@ -10094,7 +10102,43 @@ func (fs *fileStore) FastState(state *StreamState) {
 	}
 	state.Consumers = fs.numConsumers()
 	state.NumSubjects = fs.numSubjects()
-	fs.mu.RUnlock()
+}
+
+// holdForSnapshot fills in state as FastState does and, at the same instant,
+// starts keeping a copy of each message the store removes before the snapshot
+// reads it, until releaseSnapshotHold.
+func (fs *fileStore) holdForSnapshot(state *StreamState) *snapshotHold {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	fs.fastStateLocked(state)
+	h := newSnapshotHold(state)
+	fs.holds = append(fs.holds, h)
+	return h
+}
+
+// releaseSnapshotHold stops keeping removed messages for a snapshot.
+func (fs *fileStore) releaseSnapshotHold(h *snapshotHold) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	fs.holds = slices.DeleteFunc(fs.holds, func(o *snapshotHold) bool { return o == h })
+}
+
+// keepForSnapshots gives each snapshot reading the stream a copy of sm, which
+// is about to be removed.
+// Lock should be held.
+func (fs *fileStore) keepForSnapshots(sm *StoreMsg) {
+	for _, h := range fs.holds {
+		h.keep(sm)
+	}
+}
+
+// lostForSnapshots tells each snapshot reading the stream that the messages
+// from first to last are being removed in bulk, without copies.
+// Lock should be held.
+func (fs *fileStore) lostForSnapshots(first, last uint64) {
+	for _, h := range fs.holds {
+		h.lost(first, last)
+	}
 }
 
 // State returns the current state of the stream.
@@ -10531,6 +10575,7 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64) (purged uint
 
 		for seq, te := f, len(tombs); seq <= l; seq++ {
 			if sm, _ := mb.cacheLookupNoCopy(seq, &smv); sm != nil && eq(sm.subj, subject) {
+				fs.keepForSnapshots(sm)
 				rl := fileStoreMsgSize(sm.subj, sm.hdr, sm.msg)
 				// Do fast in place remove.
 				// Stats
@@ -10697,11 +10742,46 @@ func (fs *fileStore) purge(fseq uint64) (uint64, error) {
 	return purged, nil
 }
 
+// keepBlockForSnapshots gives each snapshot reading the stream a copy of every
+// message of mb, which is about to be removed whole.
+// Lock and mb lock should be held.
+func (fs *fileStore) keepBlockForSnapshots(mb *msgBlock) error {
+	needsCleanup := mb.cache == nil
+	if mb.cacheNotLoaded() {
+		if err := mb.loadMsgsWithLock(); err != nil {
+			if needsCleanup {
+				mb.finishedWithCache()
+			}
+			return err
+		}
+	}
+	defer func() {
+		if needsCleanup {
+			mb.finishedWithCache()
+		}
+	}()
+	var smv StoreMsg
+	fseq, lseq := atomic.LoadUint64(&mb.first.seq), atomic.LoadUint64(&mb.last.seq)
+	for seq := fseq; seq <= lseq; seq++ {
+		sm, err := mb.cacheLookupNoCopy(seq, &smv)
+		if err != nil && err != errDeletedMsg && err != ErrStoreMsgNotFound {
+			return err
+		}
+		if sm != nil {
+			fs.keepForSnapshots(sm)
+		}
+	}
+	return nil
+}
+
 // Lock must be held.
 func (fs *fileStore) purgeLocked(fseq uint64) (purged, bytes uint64, err error) {
 	// Always return previous write errors.
 	if err := fs.werr; err != nil {
 		return 0, 0, err
+	}
+	if fs.state.Msgs > 0 {
+		fs.lostForSnapshots(fs.state.FirstSeq, fs.state.LastSeq)
 	}
 
 	purged, bytes = fs.state.Msgs, fs.state.Bytes
@@ -10929,6 +11009,7 @@ func (fs *fileStore) compactLocked(seq uint64) (purged, bytes uint64, err error)
 	if fs.state.FirstSeq > seq {
 		return 0, 0, nil
 	}
+	fs.lostForSnapshots(fs.state.FirstSeq, seq-1)
 	// We have to delete interior messages.
 	smb := fs.selectMsgBlock(seq)
 	if smb == nil {
@@ -11178,6 +11259,9 @@ func (fs *fileStore) reset() error {
 
 	var purged, bytes uint64
 	cb := fs.scb
+	if fs.state.Msgs > 0 {
+		fs.lostForSnapshots(fs.state.FirstSeq, fs.state.LastSeq)
+	}
 
 	for _, mb := range fs.blks {
 		mb.mu.Lock()
@@ -11345,6 +11429,10 @@ func (fs *fileStore) Truncate(seq uint64) (rerr error) {
 			fs.mu.Unlock()
 		}
 	}()
+
+	if seq < fs.state.LastSeq {
+		fs.lostForSnapshots(seq+1, fs.state.LastSeq)
+	}
 
 	// Any existing state file will no longer be applicable. We will force write a new one
 	// at the end, after we release the lock.
@@ -11643,6 +11731,13 @@ func (fs *fileStore) forceRemoveMsgBlock(mb *msgBlock) error {
 // Lock should be held.
 func (fs *fileStore) purgeMsgBlock(mb *msgBlock, agg *storeUpdateAgg) error {
 	mb.mu.Lock()
+	// Give each snapshot reading the stream the messages it has yet to read.
+	if len(fs.holds) > 0 {
+		if err := fs.keepBlockForSnapshots(mb); err != nil {
+			mb.mu.Unlock()
+			return err
+		}
+	}
 	// Adjust per-subject tracking if present.
 	if err := mb.ensurePerSubjectInfoLoaded(); err != nil {
 		mb.mu.Unlock()

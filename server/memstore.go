@@ -43,10 +43,11 @@ type memStore struct {
 	scb         StorageUpdateHandler
 	rmcb        StorageRemoveMsgHandler
 	pmsgcb      ProcessJetStreamMsgHandler
-	ageChk      *time.Timer // Timer to expire messages.
-	ageChkRun   bool        // Whether message expiration is currently running.
-	ageChkTime  int64       // When the message expiration is scheduled to run.
-	recovering  bool        // Timers, schedules, TTLs etc won't fire while set.
+	holds       []*snapshotHold // Snapshots reading the stream, holding what is removed before they read it.
+	ageChk      *time.Timer     // Timer to expire messages.
+	ageChkRun   bool            // Whether message expiration is currently running.
+	ageChkTime  int64           // When the message expiration is scheduled to run.
+	recovering  bool            // Timers, schedules, TTLs etc won't fire while set.
 	consumers   []ConsumerStore
 	receivedAny bool
 	ttls        *thw.HashWheel
@@ -1664,6 +1665,9 @@ func (ms *memStore) purge(fseq uint64) (uint64, error) {
 	purged := uint64(len(ms.msgs))
 	cb := ms.scb
 	bytes := int64(ms.state.Bytes)
+	if ms.state.Msgs > 0 {
+		ms.lostForSnapshots(ms.state.FirstSeq, ms.state.LastSeq)
+	}
 	if fseq == 0 {
 		fseq = ms.state.LastSeq + 1
 	} else if fseq < ms.state.LastSeq {
@@ -1710,6 +1714,7 @@ func (ms *memStore) compact(seq uint64) (uint64, error) {
 		ms.mu.Unlock()
 		return purged, nil
 	}
+	ms.lostForSnapshots(ms.state.FirstSeq, seq-1)
 
 	cb := ms.scb
 	if seq <= ms.state.LastSeq {
@@ -1775,6 +1780,9 @@ func (ms *memStore) reset() error {
 	ms.mu.Lock()
 	var purged, bytes uint64
 	cb := ms.scb
+	if ms.state.Msgs > 0 {
+		ms.lostForSnapshots(ms.state.FirstSeq, ms.state.LastSeq)
+	}
 	if cb != nil {
 		for _, sm := range ms.msgs {
 			purged++
@@ -1815,6 +1823,9 @@ func (ms *memStore) Truncate(seq uint64) error {
 	var purged, bytes uint64
 
 	ms.mu.Lock()
+	if seq < ms.state.LastSeq {
+		ms.lostForSnapshots(seq+1, ms.state.LastSeq)
+	}
 	lsm, ok := ms.msgs[seq]
 	lastTime := ms.state.LastTime
 	if ok && lsm != nil {
@@ -2424,6 +2435,10 @@ func (ms *memStore) removeMsgNoCB(seq uint64, secure bool) (subj string, size ui
 	if !ok {
 		return _EMPTY_, 0, false
 	}
+	// Give each snapshot reading the stream a copy, when it has yet to read it.
+	for _, h := range ms.holds {
+		h.keep(sm)
+	}
 
 	size = memStoreMsgSize(sm.subj, sm.hdr, sm.msg)
 
@@ -2473,6 +2488,12 @@ func (ms *memStore) Type() StorageType {
 // Msgs, Bytes, First and Last Sequence and Time and NumDeleted.
 func (ms *memStore) FastState(state *StreamState) {
 	ms.mu.RLock()
+	ms.fastStateLocked(state)
+	ms.mu.RUnlock()
+}
+
+// Lock should be held.
+func (ms *memStore) fastStateLocked(state *StreamState) {
 	state.Msgs = ms.state.Msgs
 	state.Bytes = ms.state.Bytes
 	state.FirstSeq = ms.state.FirstSeq
@@ -2487,7 +2508,34 @@ func (ms *memStore) FastState(state *StreamState) {
 	}
 	state.Consumers = len(ms.consumers)
 	state.NumSubjects = ms.fss.Size()
-	ms.mu.RUnlock()
+}
+
+// holdForSnapshot fills in state as FastState does and, at the same instant,
+// starts keeping a copy of each message the store removes before the snapshot
+// reads it, until releaseSnapshotHold.
+func (ms *memStore) holdForSnapshot(state *StreamState) *snapshotHold {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	ms.fastStateLocked(state)
+	h := newSnapshotHold(state)
+	ms.holds = append(ms.holds, h)
+	return h
+}
+
+// releaseSnapshotHold stops keeping removed messages for a snapshot.
+func (ms *memStore) releaseSnapshotHold(h *snapshotHold) {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	ms.holds = slices.DeleteFunc(ms.holds, func(o *snapshotHold) bool { return o == h })
+}
+
+// lostForSnapshots tells each snapshot reading the stream that the messages
+// from first to last are being removed in bulk, without copies.
+// Lock should be held.
+func (ms *memStore) lostForSnapshots(first, last uint64) {
+	for _, h := range ms.holds {
+		h.lost(first, last)
+	}
 }
 
 func (ms *memStore) State() StreamState {
