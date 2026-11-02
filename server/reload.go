@@ -1523,6 +1523,32 @@ func (s *Server) ReloadOptions(newOpts *Options) error {
 	return nil
 }
 
+// CheckReloadOptions checks whether the provided Options can be reloaded, without
+// applying them. Errors that require a restart wrap ErrConfigReloadNotSupported.
+// The provided Options type should not be re-used afterwards.
+// Either use Options.Clone() to pass a copy, or make a new one.
+func (s *Server) CheckReloadOptions(newOpts *Options) error {
+	// If the server is starting, wait for startup to finish;
+	// this avoids racing against the initial setup.
+	if s.isRunning() {
+		if err := s.waitForStartup(); err != nil {
+			return err
+		}
+	}
+
+	// Comparing sorts the current options, so don't race a reload.
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+
+	s.mu.Lock()
+	curOpts := s.getOpts()
+	newOpts = prepareReloadOptions(curOpts, newOpts)
+	s.mu.Unlock()
+
+	_, err := checkReloadOptions(s, curOpts, newOpts)
+	return err
+}
+
 // prepareReloadOptions applies the command line flags and defaults to the new options,
 // so they can be compared against the current options.
 func prepareReloadOptions(curOpts, newOpts *Options) *Options {
@@ -1568,6 +1594,17 @@ func prepareReloadOptions(curOpts, newOpts *Options) *Options {
 	return newOpts
 }
 
+// CheckReload checks whether a server running with the current options can reload the new options.
+// Errors that require a restart wrap ErrConfigReloadNotSupported.
+// Both options are changed by the check and should not be re-used.
+func CheckReload(curOpts, newOpts *Options) error {
+	setBaselineOptions(curOpts)
+	if err := validateOptions(curOpts); err != nil {
+		return err
+	}
+	return checkReload(curOpts, newOpts)
+}
+
 // checkReload returns an error if going from the current to the new options
 // requires a restart instead of a reload, which wraps ErrConfigReloadNotSupported.
 // The current options must already be validated like on server startup.
@@ -1577,14 +1614,7 @@ func checkReload(curOpts, newOpts *Options) error {
 	// A running server reloads from the same file, so ignore a different path.
 	newOpts.ConfigFile = curOpts.ConfigFile
 	newOpts = prepareReloadOptions(curOpts, newOpts)
-
-	// Same as reloadOptions, without applying the changes.
-	newOpts.CustomClientAuthentication = curOpts.CustomClientAuthentication
-	newOpts.CustomRouterAuthentication = curOpts.CustomRouterAuthentication
-	if err := validateOptions(newOpts); err != nil {
-		return err
-	}
-	_, err := diffOptions(nil, curOpts, newOpts)
+	_, err := checkReloadOptions(nil, curOpts, newOpts)
 	return err
 }
 func applyBoolFlags(newOpts, flagOpts *Options) {
@@ -1615,6 +1645,22 @@ func applyBoolFlags(newOpts, flagOpts *Options) {
 // reloadOptions reloads the server config with the provided options. If an
 // option that doesn't support hot-swapping is changed, this returns an error.
 func (s *Server) reloadOptions(curOpts, newOpts *Options) error {
+	changed, err := checkReloadOptions(s, curOpts, newOpts)
+	if err != nil {
+		return err
+	}
+
+	// Create a context that is used to pass special info that we may need
+	// while applying the new options.
+	ctx := reloadContext{oldClusterPerms: curOpts.Cluster.Permissions}
+	s.setOpts(newOpts)
+	s.applyOptions(&ctx, changed)
+	return nil
+}
+
+// checkReloadOptions validates the new options and returns the options that have changed.
+// The server is nil when checking without a running server.
+func checkReloadOptions(s *Server, curOpts, newOpts *Options) ([]option, error) {
 	// Apply to the new options some of the options that may have been set
 	// that can't be configured in the config file (this can happen in
 	// applications starting NATS Server programmatically).
@@ -1627,20 +1673,9 @@ func (s *Server) reloadOptions(curOpts, newOpts *Options) error {
 	// may be set, etc... but that should be ok since the current options
 	// went through the same process on startup/previous reload.
 	if err := validateOptions(newOpts); err != nil {
-		return err
+		return nil, err
 	}
-
-	changed, err := diffOptions(s, curOpts, newOpts)
-	if err != nil {
-		return err
-	}
-
-	// Create a context that is used to pass special info that we may need
-	// while applying the new options.
-	ctx := reloadContext{oldClusterPerms: curOpts.Cluster.Permissions}
-	s.setOpts(newOpts)
-	s.applyOptions(&ctx, changed)
-	return nil
+	return diffOptions(s, curOpts, newOpts)
 }
 
 // For the purpose of comparing, impose a order on slice data types where order does not matter
