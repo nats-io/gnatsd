@@ -174,6 +174,9 @@ var (
 	// ErrServerNotRunning is used to signal an error that a server is not running.
 	ErrServerNotRunning = errors.New("server is not running")
 
+	// ErrConfigReloadNotSupported signals a config change that requires a restart instead of a reload.
+	ErrConfigReloadNotSupported = errors.New("config reload not supported")
+
 	// ErrServerNameHasSpaces signals that the server name contains spaces, which is not allowed.
 	ErrServerNameHasSpaces = errors.New("server name cannot contain spaces")
 
