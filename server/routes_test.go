@@ -4843,25 +4843,70 @@ func TestRouteNoAppSubLeakOnSlowConsumer(t *testing.T) {
 	}
 }
 
+type slowRouteConn struct {
+	net.Conn
+	mu       sync.Mutex
+	deadline time.Time
+	slow     bool
+}
+
+func (w *slowRouteConn) SetWriteDeadline(t time.Time) error {
+	w.mu.Lock()
+	w.deadline = t
+	w.mu.Unlock()
+	return nil
+}
+
+func (w *slowRouteConn) Write(b []byte) (int, error) {
+	w.mu.Lock()
+	slow := w.slow
+	dl := w.deadline
+	w.mu.Unlock()
+
+	if slow && len(b) > 1 {
+		// Write 1 byte so handleWriteTimeout sees written > 0 and marks the
+		// route as a slow consumer instead of closing it, then time out.
+		n, err := w.Conn.Write(b[:1])
+		if err != nil {
+			return n, err
+		}
+		if !dl.IsZero() {
+			if d := time.Until(dl); d > 0 {
+				time.Sleep(d)
+			}
+		}
+		return n, os.ErrDeadlineExceeded
+	}
+	return w.Conn.Write(b)
+}
+
 func TestRouteSlowConsumerRecover(t *testing.T) {
 	o1 := DefaultOptions()
 	o1.Cluster.PoolSize = -1
 	s1 := RunServer(o1)
 	defer s1.Shutdown()
 
-	rtt := 1500 * time.Nanosecond
-	upRate := 1024 * 1024
-	downRate := 128 * 1024
-	np := createNetProxy(rtt, upRate, downRate, fmt.Sprintf("nats://127.0.0.1:%d", o1.Cluster.Port), true)
-	defer np.stop()
-
 	o2 := DefaultOptions()
 	o2.Cluster.PoolSize = -1
-	o2.Routes = RoutesFromStr(np.routeURL())
+	o2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", o1.Cluster.Port))
 	s2 := RunServer(o2)
 	defer s2.Shutdown()
 
 	checkClusterFormed(t, s1, s2)
+
+	var routeConns []*slowRouteConn
+	s1.mu.Lock()
+	for _, cl := range s1.routes {
+		for _, c := range cl {
+			c.mu.Lock()
+			sc := &slowRouteConn{Conn: c.nc, slow: true}
+			c.nc = sc
+			c.out.wdl = 50 * time.Millisecond
+			c.mu.Unlock()
+			routeConns = append(routeConns, sc)
+		}
+	}
+	s1.mu.Unlock()
 
 	changeWriteDeadline := func(s *Server, duration time.Duration) {
 		s.mu.Lock()
@@ -4892,10 +4937,6 @@ func TestRouteSlowConsumerRecover(t *testing.T) {
 		return sc
 	}
 
-	// Start with a shorter write deadline to cause errors
-	// then bump it again later to let it recover.
-	changeWriteDeadline(s1, 1*time.Second)
-
 	ncA, err := nats.Connect(s1.Addr().String())
 	require_NoError(t, err)
 	defer ncA.Close()
@@ -4910,25 +4951,25 @@ func TestRouteSlowConsumerRecover(t *testing.T) {
 	})
 	ncB.Flush()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	wg.Add(1)
 	go func() {
-		var total int
+		defer wg.Done()
 		payload := bytes.Repeat([]byte("A"), 132*1024)
-		for range time.NewTicker(30 * time.Millisecond).C {
-			select {
-			case <-ctx.Done():
-				wg.Done()
-				return
-			default:
-			}
+		ticker := time.NewTicker(30 * time.Millisecond)
+		defer ticker.Stop()
+		for {
 			ncA.Publish("test", payload)
 			ncA.Flush()
-			total++
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
 		}
 	}()
-	wg.Add(1)
 
 	checkFor(t, 20*time.Second, 2*time.Millisecond, func() error {
 		if s1.NumRoutes() < 1 {
@@ -4944,8 +4985,12 @@ func TestRouteSlowConsumerRecover(t *testing.T) {
 		return nil
 	})
 	cancel()
+	for _, sc := range routeConns {
+		sc.mu.Lock()
+		sc.slow = false
+		sc.mu.Unlock()
+	}
 	changeWriteDeadline(s1, 5*time.Second)
-	np.updateRTT(0)
 	checkFor(t, 20*time.Second, 10*time.Millisecond, func() error {
 		if s1.NumRoutes() < 1 {
 			return fmt.Errorf("No routes connected")
