@@ -10093,6 +10093,7 @@ func TestNRGLearnerSnapshotAppliedOnBecomingMember(t *testing.T) {
 		defer nc.Close()
 		sub, err := nc.SubscribeSync(aeReply)
 		require_NoError(t, err)
+		require_NoError(t, nc.Flush())
 
 		// The snapshot goes missing before we become a member.
 		require_NoError(t, os.Remove(n.snapfile))
@@ -10145,6 +10146,7 @@ func TestNRGLearnerOverrunTruncatesToSnapshot(t *testing.T) {
 	defer nc.Close()
 	sub, err := nc.SubscribeSync(aeReply)
 	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
 
 	// Leader is ahead, catch up with a snapshot at index 100.
 	aeTriggerCatchup := encode(t, &appendEntry{leader: nats0, term: 1, commit: 100, pterm: 1, pindex: 100, reply: aeReply, entries: nil})
@@ -10226,6 +10228,7 @@ func TestNRGLearnerOverrunDuringCatchupRequestsCatchupOnNewEntry(t *testing.T) {
 	require_NoError(t, err)
 	psub, err := nc.SubscribeSync(progressReply)
 	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
 
 	// Leader is far ahead, catch up with a snapshot at index 100 followed by entries.
 	tail := uint64(pauseQuorumThreshold + 1)
@@ -10295,6 +10298,7 @@ func TestNRGMemberCatchupAfterWALResetNotTreatedAsLearner(t *testing.T) {
 	defer nc.Close()
 	sub, err := nc.SubscribeSync(aeReply)
 	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
 
 	// Store five entries, the first three committed.
 	entries := []*Entry{newEntry(EntryNormal, []byte("x"))}
