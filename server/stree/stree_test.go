@@ -682,6 +682,40 @@ func TestSubjectTreeMatchInvalidWildcard(t *testing.T) {
 	match(t, st, `'*.*'`, 0)
 }
 
+func TestSubjectTreeMatchPartialWildcardIsLiteral(t *testing.T) {
+	// Shared "a" prefix splits nodes right before the '*' or '>' in the filters.
+	st := NewSubjectTree[int]()
+	st.Insert(b("KV.a"), 1)
+	st.Insert(b("KV.apple"), 2)
+	st.Insert(b("KV.avocado"), 3)
+	st.Insert(b("KV.banana"), 4)
+	match(t, st, "KV.a*", 0)
+	match(t, st, "KV.a>", 0)
+	match(t, st, "KV.ap*", 0)
+	match(t, st, "KV.*", 4)
+	match(t, st, "KV.>", 4)
+
+	// Subjects with a wildcard char inside a token are valid literals, and match exactly.
+	st.Insert(b("KV.a*"), 5)
+	st.Insert(b("KV.a*x"), 6)
+	st.Insert(b("KV.a>"), 7)
+	st.Insert(b("KV.a>x"), 8)
+	match(t, st, "KV.a*", 1)
+	match(t, st, "KV.a>", 1)
+	match(t, st, "KV.a*x", 1)
+	match(t, st, "*.a*", 1)
+	match(t, st, "KV.*", 8)
+	match(t, st, "KV.>", 8)
+
+	// A trimmed '*' can also reach a leaf directly.
+	st = NewSubjectTree[int]()
+	st.Insert(b("KV.apple"), 1)
+	st.Insert(b("KV.avocado"), 2)
+	st.Insert(b("KV.a*x"), 3)
+	match(t, st, "KV.a*", 0)
+	match(t, st, "KV.a*x", 1)
+}
+
 func TestSubjectTreeRandomTrackEntries(t *testing.T) {
 	st := NewSubjectTree[int]()
 	smap := make(map[string]struct{}, 1000)

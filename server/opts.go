@@ -159,6 +159,8 @@ type GatewayOpts struct {
 	RejectUnknown     bool                 `json:"reject_unknown,omitempty"` // config got renamed to reject_unknown_cluster
 	WriteDeadline     time.Duration        `json:"-"`
 	WriteTimeout      WriteTimeoutPolicy   `json:"-"`
+	PingInterval      time.Duration        `json:"-"`
+	MaxPingsOut       int                  `json:"-"`
 
 	// Not exported, for tests.
 	resolver         netResolver
@@ -236,6 +238,11 @@ type LeafNodeOpts struct {
 	// be overridden on a per-remote basis with RemoteLeafOpts.DialTimeout.
 	// If not set (or <= 0), DEFAULT_ROUTE_DIAL is used.
 	DialTimeout time.Duration `json:"-"`
+
+	// PingInterval and MaxPingsOut, if set, override the default PingInterval
+	// and MaxPingsOut for leafnode connections.
+	PingInterval time.Duration `json:"-"`
+	MaxPingsOut  int           `json:"-"`
 
 	// Not exported, for tests.
 	resolver  netResolver
@@ -507,6 +514,7 @@ type Options struct {
 	TLSTimeout                 float64           `json:"tls_timeout"`
 	TLS                        bool              `json:"-"`
 	TLSVerify                  bool              `json:"-"`
+	TLSVerifyOptional          bool              `json:"-"`
 	TLSMap                     bool              `json:"-"`
 	TLSCert                    string            `json:"-"`
 	TLSKey                     string            `json:"-"`
@@ -890,6 +898,7 @@ type TLSConfigOpts struct {
 	KeyFile              string
 	CaFile               string
 	Verify               bool
+	VerifyOptional       bool
 	Insecure             bool
 	Map                  bool
 	TLSCheckKnownURLs    bool
@@ -959,6 +968,9 @@ e.g.
             "CurveP521"
         ]
     }
+
+The verify option accepts "true" (require a valid client certificate),
+"false" (do not request one) or "optional" (verify only if provided).
 
 Available cipher suites include:
 `
@@ -2371,6 +2383,13 @@ func parseGateway(v any, o *Options, errors *[]error, warnings *[]error) error {
 			o.Gateway.WriteDeadline = parseDuration("write_deadline", tk, mv, errors, warnings)
 		case "write_timeout":
 			o.Gateway.WriteTimeout = parseWriteDeadlinePolicy(tk, mv.(string), errors)
+		case "ping_interval":
+			o.Gateway.PingInterval = parseDuration("ping_interval", tk, mv, errors, warnings)
+			if o.Gateway.PingInterval > gatewayMaxPingInterval {
+				*warnings = append(*warnings, &configErr{tk, fmt.Sprintf("Gateway 'ping_interval' will reset to %v which is the max for gateways", gatewayMaxPingInterval)})
+			}
+		case "ping_max":
+			o.Gateway.MaxPingsOut = int(mv.(int64))
 		default:
 			if !tk.IsUsedVariable() {
 				err := &unknownConfigFieldErr{
@@ -2931,6 +2950,10 @@ func parseLeafNodes(v any, opts *Options, errors *[]error, warnings *[]error) er
 			opts.LeafNode.WriteDeadline = parseDuration("write_deadline", tk, mv, errors, warnings)
 		case "write_timeout":
 			opts.LeafNode.WriteTimeout = parseWriteDeadlinePolicy(tk, mv.(string), errors)
+		case "ping_interval":
+			opts.LeafNode.PingInterval = parseDuration("ping_interval", tk, mv, errors, warnings)
+		case "ping_max":
+			opts.LeafNode.MaxPingsOut = int(mv.(int64))
 		default:
 			if !tk.IsUsedVariable() {
 				err := &unknownConfigFieldErr{
@@ -3952,7 +3975,14 @@ func parseAccounts(v any, opts *Options, errors *[]error, warnings *[]error) err
 			}
 			accounts = append(accounts, ta)
 		}
-		if err := stream.acc.addStreamExportWithAccountPos(stream.sub, accounts, stream.tPos); err != nil {
+		// Account scoped mapping functions (e.g. {{account-hash()}}) are resolved into literals here, once.
+		sub, err := expandSubjectPlaceholders(stream.sub, subjectPlaceholderContext{account: stream.acc.Name})
+		if err != nil {
+			msg := fmt.Sprintf("Error adding stream export %q: %v", stream.sub, err)
+			*errors = append(*errors, &configErr{tk, msg})
+			continue
+		}
+		if err := stream.acc.addStreamExportWithAccountPos(sub, accounts, stream.tPos); err != nil {
 			msg := fmt.Sprintf("Error adding stream export %q: %v", stream.sub, err)
 			*errors = append(*errors, &configErr{tk, msg})
 			continue
@@ -3970,7 +4000,13 @@ func parseAccounts(v any, opts *Options, errors *[]error, warnings *[]error) err
 			}
 			accounts = append(accounts, ta)
 		}
-		if err := service.acc.addServiceExportWithResponseAndAccountPos(service.sub, service.rt, accounts, service.tPos); err != nil {
+		sub, err := expandSubjectPlaceholders(service.sub, subjectPlaceholderContext{account: service.acc.Name})
+		if err != nil {
+			msg := fmt.Sprintf("Error adding service export %q: %v", service.sub, err)
+			*errors = append(*errors, &configErr{tk, msg})
+			continue
+		}
+		if err := service.acc.addServiceExportWithResponseAndAccountPos(sub, service.rt, accounts, service.tPos); err != nil {
 			msg := fmt.Sprintf("Error adding service export %q: %v", service.sub, err)
 			*errors = append(*errors, &configErr{tk, msg})
 			continue
@@ -4015,6 +4051,13 @@ func parseAccounts(v any, opts *Options, errors *[]error, warnings *[]error) err
 			*errors = append(*errors, &configErr{tk, msg})
 			continue
 		}
+		// Account scoped mapping functions (e.g. {{account-hash-import()}}) are resolved into literals here, once.
+		ictx := subjectPlaceholderContext{account: stream.acc.Name, importAccount: ta.Name}
+		if err := expandSubjectsPlaceholders(ictx, &stream.sub, &stream.pre, &stream.to); err != nil {
+			msg := fmt.Sprintf("Error adding stream import %q: %v", stream.sub, err)
+			*errors = append(*errors, &configErr{tk, msg})
+			continue
+		}
 		if stream.pre != _EMPTY_ {
 			if err := stream.acc.addStreamImportWithClaim(ta, stream.sub, stream.pre, stream.atrc, nil); err != nil {
 				msg := fmt.Sprintf("Error adding stream import %q: %v", stream.sub, err)
@@ -4033,6 +4076,12 @@ func parseAccounts(v any, opts *Options, errors *[]error, warnings *[]error) err
 		ta := am[service.an]
 		if ta == nil {
 			msg := fmt.Sprintf("%q account not defined for service import", service.an)
+			*errors = append(*errors, &configErr{tk, msg})
+			continue
+		}
+		ictx := subjectPlaceholderContext{account: service.acc.Name, importAccount: ta.Name}
+		if err := expandSubjectsPlaceholders(ictx, &service.sub, &service.to); err != nil {
+			msg := fmt.Sprintf("Error adding service import %q: %v", service.sub, err)
 			*errors = append(*errors, &configErr{tk, msg})
 			continue
 		}
@@ -5217,11 +5266,17 @@ func parseTLS(v any, isClientCtx bool) (t *TLSConfigOpts, retErr error) {
 			}
 			tc.Insecure = insecure
 		case "verify":
-			verify, ok := mv.(bool)
-			if !ok {
-				return nil, &configErr{tk, "error parsing tls config, expected 'verify' to be a boolean"}
+			switch verify := mv.(type) {
+			case bool:
+				tc.Verify = verify
+			case string:
+				if !strings.EqualFold(verify, "optional") {
+					return nil, &configErr{tk, "error parsing tls config, expected 'verify' to be a boolean or 'optional'"}
+				}
+				tc.VerifyOptional = true
+			default:
+				return nil, &configErr{tk, "error parsing tls config, expected 'verify' to be a boolean or 'optional'"}
 			}
-			tc.Verify = verify
 		case "verify_and_map":
 			verify, ok := mv.(bool)
 			if !ok {
@@ -5470,6 +5525,10 @@ func parseTLS(v any, isClientCtx bool) (t *TLSConfigOpts, retErr error) {
 	}
 	if len(tc.Certificates) > 0 && tc.CertFile != _EMPTY_ {
 		return nil, &configErr{tk, "error parsing tls config, cannot combine 'cert_file' option with 'certs' option"}
+	}
+
+	if tc.Verify && tc.VerifyOptional {
+		return nil, &configErr{tk, "error parsing tls config, cannot combine 'verify: optional' with options requiring client certificates"}
 	}
 
 	// If cipher suites were not specified then use the defaults
@@ -5923,10 +5982,19 @@ func GenTLSConfig(tc *TLSConfigOpts) (*tls.Config, error) {
 		}
 	}
 
-	// Require client certificates as needed
-	if tc.Verify {
-		config.ClientAuth = tls.RequireAndVerifyClientCert
+	// Optional verification permits clients without certificates, but verifies
+	// any certificate they present (for example, for an auth callout). Technically
+	// a duplicate check but covers caller building TLSConfigOpts directly.
+	if tc.Verify && tc.VerifyOptional {
+		return nil, fmt.Errorf("cannot enable both required and optional client certificate verification")
 	}
+	switch {
+	case tc.Verify:
+		config.ClientAuth = tls.RequireAndVerifyClientCert
+	case tc.VerifyOptional:
+		config.ClientAuth = tls.VerifyClientCertIfGiven
+	}
+
 	// Add in CAs if applicable.
 	if tc.CaFile != _EMPTY_ {
 		rootPEM, err := os.ReadFile(tc.CaFile)
@@ -6340,7 +6408,18 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 	fs.StringVar(&opts.Cluster.Name, "cluster_name", _EMPTY_, "Cluster Name, if not set one will be dynamically generated.")
 	fs.BoolVar(&showTLSHelp, "help_tls", false, "TLS help.")
 	fs.BoolVar(&opts.TLS, "tls", false, "Enable TLS.")
-	fs.BoolVar(&opts.TLSVerify, "tlsverify", false, "Enable TLS with client verification.")
+	fs.BoolFunc("tlsverify", "Enable TLS with client verification (true, false, or optional).", func(value string) error {
+		if strings.EqualFold(value, "optional") {
+			opts.TLSVerify, opts.TLSVerifyOptional = false, true
+			return nil
+		}
+		verify, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("expected true, false, or optional: %w", err)
+		}
+		opts.TLSVerify, opts.TLSVerifyOptional = verify, false
+		return nil
+	})
 	fs.StringVar(&opts.TLSCert, "tlscert", _EMPTY_, "Server certificate file.")
 	fs.StringVar(&opts.TLSKey, "tlskey", _EMPTY_, "Private key for server certificate.")
 	fs.StringVar(&opts.TLSCaCert, "tlscacert", _EMPTY_, "Client certificate CA for verification.")
@@ -6551,12 +6630,16 @@ func overrideTLS(opts *Options) error {
 	if opts.TLSKey == _EMPTY_ {
 		return errors.New("TLS Server private key must be present and valid")
 	}
+	if opts.TLSVerify && opts.TLSVerifyOptional {
+		return errors.New("cannot enable both required and optional client certificate verification")
+	}
 
 	tc := TLSConfigOpts{}
 	tc.CertFile = opts.TLSCert
 	tc.KeyFile = opts.TLSKey
 	tc.CaFile = opts.TLSCaCert
 	tc.Verify = opts.TLSVerify
+	tc.VerifyOptional = opts.TLSVerifyOptional
 	tc.Ciphers = defaultCipherSuites()
 
 	var err error

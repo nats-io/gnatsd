@@ -761,17 +761,28 @@ func TestJetStreamJWTClusteredDeleteTierWithStreamAndMove(t *testing.T) {
 		return err
 	})
 
-	var respAfter JSApiAccountInfoResponse
-	m, err = nc.Request("$JS.API.INFO", nil, time.Second)
-	require_NoError(t, err)
-	err = json.Unmarshal(m.Data, &respAfter)
-	require_NoError(t, err)
-
-	require_True(t, respAfter.JetStreamAccountStats.Tiers["R3"].Streams == 1)
-	require_True(t, respAfter.JetStreamAccountStats.Tiers["R3"].Store > 0)
-
-	_, ok := respAfter.JetStreamAccountStats.Tiers["R1"]
-	require_True(t, !ok)
+	// Account usage is propagated to the meta leader asynchronously.
+	checkFor(t, 5*time.Second, 250*time.Millisecond, func() error {
+		var respAfter JSApiAccountInfoResponse
+		m, err := nc.Request("$JS.API.INFO", nil, time.Second)
+		if err != nil {
+			return err
+		}
+		if err = json.Unmarshal(m.Data, &respAfter); err != nil {
+			return err
+		}
+		if respAfter.Error != nil {
+			return respAfter.Error
+		}
+		tiers := respAfter.JetStreamAccountStats.Tiers
+		if r3 := tiers["R3"]; r3.Streams != 1 || r3.Store == 0 {
+			return fmt.Errorf("expected R3 tier with 1 stream and stored data, got %+v", r3)
+		}
+		if r1, ok := tiers["R1"]; ok {
+			return fmt.Errorf("expected no R1 tier, got %+v", r1)
+		}
+		return nil
+	})
 }
 
 func TestJetStreamJWTSysAccUpdateMixedMode(t *testing.T) {

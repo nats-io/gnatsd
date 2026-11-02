@@ -5054,7 +5054,9 @@ func TestNoRaceJetStreamAccountLimitsAndRestartForceSnapshot(t *testing.T) {
 	c.waitOnLeader()
 	c.waitOnStreamLeader("$JS", "TEST")
 
-	checkFor(t, 2*time.Second, 500*time.Millisecond, func() error {
+	// The first catchup request can race the leader's sync subscription.
+	// It's only retried after streamCatchupStartInterval.
+	checkFor(t, 2*streamCatchupStartInterval, 200*time.Millisecond, func() error {
 		return checkState(t, c, "$JS", "TEST")
 	})
 	for _, cs := range c.servers {

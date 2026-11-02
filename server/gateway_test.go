@@ -594,6 +594,104 @@ func TestGatewayRejectsInfoBeforeConnect(t *testing.T) {
 	}
 }
 
+// Verify that receiving A-/A+ on an inbound gateway connection closes the
+// connection with a protocol violation.
+func TestGatewayAccountSubUnsubOnInboundProtocolViolation(t *testing.T) {
+	o := testDefaultOptionsForGateway("A")
+	s := runGatewayServer(o)
+	defer s.Shutdown()
+
+	for _, proto := range []string{"A- foo\r\n", "A+ foo\r\n"} {
+		t.Run(strings.TrimSpace(proto), func(t *testing.T) {
+			gwconn, err := net.Dial("tcp", net.JoinHostPort(o.Gateway.Host, strconv.Itoa(o.Gateway.Port)))
+			if err != nil {
+				t.Fatalf("Error dialing server: %v", err)
+			}
+			defer gwconn.Close()
+
+			br := bufio.NewReaderSize(gwconn, maxBufSize)
+			if _, err := br.ReadString('\n'); err != nil {
+				t.Fatalf("Error receiving initial INFO from server: %v", err)
+			}
+
+			// Send a CONNECT so that the connection is registered as an
+			// inbound gateway, then the A-/A+ protocol.
+			if _, err := fmt.Fprintf(gwconn, "CONNECT {\"gateway\":\"B\",\"name\":\"x\"}\r\n%s", proto); err != nil {
+				t.Fatalf("Error sending gateway CONNECT: %v", err)
+			}
+
+			// The server should close the connection (protocol violation).
+			if err := gwconn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				t.Fatalf("Error setting read deadline: %v", err)
+			}
+			var rerr error
+			for rerr == nil {
+				_, rerr = br.ReadString('\n')
+			}
+			if ne, ok := rerr.(net.Error); ok && ne.Timeout() {
+				t.Fatalf("Expected connection to be closed by the server, got timeout")
+			}
+			waitForInboundGateways(t, s, 0, 2*time.Second)
+		})
+	}
+}
+
+// Verify that receiving a message (RMSG/HMSG) on an outbound gateway connection
+// closes the connection with a protocol violation before buffering any payload.
+func TestGatewayMsgOnOutboundProtocolViolation(t *testing.T) {
+	ob := testDefaultOptionsForGateway("B")
+	sb := runGatewayServer(ob)
+	defer sb.Shutdown()
+
+	oa := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
+	sa := runGatewayServer(oa)
+	defer sa.Shutdown()
+
+	waitForOutboundGateways(t, sa, 1, 2*time.Second)
+	waitForInboundGateways(t, sb, 1, 2*time.Second)
+
+	for _, proto := range []string{"RMSG $G foo 2\r\n", "HMSG $G foo 0 2\r\n"} {
+		t.Run(strings.TrimSpace(proto), func(t *testing.T) {
+			// A's outbound connection to B.
+			gwa := sa.getOutboundGatewayConnection("B")
+			if gwa == nil {
+				t.Fatalf("Outbound gateway connection to B not found")
+			}
+			// B's inbound connection from A: what it writes is read by A's
+			// outbound connection, which should never receive an RMSG/HMSG.
+			var gws []*client
+			sb.getInboundGatewayConnections(&gws)
+			if len(gws) != 1 {
+				t.Fatalf("Expected 1 inbound gateway on B, got %v", len(gws))
+			}
+			gwb := gws[0]
+			gwb.mu.Lock()
+			gwb.enqueueProto([]byte(proto))
+			gwb.mu.Unlock()
+
+			// A's outbound connection should be closed immediately upon
+			// receiving the header line, without waiting for the payload.
+			checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+				gwa.mu.Lock()
+				closed := gwa.isClosed()
+				gwa.mu.Unlock()
+				if !closed {
+					return fmt.Errorf("Outbound gateway connection should have been closed")
+				}
+				return nil
+			})
+			// A should reconnect to B.
+			checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+				if gw := sa.getOutboundGatewayConnection("B"); gw == nil || gw == gwa {
+					return fmt.Errorf("Outbound gateway connection to B not re-established")
+				}
+				return nil
+			})
+			waitForInboundGateways(t, sb, 1, 2*time.Second)
+		})
+	}
+}
+
 func TestGatewayHeaderSupport(t *testing.T) {
 	o2 := testDefaultOptionsForGateway("B")
 	o2.Gateway.ConnectRetries = 0
@@ -6616,6 +6714,40 @@ func TestGatewayPings(t *testing.T) {
 	}
 }
 
+func TestGatewayCustomPing(t *testing.T) {
+	pingInterval := 50 * time.Millisecond
+
+	ob := testDefaultOptionsForGateway("B")
+	ob.Gateway.PingInterval = pingInterval
+	ob.Gateway.MaxPingsOut = 2
+	sb := RunServer(ob)
+	defer sb.Shutdown()
+
+	oa := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
+	oa.Gateway.PingInterval = pingInterval
+	sa := RunServer(oa)
+	defer sa.Shutdown()
+
+	waitForInboundGateways(t, sa, 1, 2*time.Second)
+	waitForOutboundGateways(t, sa, 1, 2*time.Second)
+	waitForInboundGateways(t, sb, 1, 2*time.Second)
+	waitForOutboundGateways(t, sb, 1, 2*time.Second)
+
+	c := sa.getOutboundGatewayConnection("B")
+	ch := make(chan struct{}, 1)
+	c.mu.Lock()
+	c.nc = &capturePingConn{c.nc, ch}
+	c.mu.Unlock()
+
+	for i := 0; i < 5; i++ {
+		select {
+		case <-ch:
+		case <-time.After(250 * time.Millisecond):
+			t.Fatalf("Did not send PING")
+		}
+	}
+}
+
 func TestGatewayTLSConfigReload(t *testing.T) {
 	template := `
 		listen: 127.0.0.1:-1
@@ -7921,4 +8053,28 @@ func TestGatewayProcessRSubNoBlockingAccountFetch(t *testing.T) {
 	ei, ok = c2.gw.outsim.Load(accPub)
 	require_True(t, ok)
 	require_True(t, ei.(*outsie).sl.CacheEnabled())
+}
+
+func TestGatewayLogsRemoteURL(t *testing.T) {
+	o2 := testDefaultOptionsForGateway("B")
+	o2.ServerName = "gw-b"
+	o2.Gateway.Username = remoteURLLogUser
+	o2.Gateway.Password = remoteURLLogPassword
+	s2 := runGatewayServer(o2)
+	defer s2.Shutdown()
+
+	gwHost := fmt.Sprintf("localhost:%d", s2.GatewayAddr().Port)
+	u := &url.URL{Scheme: "nats", Host: gwHost, User: url.UserPassword(remoteURLLogUser, remoteURLLogPassword)}
+	o1 := testGatewayOptionsFromToWithURLs(t, "A", "B", []string{u.String()})
+	o1.Gateway.resolver = &localhostResolver{}
+	s1, l := runServerWithNoticeLogger(t, o1)
+	defer s1.Shutdown()
+
+	waitForOutboundGateways(t, s1, 1, 2*time.Second)
+	checkNoticeContains(t, l, `Creating outbound gateway connection to "B" (`+gwHost+")")
+
+	s2.Shutdown()
+	checkNoticeContains(t, l, "Gateway connection closed: "+ClientClosed.String()+" - Remote: "+s2.Name()+", Host: "+gwHost)
+	s1.Shutdown()
+	checkNoticeNotContains(t, l, remoteURLLogUser, remoteURLLogPassword)
 }

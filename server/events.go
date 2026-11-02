@@ -682,7 +682,7 @@ func (s *Server) sendLDMShutdownEventLocked() {
 	}
 	subj := fmt.Sprintf(lameDuckEventSubj, s.info.ID)
 	si := &ServerInfo{}
-	s.sys.sendq.push(newPubMsg(nil, subj, _EMPTY_, si, nil, si, noCompression, false, true))
+	s.sys.sendq.push(newPubMsg(nil, subj, _EMPTY_, si, nil, si, noCompression, false, false))
 }
 
 // Will send a shutdown message.
@@ -1100,6 +1100,12 @@ func (s *Server) limitStatsz(subj string) bool {
 	// Only limit the normal broadcast subject.
 	if subj != fmt.Sprintf(serverStatsSubj, s.ID()) {
 		return false
+	}
+
+	// Peers mark us offline when we enter lame duck mode. A broadcast
+	// statsz would mark us online again and make us a placement target.
+	if s.ldm {
+		return true
 	}
 
 	interval := statszRateLimit

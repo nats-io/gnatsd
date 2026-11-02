@@ -1802,7 +1802,7 @@ func TestJetStreamClusterConsumerAssignmentSameIdentity(t *testing.T) {
 		require_NotNil(t, mjs)
 		mjs.mu.RLock()
 		defer mjs.mu.RUnlock()
-		ca := mjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+		ca := mjs.consumerAssignmentOrInflight(globalAccountName, "TEST", "CONSUMER")
 		require_NotNil(t, ca)
 		// Clone so it survives subsequent delete/recreate of the live entry.
 		return ca.clone()
@@ -3822,12 +3822,14 @@ func TestJetStreamClusterNoR1AssetsDuringLameDuck(t *testing.T) {
 	nc, js := jsClientConnect(t, c.servers[2])
 	defer nc.Close()
 
+	// Connect to the third server as the system account.
+	snc, _ := jsClientConnect(t, c.servers[2], nats.UserInfo("admin", "s3cr3t!"))
+	defer snc.Close()
+
 	// Now put the first server into lame duck mode.
 	go s.lameDuckMode()
 
-	// Wait for news to arrive that the first server has gone into
-	// lame duck mode and been marked offline.
-	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+	checkOffline := func() error {
 		id := s.info.ID
 		s := c.servers[2]
 		s.mu.RLock()
@@ -3847,7 +3849,19 @@ func TestJetStreamClusterNoR1AssetsDuringLameDuck(t *testing.T) {
 			return fmt.Errorf("first node is still online unexpectedly")
 		}
 		return nil
-	})
+	}
+
+	// Wait for news to arrive that the first server has gone into
+	// lame duck mode and been marked offline.
+	checkFor(t, 2*time.Second, 50*time.Millisecond, checkOffline)
+
+	// Request a statsz broadcast, it must not mark the first server online again.
+	require_NoError(t, snc.Publish(fmt.Sprintf("$SYS.REQ.SERVER.%s.STATSZ", s.ID()), nil))
+	require_NoError(t, snc.Flush())
+	for range 10 {
+		time.Sleep(50 * time.Millisecond)
+		require_NoError(t, checkOffline())
+	}
 
 	// Create a go routine that will create streams constantly.
 	qch := make(chan bool)
@@ -3884,6 +3898,78 @@ func TestJetStreamClusterNoR1AssetsDuringLameDuck(t *testing.T) {
 		time.Sleep(15 * time.Millisecond)
 	}
 	s.WaitForShutdown()
+}
+
+func TestJetStreamClusterRepliesDuringLameDuck(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	// Grab the meta leader and set lameduck option directly.
+	// It has a leader to transfer, so JetStream stays up for a second in LDM.
+	s := c.leader()
+	s.optsMu.Lock()
+	s.opts.LameDuckDuration = 5 * time.Second
+	s.opts.LameDuckGracePeriod = -5 * time.Second
+	s.optsMu.Unlock()
+
+	// Connect to the server to keep it alive when we go into LDM.
+	dummy, _ := jsClientConnect(t, s)
+	defer dummy.Close()
+
+	// Connect to another server, as a user and as the system account.
+	rs := c.randomNonLeader()
+	nc, js := jsClientConnect(t, rs)
+	defer nc.Close()
+	snc, _ := jsClientConnect(t, rs, nats.UserInfo("admin", "s3cr3t!"))
+	defer snc.Close()
+
+	// Create R1 streams until one is placed on the lameduck server.
+	var stream string
+	var index int
+	checkFor(t, 5*time.Second, time.Millisecond, func() error {
+		index++
+		stream = fmt.Sprintf("TEST_%d", index)
+		_, err := js.AddStream(&nats.StreamConfig{Name: stream, Replicas: 1})
+		require_NoError(t, err)
+		if c.streamLeader(globalAccountName, stream) != s {
+			return fmt.Errorf("Stream not placed on the lameduck server")
+		}
+		return nil
+	})
+
+	// Now put the server into lame duck mode.
+	go s.lameDuckMode()
+
+	// Wait for news to arrive that the server has gone into
+	// lame duck mode and been marked offline.
+	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		id := s.info.ID
+		rs.mu.RLock()
+		defer rs.mu.RUnlock()
+		var isOffline bool
+		rs.nodeToInfo.Range(func(_, v any) bool {
+			ni := v.(nodeInfo)
+			if ni.id == id {
+				isOffline = ni.offline
+				return false
+			}
+			return true
+		})
+		if !isOffline {
+			return fmt.Errorf("Lameduck server is still online unexpectedly")
+		}
+		return nil
+	})
+
+	// The lameduck server must still reply to requests it serves.
+	_, err := js.StreamInfo(stream, nats.MaxWait(250*time.Millisecond))
+	if err != nil {
+		t.Fatalf("No stream info reply from the lameduck server: %v", err)
+	}
+	_, err = snc.Request(fmt.Sprintf("$SYS.REQ.SERVER.%s.VARZ", s.ID()), nil, 250*time.Millisecond)
+	if err != nil {
+		t.Fatalf("No varz reply from the lameduck server: %v", err)
+	}
 }
 
 // If a consumer has not been registered (possible in heavily loaded systems with lots of assets)
@@ -6126,7 +6212,7 @@ func TestJetStreamClusterConsumerLimitsUpdateGatedAtMetaLeader(t *testing.T) {
 			}
 			sjs := ml.getJetStream()
 			sjs.mu.RLock()
-			sa := sjs.streamAssignment(globalAccountName, "test")
+			sa := sjs.streamAssignmentOrInflight(globalAccountName, "test")
 			if sa == nil || sa.Config == nil {
 				sjs.mu.RUnlock()
 				return errors.New("no stream assignment")
@@ -9434,6 +9520,52 @@ func TestJetStreamClusterStreamRestoreNameMismatch(t *testing.T) {
 	}
 }
 
+// https://github.com/nats-io/nats-server/issues/8687
+func TestJetStreamClusterStreamRestoreStallPublishesAdvisory(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}, Replicas: 3})
+	require_NoError(t, err)
+	for i := 0; i < 100; i++ {
+		sendStreamMsg(t, nc, "foo", "msg")
+	}
+	sc, ss, snapshot := performStreamBackup(t, nc, "TEST")
+	require_NoError(t, js.DeleteStream("TEST"))
+
+	sub, err := nc.SubscribeSync(JSAdvisoryStreamRestoreCompletePre + ".TEST")
+	require_NoError(t, err)
+	defer sub.Unsubscribe()
+
+	// Send the whole archive, but never the empty chunk that ends the transfer.
+	req, err := json.Marshal(struct {
+		StreamState  `json:"state"`
+		StreamConfig `json:"config"`
+	}{StreamState: ss, StreamConfig: sc})
+	require_NoError(t, err)
+	rmsg, err := nc.Request(fmt.Sprintf(JSApiStreamRestoreT, "TEST"), req, 5*time.Second)
+	require_NoError(t, err)
+	var resp JSApiStreamRestoreResponse
+	require_NoError(t, json.Unmarshal(rmsg.Data, &resp))
+	require_True(t, resp.Error == nil)
+	const chunk = 64 * 1024
+	for i := 0; i < len(snapshot); i += chunk {
+		_, err = nc.Request(resp.DeliverSubject, snapshot[i:min(i+chunk, len(snapshot))], time.Second)
+		require_NoError(t, err)
+	}
+
+	// The transfer stalls, and the restore is reported like any other failed restore.
+	msg, err := sub.NextMsg(15 * time.Second)
+	require_NoError(t, err)
+	var adv JSRestoreCompleteAdvisory
+	require_NoError(t, json.Unmarshal(msg.Data, &adv))
+	require_Equal(t, adv.Stream, "TEST")
+	require_Equal(t, adv.Bytes, int64(len(snapshot)))
+}
+
 func TestJetStreamClusterRemoveStatusHeaderOnStreamInbound(t *testing.T) {
 	test := func(t *testing.T, replicas int) {
 		var s *Server
@@ -11327,7 +11459,7 @@ func TestJetStreamClusterStreamScaleDownOfflinePeersHonorsReplicaCount(t *testin
 	// Get the stream peer set from the meta leader.
 	mjs := ml.getJetStream()
 	mjs.mu.RLock()
-	sa := mjs.streamAssignment(globalAccountName, "TEST")
+	sa := mjs.streamAssignmentOrInflight(globalAccountName, "TEST")
 	var streamPeers []string
 	if sa != nil {
 		streamPeers = copyStrings(sa.Group.Peers)
@@ -11479,7 +11611,7 @@ func TestJetStreamClusterConsumerScaleDownPrefersOnlinePeers(t *testing.T) {
 	ml := c.leader()
 	mjs := ml.getJetStream()
 	mjs.mu.RLock()
-	ca := mjs.consumerAssignment(globalAccountName, "TEST", "DUR")
+	ca := mjs.consumerAssignmentOrInflight(globalAccountName, "TEST", "DUR")
 	var consumerPeers []string
 	if ca != nil {
 		consumerPeers = copyStrings(ca.Group.Peers)
@@ -11703,7 +11835,7 @@ func TestJetStreamClusterMetaSnapshotRecoveryScaleStream(t *testing.T) {
 	mljs := ml.getJetStream()
 	mljs.mu.Lock()
 	var osa, nsa *streamAssignment
-	if osa = mljs.streamAssignment(globalAccountName, "TEST"); osa != nil {
+	if osa = mljs.streamAssignmentOrInflight(globalAccountName, "TEST"); osa != nil {
 		nsa = osa.copyGroup()
 	}
 	cc := mljs.cluster
@@ -11822,7 +11954,7 @@ func TestJetStreamClusterMetaSnapshotRecoveryScaleConsumer(t *testing.T) {
 	mljs := ml.getJetStream()
 	mljs.mu.Lock()
 	var oca, nca *consumerAssignment
-	if oca = mljs.consumerAssignment(globalAccountName, "TEST", "DUR"); oca != nil {
+	if oca = mljs.consumerAssignmentOrInflight(globalAccountName, "TEST", "DUR"); oca != nil {
 		nca = oca.copyGroup()
 	}
 	cc := mljs.cluster
@@ -12306,7 +12438,7 @@ func TestJetStreamClusterDesiredOriginRetentionBackToLimits(t *testing.T) {
 	snapshot := func() (retention, effective RetentionPolicy, origin *RetentionPolicy, pending bool) {
 		mjs.mu.RLock()
 		defer mjs.mu.RUnlock()
-		sa := mjs.streamAssignment(globalAccountName, "TEST")
+		sa := mjs.streamAssignmentOrInflight(globalAccountName, "TEST")
 		require_NotNil(t, sa)
 		if d := sa.Group.Desired; d != nil {
 			pending = true
@@ -12440,7 +12572,7 @@ func TestJetStreamClusterDesiredOriginRetentionCancelBackToInterest(t *testing.T
 	snapshot := func() (retention, effective RetentionPolicy, origin *RetentionPolicy, pending bool) {
 		mjs.mu.RLock()
 		defer mjs.mu.RUnlock()
-		sa := mjs.streamAssignment(globalAccountName, "TEST")
+		sa := mjs.streamAssignmentOrInflight(globalAccountName, "TEST")
 		require_NotNil(t, sa)
 		if d := sa.Group.Desired; d != nil {
 			pending = true
@@ -12721,7 +12853,7 @@ func TestJetStreamClusterDesiredOriginRetentionSurvivesConfigEdit(t *testing.T) 
 
 	require_True(t, ml == c.leader())
 	mjs.mu.RLock()
-	sa := mjs.streamAssignment(globalAccountName, "TEST")
+	sa := mjs.streamAssignmentOrInflight(globalAccountName, "TEST")
 	wasPending := sa != nil && sa.Group.Desired != nil
 	mjs.mu.RUnlock()
 	require_True(t, wasPending)
@@ -13207,7 +13339,7 @@ func proposeSelectedScaleDown(t *testing.T, c *cluster, stream, consumer string,
 	mjs := ml.getJetStream()
 	mjs.mu.Lock()
 	cc := mjs.cluster
-	ca := mjs.consumerAssignment(globalAccountName, stream, consumer)
+	ca := mjs.consumerAssignmentOrInflight(globalAccountName, stream, consumer)
 	if ca == nil || cc == nil || cc.meta == nil {
 		mjs.mu.Unlock()
 		t.Fatalf("no consumer assignment for %q", consumer)
@@ -13780,6 +13912,10 @@ func TestJetStreamClusterPeerRemoveRestoresQuorumWhileScalingDown(t *testing.T) 
 				}
 				if l := c.consumerLeader(globalAccountName, "TEST", "scaled"); l != nil {
 					return fmt.Errorf("consumer still has leader %q", l.Name())
+				}
+				// The old leader unsubscribes only after its stream monitor processes the step down.
+				if sl.gacc.sl.HasInterest("foo") {
+					return errors.New("stream still has interest")
 				}
 				return nil
 			})
@@ -15552,7 +15688,7 @@ func TestJetStreamClusterScaleDownCancelsCatchup(t *testing.T) {
 	waitReplicas := func(r int) {
 		t.Helper()
 		checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
-			si, err := js.StreamInfo("TEST")
+			si, err := js.StreamInfo("TEST", nats.MaxWait(time.Second))
 			if err != nil {
 				return err
 			}
@@ -15650,7 +15786,7 @@ func TestJetStreamClusterConsumerScaleDownDesiredAfterMetaLeaderChange(t *testin
 	mjs := ml.getJetStream()
 
 	mjs.mu.RLock()
-	ca := mjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+	ca := mjs.consumerAssignmentOrInflight(globalAccountName, "TEST", "CONSUMER")
 	require_NotNil(t, ca)
 	peers := copyStrings(ca.Group.Peers)
 	mjs.mu.RUnlock()
@@ -15772,6 +15908,16 @@ func TestJetStreamClusterReconcileMigratesConsumerBeforeDroppingStreamPeer(t *te
 	ml := c.leader()
 	require_NotNil(t, ml)
 	mjs := ml.getJetStream()
+
+	// The consumer leader responds to a create, wait for the meta leader to apply it.
+	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+		mjs.mu.RLock()
+		defer mjs.mu.RUnlock()
+		if mjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER") == nil {
+			return errors.New("consumer assignment not applied yet")
+		}
+		return nil
+	})
 
 	// The peer hosting the consumer is the one the scale down drops.
 	cl := c.consumerLeader(globalAccountName, "TEST", "CONSUMER")
@@ -16021,7 +16167,7 @@ func TestJetStreamClusterScaleUpSourceDown(t *testing.T) {
 						return fmt.Errorf("%s still an observer", s.Name())
 					}
 				}
-				ci, err := js.ConsumerInfo("TEST", "C")
+				ci, err := js.ConsumerInfo("TEST", "C", nats.MaxWait(time.Second))
 				if err != nil {
 					return err
 				}

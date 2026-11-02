@@ -1564,14 +1564,20 @@ func (c *cluster) stepDownStreamLeader(nc *nats.Conn, account, stream string, s 
 	c.t.Helper()
 	req, err := json.Marshal(JSApiLeaderStepdownRequest{Placement: &Placement{Preferred: s.Name()}})
 	require_NoError(c.t, err)
-	sl := c.streamLeader(account, stream)
-	if sl != s {
+	// The leader skips the preferred peer if it hasn't heard from it yet, retry until it's picked.
+	checkFor(c.t, 10*time.Second, 100*time.Millisecond, func() error {
+		c.waitOnStreamLeader(account, stream)
+		if sl := c.streamLeader(account, stream); sl == s {
+			return nil
+		}
 		_, err = nc.Request(fmt.Sprintf(JSApiStreamLeaderStepDownT, stream), req, 5*time.Second)
 		require_NoError(c.t, err)
 		c.waitOnStreamLeader(account, stream)
-		sl = c.streamLeader(account, stream)
-	}
-	require_Equal(c.t, sl, s)
+		if sl := c.streamLeader(account, stream); sl != s {
+			return fmt.Errorf("expected stream leader %s, got %s", s, sl)
+		}
+		return nil
+	})
 }
 
 // stepDownConsumerLeader steps the consumer leader down to the given server if it's not equal.
@@ -1579,14 +1585,20 @@ func (c *cluster) stepDownConsumerLeader(nc *nats.Conn, account, stream, consume
 	c.t.Helper()
 	req, err := json.Marshal(JSApiLeaderStepdownRequest{Placement: &Placement{Preferred: s.Name()}})
 	require_NoError(c.t, err)
-	cl := c.consumerLeader(account, stream, consumer)
-	if cl != s {
+	// The leader skips the preferred peer if it hasn't heard from it yet, retry until it's picked.
+	checkFor(c.t, 10*time.Second, 100*time.Millisecond, func() error {
+		c.waitOnConsumerLeader(account, stream, consumer)
+		if cl := c.consumerLeader(account, stream, consumer); cl == s {
+			return nil
+		}
 		_, err = nc.Request(fmt.Sprintf(JSApiConsumerLeaderStepDownT, stream, consumer), req, 5*time.Second)
 		require_NoError(c.t, err)
 		c.waitOnConsumerLeader(account, stream, consumer)
-		cl = c.consumerLeader(account, stream, consumer)
-	}
-	require_Equal(c.t, cl, s)
+		if cl := c.consumerLeader(account, stream, consumer); cl != s {
+			return fmt.Errorf("expected consumer leader %s, got %s", s, cl)
+		}
+		return nil
+	})
 }
 
 func (c *cluster) waitOnStreamLeader(account, stream string) {
@@ -2560,5 +2572,22 @@ func publishAsync(t testing.TB, js nats.JetStreamContext, subj string, msg []byt
 			return pubAck
 		}
 		require_Error(t, err, nats.ErrTooManyStalledMsgs)
+	}
+}
+
+// requireFileStoreStopped checks that the named filestore has already logged
+// to l that it stopped.
+func requireFileStoreStopped(t *testing.T, l *captureDebugLogger, name string) {
+	t.Helper()
+	stopped := fmt.Sprintf("Filestore [%s] Stopped", name)
+	for {
+		select {
+		case msg := <-l.dbgCh:
+			if msg == stopped {
+				return
+			}
+		default:
+			t.Fatalf("Filestore %q not stopped", name)
+		}
 	}
 }

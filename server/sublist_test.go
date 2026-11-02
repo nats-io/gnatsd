@@ -1228,6 +1228,14 @@ func TestIsSubsetMatch(t *testing.T) {
 		{"foo.>", "foo.bar", false},
 		{"foo..bar", "foo.*", false}, // Bad subject, we return false
 		{"foo.*", "foo..bar", false}, // Bad subject, we return false
+		// A wildcard char inside a token is a literal.
+		{"foo.bar", "foo.*bar", false},
+		{"foo.bar", "foo.**", false},
+		{"foo.*bar", "foo.*bar", true},
+		{"foo.*bar", "foo.*", true},
+		{"foo.*", "foo.*bar", false},
+		{"foo.bar", "foo.bar*", false},
+		{"foo.bar", "foo.>bar", false},
 	} {
 		t.Run("", func(t *testing.T) {
 			if res := subjectIsSubsetMatch(test.subject, test.test); res != test.result {
@@ -1666,6 +1674,13 @@ func TestSublistSubjectCollide(t *testing.T) {
 	require_True(t, SubjectsCollide("foo.*", "foo.foo"))
 	require_True(t, SubjectsCollide("foo.*", "*.foo"))
 	require_True(t, SubjectsCollide("foo.bar.>", "*.bar.foo"))
+
+	// A wildcard char inside a token is a literal.
+	require_False(t, SubjectsCollide("foo.*bar.*", "foo.baz.*"))
+	require_False(t, SubjectsCollide("foo.>bar.*", "foo.baz.*"))
+	require_False(t, SubjectsCollide("foo.**.*", "foo.baz.*"))
+	require_True(t, SubjectsCollide("foo.*bar.*", "foo.*bar.*"))
+	require_True(t, SubjectsCollide("foo.*bar.*", "foo.*.baz"))
 }
 
 func TestSublistAddCacheHitRate(t *testing.T) {

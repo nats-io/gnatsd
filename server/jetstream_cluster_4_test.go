@@ -264,16 +264,25 @@ func TestJetStreamClusterSourceWorkingQueueWithLimit(t *testing.T) {
 	require_NoError(t, err)
 
 	sendBatch := func(subject string, n int) {
-		for i := 0; i < n; i++ {
+		for i := range n {
 			_, err = js.Publish(subject, []byte(fmt.Sprintf(msgPayloadFormat, i)))
 			require_NoError(t, err)
 		}
 	}
 
 	f := func(ss *nats.Subscription, done chan bool) {
-		for i := 0; i < totalMsgs; i++ {
-			m, err := ss.Fetch(1, nats.MaxWait(3*time.Second))
-			require_NoError(t, err)
+		for i := range totalMsgs {
+			var m []*nats.Msg
+			// The consumer's interest can still be propagating.
+			// The source also pauses for a few seconds after the stream was full.
+			checkFor(t, 5*time.Second, 50*time.Millisecond, func() error {
+				var err error
+				if m, err = ss.Fetch(1, nats.MaxWait(3*time.Second)); err == nats.ErrNoResponders || err == nats.ErrTimeout {
+					return err
+				}
+				require_NoError(t, err)
+				return nil
+			})
 			p, err := strconv.Atoi(string(m[0].Data))
 			require_NoError(t, err)
 			require_Equal(t, p, i)
@@ -329,7 +338,8 @@ func TestJetStreamClusterSourceWorkingQueueWithLimit(t *testing.T) {
 	select {
 	case <-doneChan1:
 		ss1.Drain()
-	case <-time.After(10 * time.Second):
+	// Every pause of the source slows down the consumer.
+	case <-time.After(30 * time.Second):
 		t.Fatalf("Did not receive completion signal")
 	}
 
@@ -357,7 +367,8 @@ func TestJetStreamClusterSourceWorkingQueueWithLimit(t *testing.T) {
 	select {
 	case <-doneChan2:
 		ss2.Drain()
-	case <-time.After(20 * time.Second):
+	// Every pause of the source slows down the consumer.
+	case <-time.After(30 * time.Second):
 		t.Fatalf("Did not receive completion signal")
 	}
 }
@@ -3319,7 +3330,7 @@ func TestJetStreamClusterConsumerReplicasAfterScale(t *testing.T) {
 
 	checkConsumerReplicas := func(t *testing.T, stream, consumer string, cor, clr int) {
 		checkFor(t, 5*time.Second, 500*time.Millisecond, func() error {
-			if ci, err = js.ConsumerInfo(stream, consumer); err != nil {
+			if ci, err = js.ConsumerInfo(stream, consumer, nats.MaxWait(time.Second)); err != nil {
 				return err
 			}
 			if ci.Config.Replicas != cor {
@@ -3397,7 +3408,7 @@ func TestJetStreamClusterConsumerReplicasAfterScaleMoveConsumer(t *testing.T) {
 	consumerLeader := ci.Cluster.Leader
 
 	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
-		si, err := js.StreamInfo("TEST")
+		si, err := js.StreamInfo("TEST", nats.MaxWait(time.Second))
 		if err != nil {
 			return err
 		}
@@ -3418,7 +3429,7 @@ func TestJetStreamClusterConsumerReplicasAfterScaleMoveConsumer(t *testing.T) {
 
 	// Check that the consumer state wasn't lost.
 	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
-		ci2, err := js.ConsumerInfo("TEST", "CONSUMER")
+		ci2, err := js.ConsumerInfo("TEST", "CONSUMER", nats.MaxWait(time.Second))
 		if err != nil {
 			return err
 		}
@@ -4337,6 +4348,15 @@ func TestJetStreamClusterMetaSnapshotReCreateConsistency(t *testing.T) {
 
 	ml := c.leader()
 	mjs := ml.getJetStream()
+	// The consumer leader responds to a create, the meta leader could still be applying it.
+	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+		mjs.mu.RLock()
+		defer mjs.mu.RUnlock()
+		if mjs.consumerAssignment(globalAccountName, "TEST", "consumer") == nil {
+			return errors.New("consumer not applied yet")
+		}
+		return nil
+	})
 	mjs.mu.Lock()
 	sa := mjs.streamAssignment(globalAccountName, "TEST")
 	ca := mjs.consumerAssignment(globalAccountName, "TEST", "consumer")
@@ -6438,6 +6458,15 @@ func TestJetStreamClusterMaxHAAssetsTracking(t *testing.T) {
 	}
 
 	sjs := c.leader().getJetStream()
+	// The consumer leader responds to a create, the meta leader could still be applying it.
+	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+		sjs.mu.RLock()
+		defer sjs.mu.RUnlock()
+		if sjs.consumerAssignment(globalAccountName, "TEST", "C2") == nil {
+			return errors.New("consumer not applied yet")
+		}
+		return nil
+	})
 	sjs.mu.Lock()
 	defer sjs.mu.Unlock()
 	cc := sjs.cluster
@@ -6572,9 +6601,9 @@ func TestJetStreamClusterMaxHAAssetsRetentionChangeReserved(t *testing.T) {
 	sjs := ml.getJetStream()
 	sjs.mu.Lock()
 	cc := sjs.cluster
-	sa := sjs.streamAssignment(globalAccountName, "TEST")
+	sa := sjs.streamAssignmentOrInflight(globalAccountName, "TEST")
 	require_NotNil(t, sa)
-	ca := sa.consumers["C"]
+	ca := sjs.consumerAssignmentOrInflight(globalAccountName, "TEST", "C")
 	require_NotNil(t, ca)
 	require_Len(t, len(ca.Group.Peers), 1)
 	requireCounts := func(want peerAssets) {
@@ -6708,14 +6737,14 @@ func TestJetStreamClusterMaxHAAssetsR1MoveNotLimited(t *testing.T) {
 	require_True(t, moveResp.Error == nil)
 
 	checkFor(t, 10*time.Second, 200*time.Millisecond, func() error {
-		si, err := js.StreamInfo("S2")
+		si, err := js.StreamInfo("S2", nats.MaxWait(time.Second))
 		if err != nil {
 			return err
 		}
 		if si.Cluster.Leader == _EMPTY_ || si.Cluster.Leader == origin || len(si.Cluster.Replicas) > 0 {
 			return fmt.Errorf("move not completed yet: %+v", si.Cluster)
 		}
-		ci, err := js.ConsumerInfo("S2", "DUR")
+		ci, err := js.ConsumerInfo("S2", "DUR", nats.MaxWait(time.Second))
 		if err != nil {
 			return err
 		}
@@ -6757,6 +6786,15 @@ func TestJetStreamClusterMaxHAAssetsConsumerStackedScaleUp(t *testing.T) {
 
 	// Simulate an inflight R1 -> R3 scale up, which is counted on its desired peers.
 	sjs := c.leader().getJetStream()
+	// The consumer leader responds to a create, the meta leader could still be applying it.
+	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+		sjs.mu.RLock()
+		defer sjs.mu.RUnlock()
+		if sjs.consumerAssignment(globalAccountName, "TEST", "C") == nil {
+			return errors.New("consumer not applied yet")
+		}
+		return nil
+	})
 	sjs.mu.Lock()
 	cc := sjs.cluster
 	sa := sjs.streamAssignment(globalAccountName, "TEST")
@@ -6847,6 +6885,15 @@ func TestJetStreamClusterMaxHAAssetsPlacementMoveOverlap(t *testing.T) {
 
 	// Simulate an inflight move onto the tagged 'b' servers, which is counted on its desired peers.
 	sjs := c.leader().getJetStream()
+	// The stream leader responds to a create, the meta leader could still be applying it.
+	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+		sjs.mu.RLock()
+		defer sjs.mu.RUnlock()
+		if sjs.streamAssignment(globalAccountName, "INTEREST") == nil {
+			return errors.New("stream not applied yet")
+		}
+		return nil
+	})
 	sjs.mu.Lock()
 	cc := sjs.cluster
 	sa := sjs.streamAssignment(globalAccountName, "INTEREST")
@@ -6933,7 +6980,7 @@ func TestJetStreamClusterMaxHAAssetsPeerRemoveIgnoresLimit(t *testing.T) {
 	var spare *Server
 	sjs := c.leader().getJetStream()
 	sjs.mu.Lock()
-	sa := sjs.streamAssignment(globalAccountName, "TEST")
+	sa := sjs.streamAssignmentOrInflight(globalAccountName, "TEST")
 	for _, s := range c.servers {
 		if !slices.Contains(sa.Group.Peers, s.NodeName()) {
 			spare = s
@@ -9357,7 +9404,7 @@ func TestJetStreamClusterCreateGroupForConsumerNoPeers(t *testing.T) {
 	sjs.mu.Lock()
 	defer sjs.mu.Unlock()
 
-	sa := cc.streams[globalAccountName]["TEST"]
+	sa := sjs.streamAssignmentOrInflight(globalAccountName, "TEST")
 	require_True(t, sa != nil)
 
 	// Asking for more replicas than the parent stream has peers can't be placed.
@@ -9685,7 +9732,7 @@ func TestJetStreamClusterConsumerAssignmentCreateAPI(t *testing.T) {
 	getCa := func() *consumerAssignment {
 		mjs.mu.RLock()
 		defer mjs.mu.RUnlock()
-		return mjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+		return mjs.consumerAssignmentOrInflight(globalAccountName, "TEST", "CONSUMER")
 	}
 
 	ca := getCa()
@@ -9790,7 +9837,9 @@ func TestJetStreamClusterConsumerAssignmentDeleteAPI(t *testing.T) {
 		return mjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
 	}
 
-	ca := getCa()
+	mjs.mu.RLock()
+	ca := mjs.consumerAssignmentOrInflight(globalAccountName, "TEST", "CONSUMER")
+	mjs.mu.RUnlock()
 	require_NotNil(t, ca)
 	created := ca.Created
 
@@ -9918,7 +9967,7 @@ func TestJetStreamClusterConsumerDeleteRacingGroupRename(t *testing.T) {
 	// single node group converges after a migration) and immediately run the
 	// client delete request on the meta leader, before the rename is applied.
 	mjs.mu.Lock()
-	rca := mjs.consumerAssignment(globalAccountName, "TEST", "C").copyGroup()
+	rca := mjs.consumerAssignmentOrInflight(globalAccountName, "TEST", "C").copyGroup()
 	rca.Group.Name = groupNameForConsumer(rca.Group.Peers, rca.Group.Storage)
 	rca.Reply = _EMPTY_
 	err = cc.meta.Propose(cc.term, encodeAddConsumerAssignment(rca))
@@ -10085,7 +10134,7 @@ func TestJetStreamClusterStreamDeleteRacingGroupRename(t *testing.T) {
 	cc := mjs.cluster
 
 	mjs.mu.Lock()
-	rsa := mjs.streamAssignment(globalAccountName, "TEST").copyGroup()
+	rsa := mjs.streamAssignmentOrInflight(globalAccountName, "TEST").copyGroup()
 	rsa.Group.Name = groupNameForStream(rsa.Group.Peers, rsa.Group.Storage)
 	rsa.Reply = _EMPTY_
 	err = cc.meta.Propose(cc.term, encodeUpdateStreamAssignment(rsa))
@@ -10145,7 +10194,7 @@ func TestJetStreamClusterConsumerPauseRacingGroupRename(t *testing.T) {
 	// Track a rename of the consumer's group as an inflight proposal, as if the
 	// meta leader had just proposed it, and it is not applied yet.
 	mjs.mu.Lock()
-	rca := mjs.consumerAssignment(globalAccountName, "TEST", "C").copyGroup()
+	rca := mjs.consumerAssignmentOrInflight(globalAccountName, "TEST", "C").copyGroup()
 	rca.Group.Name = groupNameForConsumer(rca.Group.Peers, rca.Group.Storage)
 	rca.Reply = _EMPTY_
 	cc.trackInflightConsumerProposal(globalAccountName, "TEST", rca, false)
@@ -10258,6 +10307,142 @@ func TestJetStreamClusterStreamInfoWithInflightStreamUpdate(t *testing.T) {
 	require_Equal(t, si.State.Consumers, consumers)
 }
 
+func TestJetStreamClusterStreamInfoWithUncommittedCreate(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	ml := c.leader()
+	nc, js := jsClientConnect(t, ml)
+	defer nc.Close()
+
+	// Keep the metadata leader alive, but prevent new assignments from reaching quorum.
+	for _, s := range c.servers {
+		if s != ml {
+			s.Shutdown()
+		}
+	}
+	sjs, _ := ml.getJetStreamCluster()
+
+	// R1 allows placement on the surviving server, but metadata still needs quorum.
+	cfg := &nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}, Replicas: 1}
+	_, err := js.AddStream(cfg, nats.MaxWait(250*time.Millisecond))
+	require_Error(t, err, context.DeadlineExceeded)
+
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		sjs.mu.RLock()
+		applied := sjs.streamAssignment(globalAccountName, "TEST")
+		pending := sjs.streamAssignmentOrInflight(globalAccountName, "TEST")
+		sjs.mu.RUnlock()
+		if applied != nil || pending == nil {
+			return fmt.Errorf("expected only an inflight assignment: applied=%v pending=%v",
+				applied != nil, pending != nil)
+		}
+		return nil
+	})
+
+	// INFO must require an actual stream, not just its inflight assignment.
+	_, err = js.StreamInfo("TEST", nats.MaxWait(2*time.Second))
+	require_Error(t, err, nats.ErrStreamNotFound)
+
+	// AddStream sends CREATE directly. Retrying cannot succeed without quorum.
+	_, err = js.AddStream(cfg, nats.MaxWait(2*time.Second))
+	require_Error(t, err, context.DeadlineExceeded)
+
+	// Restore quorum and verify that the stream can store messages.
+	for _, s := range c.servers {
+		if s != ml {
+			c.restartServer(s)
+		}
+	}
+	c.waitOnLeader()
+	c.waitOnStreamLeader(globalAccountName, "TEST")
+	si, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+	require_Equal(t, si.Config.Name, "TEST")
+	ack, err := js.Publish("foo", []byte("message after committed creation"))
+	require_NoError(t, err)
+	msg, err := js.GetMsg("TEST", ack.Sequence)
+	require_NoError(t, err)
+	require_Equal(t, msg.Subject, "foo")
+	require_Equal(t, string(msg.Data), "message after committed creation")
+}
+
+func TestJetStreamClusterConsumerInfoWithUncommittedCreate(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	ml := c.leader()
+	nc, js := jsClientConnect(t, ml)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name: "TEST", Subjects: []string{"foo"}, Replicas: 3,
+	})
+	require_NoError(t, err)
+	c.waitOnStreamLeader(globalAccountName, "TEST")
+
+	// Shutdown all servers, except for the metadata leader.
+	for _, s := range c.servers {
+		if s != ml {
+			s.Shutdown()
+		}
+	}
+	sjs, _ := ml.getJetStreamCluster()
+
+	// Use R1 so the consumer can be placed on the metadata.
+	// Its assignment still needs a quorum of the three metadata peers.
+	cfg := &nats.ConsumerConfig{
+		Durable: "C", Name: "C", FilterSubject: "foo", AckPolicy: nats.AckExplicitPolicy, Replicas: 1,
+	}
+	_, err = js.AddConsumer("TEST", cfg, nats.MaxWait(250*time.Millisecond))
+	require_Error(t, err, context.DeadlineExceeded)
+
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		sjs.mu.RLock()
+		applied := sjs.consumerAssignment(globalAccountName, "TEST", "C")
+		pending := sjs.consumerAssignmentOrInflight(globalAccountName, "TEST", "C")
+		sjs.mu.RUnlock()
+		if applied != nil || pending == nil {
+			return fmt.Errorf("expected only an inflight assignment: applied=%v pending=%v",
+				applied != nil, pending != nil)
+		}
+		return nil
+	})
+
+	// INFO must require an actual consumer, not just its inflight assignment.
+	_, err = js.ConsumerInfo("TEST", "C", nats.MaxWait(2*time.Second))
+	require_Error(t, err, nats.ErrConsumerNotFound)
+
+	// The legacy client retries creation after INFO returns consumer not found.
+	// Without quorum expect the request to timeout.
+	_, err = js.AddConsumer("TEST", cfg, nats.MaxWait(2*time.Second))
+	require_Error(t, err, context.DeadlineExceeded)
+
+	// Restart servers and check that the consumer works.
+	for _, s := range c.servers {
+		if s != ml {
+			c.restartServer(s)
+		}
+	}
+	c.waitOnLeader()
+	c.waitOnStreamLeader(globalAccountName, "TEST")
+	c.waitOnConsumerLeader(globalAccountName, "TEST", "C")
+	ci, err := js.ConsumerInfo("TEST", "C")
+	require_NoError(t, err)
+	require_Equal(t, ci.Name, "C")
+	sub, err := js.PullSubscribe("foo", "C", nats.Bind("TEST", "C"))
+	require_NoError(t, err)
+	ack, err := js.Publish("foo", []byte("message after committed creation"))
+	require_NoError(t, err)
+	msgs, err := sub.Fetch(1, nats.MaxWait(5*time.Second))
+	require_NoError(t, err)
+	require_Equal(t, len(msgs), 1)
+	meta, err := msgs[0].Metadata()
+	require_NoError(t, err)
+	require_Equal(t, meta.Sequence.Stream, ack.Sequence)
+	require_NoError(t, msgs[0].AckSync())
+}
+
 func TestJetStreamClusterConsumerInfoWithInflightConsumerDelete(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
@@ -10368,10 +10553,16 @@ func TestJetStreamClusterConsumerRemovalMatchesRenamedGroup(t *testing.T) {
 	// A server that only holds the assignment, not the consumer itself.
 	s := c.randomNonConsumerLeader(globalAccountName, "TEST", "C")
 	sjs := s.getJetStream()
-	sjs.mu.RLock()
-	ca := sjs.consumerAssignment(globalAccountName, "TEST", "C")
-	sjs.mu.RUnlock()
-	require_NotNil(t, ca)
+	// The consumer leader responds to a create, this server could still be applying it.
+	var ca *consumerAssignment
+	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+		sjs.mu.RLock()
+		defer sjs.mu.RUnlock()
+		if ca = sjs.consumerAssignment(globalAccountName, "TEST", "C"); ca == nil {
+			return errors.New("consumer not applied yet")
+		}
+		return nil
+	})
 
 	// A removal for a recreated consumer with the same name is not ours.
 	nca := ca.copyGroup()
@@ -10712,7 +10903,7 @@ func TestJetStreamClusterStreamMoveIgnoresStoreStateOfDownPeer(t *testing.T) {
 	mjs := ml.getJetStream()
 	cc := mjs.cluster
 	mjs.mu.Lock()
-	sa := mjs.streamAssignment(globalAccountName, "TEST")
+	sa := mjs.streamAssignmentOrInflight(globalAccountName, "TEST")
 	require_NotNil(t, sa)
 	origin := copyStrings(sa.Group.Peers)
 	nsa := sa.copyGroup()
@@ -10819,16 +11010,23 @@ func TestJetStreamClusterConsumerMoveWaitsForDesiredQuorum(t *testing.T) {
 	// Move onto the servers not hosting the stream yet, while two of them are down.
 	var desired []string
 	var down []*Server
-	for _, s := range c.servers {
-		if s.JetStreamIsStreamAssigned(globalAccountName, "TEST") {
-			continue
+	// A stream peer could still be applying the create, and not report it as assigned yet.
+	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+		desired, down = nil, nil
+		for _, s := range c.servers {
+			if s.JetStreamIsStreamAssigned(globalAccountName, "TEST") {
+				continue
+			}
+			desired = append(desired, s.NodeName())
+			if len(down) < 2 {
+				down = append(down, s)
+			}
 		}
-		desired = append(desired, s.NodeName())
-		if len(down) < 2 {
-			down = append(down, s)
+		if len(desired) != 3 {
+			return fmt.Errorf("expected 3 desired peers, got %d", len(desired))
 		}
-	}
-	require_Len(t, len(desired), 3)
+		return nil
+	})
 	for _, s := range down {
 		s.Shutdown()
 	}
@@ -10839,7 +11037,7 @@ func TestJetStreamClusterConsumerMoveWaitsForDesiredQuorum(t *testing.T) {
 	mjs := ml.getJetStream()
 	cc := mjs.cluster
 	mjs.mu.Lock()
-	sa := mjs.streamAssignment(globalAccountName, "TEST")
+	sa := mjs.streamAssignmentOrInflight(globalAccountName, "TEST")
 	require_NotNil(t, sa)
 	origin := copyStrings(sa.Group.Peers)
 	nsa := sa.copyGroup()
@@ -11017,6 +11215,50 @@ func TestJetStreamClusterCanRemovePeer(t *testing.T) {
 	}
 }
 
+func TestJetStreamClusterSortScaleDownPeers(t *testing.T) {
+	// Members are "A" (us), then uppercase for online and lowercase for offline.
+	// Learners are uppercase for caught up and lowercase for behind. Others we haven't heard from.
+	for _, test := range []struct {
+		name     string
+		members  string
+		learners string
+		others   string
+		sorted   string
+	}{
+		{"leader first", "BA", "", "", "AB"},
+		{"online member before offline member", "AbC", "", "", "ACB"},
+		{"online member before caught up learner", "AB", "C", "", "ABC"},
+		{"caught up learner before offline member", "Ab", "C", "", "ACB"},
+		{"offline member before learner that's behind", "Ab", "c", "", "ABC"},
+		{"caught up learner before learner that's behind", "A", "cB", "", "ABC"},
+		{"unknown peer last", "Ab", "", "C", "ABC"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s, n := &Server{}, &raft{peers: map[string]*lps{}, observed: map[string]*lps{}}
+			now := time.Now()
+			// Members are passed last, so they're only first if sorted.
+			candidates := strings.Split(test.others, "")
+			for _, id := range test.learners {
+				peer := strings.ToUpper(string(id))
+				n.observed[peer] = &lps{ts: now, li: 1}
+				if peer != string(id) {
+					n.observed[peer].ci = 2
+				}
+				candidates = append(candidates, peer)
+			}
+			var current []*Peer
+			for _, id := range test.members {
+				peer := strings.ToUpper(string(id))
+				s.nodeToInfo.Store(peer, nodeInfo{offline: peer != string(id)})
+				n.peers[peer] = &lps{ts: now}
+				current = append(current, &Peer{ID: peer})
+				candidates = append(candidates, peer)
+			}
+			require_Equal(t, strings.Join(s.sortScaleDownPeers(n, "A", current, candidates), ""), test.sorted)
+		})
+	}
+}
+
 func TestJetStreamClusterStreamMoveHoldsWhileDesiredPeerCatchesUp(t *testing.T) {
 	askInterval, stall := migratePosAskInterval, migrateCatchupStall
 	migratePosAskInterval, migrateCatchupStall = 250*time.Millisecond, time.Second
@@ -11087,7 +11329,7 @@ func TestJetStreamClusterStreamMoveHoldsWhileDesiredPeerCatchesUp(t *testing.T) 
 	mjs := ml.getJetStream()
 	cc := mjs.cluster
 	mjs.mu.Lock()
-	sa := mjs.streamAssignment(globalAccountName, "TEST")
+	sa := mjs.streamAssignmentOrInflight(globalAccountName, "TEST")
 	require_NotNil(t, sa)
 	nsa := sa.copyGroup()
 	nsa.Reply = _EMPTY_
@@ -12144,5 +12386,182 @@ func TestJetStreamClusterMetaMonitorNotStartedShutdown(t *testing.T) {
 	s.shutdownJetStream()
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("shutdownJetStream took %v", elapsed)
+	}
+}
+
+func TestJetStreamClusterScaleDownNotBlockedByUnaddedPeer(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R4S", 4)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}, Replicas: 3})
+	require_NoError(t, err)
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "C", AckPolicy: nats.AckExplicitPolicy})
+	require_NoError(t, err)
+
+	sl := c.streamLeader(globalAccountName, "TEST")
+	cl := c.consumerLeader(globalAccountName, "TEST", "C")
+	mset, err := sl.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	n, sjs := mset.raftNode(), sl.getJetStream()
+	cmset, err := cl.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	o := cmset.lookupConsumer("C")
+	require_NotNil(t, o)
+	on, cjs := o.raftNode(), cl.getJetStream()
+
+	// Stop a member, so the live members can't reach quorum once a peer is added.
+	sjs.mu.RLock()
+	peers := copyStrings(sjs.streamAssignment(globalAccountName, "TEST").Group.Peers)
+	sjs.mu.RUnlock()
+	var down, unadded string
+	for _, s := range c.servers {
+		if !slices.Contains(peers, s.NodeName()) {
+			unadded = s.NodeName()
+		} else if down == _EMPTY_ && s != sl && s != cl {
+			down = s.NodeName()
+			s.Shutdown()
+		}
+	}
+	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		for _, rn := range []RaftNode{n, on} {
+			for _, p := range rn.Peers() {
+				if p.ID == down && withinLiveWindow(p.Last) {
+					return errors.New("member still live")
+				}
+			}
+		}
+		return nil
+	})
+
+	// The group was scaled up onto the fourth server, but scaled back down before it could be added.
+	scaleDown := func(rg *raftGroup, n RaftNode) {
+		rg.Peers = append(rg.Peers, unadded)
+		rg.Desired = &desiredRaftGroup{ID: "scale-down", Term: n.Term(), Peers: rg.Peers, ScaleDown: true}
+	}
+
+	t.Run("stream", func(t *testing.T) {
+		sjs.mu.RLock()
+		sa := sjs.streamAssignment(globalAccountName, "TEST").copyGroup()
+		sjs.mu.RUnlock()
+		scaleDown(sa.Group, n)
+		status := sjs.runStreamMigration(mset, sa, n, n.Term(), &peerPositions{})
+		require_NotNil(t, status)
+		require_Equal(t, status.Description, "selecting peers to scale down to")
+	})
+
+	t.Run("consumer", func(t *testing.T) {
+		cjs.mu.RLock()
+		ca := cjs.consumerAssignment(globalAccountName, "TEST", "C").copyGroup()
+		cjs.mu.RUnlock()
+		scaleDown(ca.Group, on)
+		status := cjs.runConsumerMigration(o, ca, on, on.Term())
+		require_NotNil(t, status)
+		require_Equal(t, status.Description, "selecting peers to scale down to")
+	})
+}
+
+func TestJetStreamClusterMetaGroupStopsWALOnSetupFailure(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		setup func(t *testing.T, sd string)
+		check func(t *testing.T, sd string, err error)
+	}{
+		{
+			// No peer state to recover, so the meta group bootstraps, but can't write it.
+			name: "Bootstrap",
+			setup: func(t *testing.T, sd string) {
+				psf := filepath.Join(sd, peerStateFile)
+				require_NoError(t, os.Remove(psf))
+				require_NoError(t, os.Mkdir(psf, defaultDirPerms))
+			},
+			check: func(t *testing.T, sd string, err error) {
+				var lerr *os.LinkError
+				require_True(t, errors.As(err, &lerr))
+				require_Equal(t, lerr.New, filepath.Join(sd, peerStateFile))
+			},
+		},
+		{
+			// The peer state is recovered, but can't be written back.
+			name: "WritePeerState",
+			setup: func(t *testing.T, sd string) {
+				require_NoError(t, os.Mkdir(filepath.Join(sd, peerStateFile)+".tmp", defaultDirPerms))
+			},
+			check: func(t *testing.T, sd string, err error) {
+				var perr *os.PathError
+				require_True(t, errors.As(err, &perr))
+				require_Equal(t, perr.Path, filepath.Join(sd, peerStateFile)+".tmp")
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := runServerWaitingForRouting(t)
+			defer s.Shutdown()
+			sd := s.getJetStream().getMetaGroup().(*raft).sd
+			// Stops the meta node and waits for it to release its WAL.
+			require_NoError(t, s.ShutdownJetStream())
+			test.setup(t, sd)
+
+			l := &captureDebugLogger{dbgCh: make(chan string, 100)}
+			s.SetLogger(l, true, false)
+			err := s.EnableJetStream(&JetStreamConfig{StoreDir: s.getOpts().StoreDir})
+			require_Error(t, err)
+			test.check(t, sd, err)
+			requireFileStoreStopped(t, l, defaultMetaGroupName)
+		})
+	}
+}
+
+func TestJetStreamClusterHealthzNewReplicatedAssets(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	ml := c.leader()
+	nc, js := jsClientConnect(t, ml)
+	defer nc.Close()
+
+	// Poll a follower, the meta leader applies assignments before the others.
+	s := c.randomNonLeader()
+	require_NotNil(t, s)
+	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		if hs := s.healthz(nil); hs.StatusCode != 200 {
+			return fmt.Errorf("healthz: %d %s", hs.StatusCode, hs.Error)
+		}
+		return nil
+	})
+
+	var stop atomic.Bool
+	errCh := make(chan string, 1)
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for !stop.Load() {
+			if hs := s.healthz(nil); hs.StatusCode != 200 {
+				select {
+				case errCh <- fmt.Sprintf("%d %s", hs.StatusCode, hs.Error):
+				default:
+				}
+			}
+			time.Sleep(time.Millisecond)
+		}
+	})
+
+	// New replicated streams and consumers are starting, not unhealthy.
+	for i := range 10 {
+		name := fmt.Sprintf("TEST%d", i)
+		_, err := js.AddStream(&nats.StreamConfig{Name: name, Subjects: []string{name}, Replicas: 3})
+		require_NoError(t, err)
+		_, err = js.AddConsumer(name, &nats.ConsumerConfig{Durable: "CONSUMER", AckPolicy: nats.AckExplicitPolicy, Replicas: 3})
+		require_NoError(t, err)
+	}
+	c.waitOnAllCurrent()
+	stop.Store(true)
+	wg.Wait()
+
+	select {
+	case e := <-errCh:
+		t.Fatalf("Expected healthz to stay healthy, got: %s", e)
+	default:
 	}
 }

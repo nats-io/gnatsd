@@ -1444,12 +1444,10 @@ func (s *Server) createWSClient(conn net.Conn, ws *websocket) *client {
 	c.mu.Unlock()
 
 	s.mu.Lock()
-	if !s.isRunning() || s.ldm {
-		if s.isShuttingDown() {
-			conn.Close()
-		}
+	if !s.isRunning() || s.isShuttingDown() || s.ldm {
 		s.mu.Unlock()
-		return c
+		c.closeConnection(ServerShutdown)
+		return nil
 	}
 
 	if opts.MaxConn < 0 || (opts.MaxConn > 0 && len(s.clients) >= opts.MaxConn) {

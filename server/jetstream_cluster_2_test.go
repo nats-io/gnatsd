@@ -1077,10 +1077,18 @@ func metaPeerRemove(t *testing.T, nc *nats.Conn, subject, peer string) *ApiError
 	t.Helper()
 	req, err := json.Marshal(&JSApiMetaServerRemoveRequest{Server: peer})
 	require_NoError(t, err)
-	rmsg, err := nc.Request(subject, req, 5*time.Second)
-	require_NoError(t, err)
 	var resp JSApiMetaServerRemoveResponse
-	require_NoError(t, json.Unmarshal(rmsg.Data, &resp))
+	// A previous membership change can still be committing, retry until it's done.
+	checkFor(t, 5*time.Second, 50*time.Millisecond, func() error {
+		rmsg, err := nc.Request(subject, req, 5*time.Second)
+		require_NoError(t, err)
+		resp = JSApiMetaServerRemoveResponse{}
+		require_NoError(t, json.Unmarshal(rmsg.Data, &resp))
+		if resp.Error != nil && resp.Error.ErrCode == uint16(JSClusterServerMemberChangeInflightErr) {
+			return resp.Error
+		}
+		return nil
+	})
 	return resp.Error
 }
 
@@ -5434,7 +5442,7 @@ func TestJetStreamClusterDuplicateMsgIdsOnCatchupAndLeaderTakeover(t *testing.T)
 	require_NoError(t, err)
 	if node := mset.raftNode(); node == nil {
 		t.Fatalf("Could not get stream group name")
-	} else if err := node.InstallSnapshot(mset.stateSnapshot(), false); err != nil {
+	} else if err := node.InstallSnapshot(mset.stateSnapshot(), true); err != nil {
 		t.Fatalf("Error installing snapshot: %v", err)
 	}
 
@@ -9130,6 +9138,32 @@ func TestJetStreamClusterSelectPeerToAdd(t *testing.T) {
 	n = newNode(map[string]time.Time{"A": {}, "B": now, "C": now}, nil)
 	s.nodeToInfo.Store("C", nodeInfo{offline: true})
 	require_Equal(t, selectFor(n, []string{"D"}), _EMPTY_)
+
+	// As the only member, learners that aren't caught up are waited for at first.
+	n = newNode(map[string]time.Time{"A": {}}, map[string]time.Time{"E": now, "F": now})
+	for id, li := range map[string]uint64{"E": 5, "F": 7} {
+		n.observed[id].li, n.observed[id].ci, n.observed[id].fs = li, 10, now
+	}
+	add, catchingUp = s.selectPeerToAdd(n, "A", []*Peer{{ID: "A"}}, []string{"E", "F"})
+	require_Equal(t, add, _EMPTY_)
+	require_True(t, catchingUp)
+
+	// But our writes don't wait on them, so after a grace period the most caught up learner is added.
+	for _, id := range []string{"E", "F"} {
+		n.observed[id].fs = now.Add(-migrateFirstPeerGrace)
+	}
+	require_Equal(t, selectFor(n, []string{"E", "F"}), "F")
+
+	// A caught up learner is also preferred by how far it's caught up, rather than when we last heard from it.
+	n = newNode(map[string]time.Time{"A": {}}, map[string]time.Time{"E": now.Add(-hbInterval), "F": now})
+	n.observed["E"].li = 3
+	require_Equal(t, selectFor(n, []string{"E", "F"}), "E")
+
+	// The grace period doesn't apply with other members, as they already pace our writes.
+	n = newNode(map[string]time.Time{"A": {}, "B": now}, map[string]time.Time{"E": now})
+	ps := n.observed["E"]
+	ps.li, ps.ci, ps.fs = 5, 10, now.Add(-migrateFirstPeerGrace)
+	require_Equal(t, selectFor(n, []string{"E"}), _EMPTY_)
 }
 
 func TestJetStreamClusterStreamCatchupPeers(t *testing.T) {

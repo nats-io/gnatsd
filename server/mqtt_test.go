@@ -4628,6 +4628,306 @@ func TestMQTTWill(t *testing.T) {
 	}
 }
 
+func TestMQTTWillOnShutdown(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		cleanSess bool
+		qos       byte
+		retain    bool
+		ws        bool
+	}{
+		{"clean_session", true, 1, false, false},
+		{"persistent_session", false, 1, false, false},
+		{"qos2", true, 2, false, false},
+		{"retained_qos0", true, 0, true, false},
+		{"retained_qos1", true, 1, true, false},
+		{"websocket", true, 1, false, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for _, mode := range []string{"shutdown", "lame_duck", "connection_closed", "disconnect_shutdown", "disconnect_lame_duck"} {
+				t.Run(mode, func(t *testing.T) {
+					o := testMQTTDefaultOptions()
+					o.LameDuckDuration = 10 * time.Millisecond
+					o.LameDuckGracePeriod = -time.Millisecond
+					if test.ws {
+						o.Websocket.Host = "127.0.0.1"
+						o.Websocket.Port = -1
+						o.Websocket.NoTLS = true
+					}
+					s := testMQTTRunServer(t, o)
+					defer func() { s.Shutdown() }()
+
+					// Leave a durable subscriber offline to check that the Will
+					// is stored before JetStream shuts down.
+					observer := &mqttConnInfo{clientID: "observer", cleanSess: false}
+					mc, r := testMQTTConnect(t, observer, o.MQTT.Host, o.MQTT.Port)
+					testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+					testMQTTSub(t, 1, mc, r, []*mqttFilter{{filter: "will/topic", qos: 1}}, []byte{1})
+					testMQTTDisconnect(t, mc, nil)
+					mc.Close()
+
+					host, port := o.MQTT.Host, o.MQTT.Port
+					if test.ws {
+						host, port = o.Websocket.Host, o.Websocket.Port
+					}
+					willMsg := []byte("bye")
+					writer, wr := testMQTTConnect(t, &mqttConnInfo{
+						clientID:  "writer",
+						cleanSess: test.cleanSess,
+						ws:        test.ws,
+						will: &mqttWill{
+							topic:   []byte("will/topic"),
+							message: willMsg,
+							qos:     test.qos,
+							retain:  test.retain,
+						},
+					}, host, port)
+					defer writer.Close()
+					testMQTTCheckConnAck(t, wr, mqttConnAckRCConnectionAccepted, false)
+
+					disconnect := strings.HasPrefix(mode, "disconnect_")
+					if disconnect {
+						testMQTTDisconnectEx(t, writer, nil, false)
+						if test.ws {
+							// WebSocket disconnects send a CLOSE frame before EOF.
+							wc := writer.(*mqttWrapAsWs)
+							wc.SetReadDeadline(time.Now().Add(testMQTTTimeout))
+							frame, err := wc.br.ReadByte()
+							require_NoError(t, err)
+							require_Equal(t, frame, byte(wsFinalBit|wsCloseMessage))
+							wc.Close()
+						} else {
+							testMQTTExpectDisconnect(t, writer)
+						}
+					}
+					switch strings.TrimPrefix(mode, "disconnect_") {
+					case "shutdown":
+						s.Shutdown()
+					case "lame_duck":
+						s.LameDuckShutdown()
+					case "connection_closed":
+						// Wait for publication before reconnecting the observer,
+						// otherwise a QoS 0 Will could arrive while it is online.
+						nc := natsConnect(t, s.ClientURL())
+						defer nc.Close()
+						sub := natsSubSync(t, nc, "will.topic")
+						natsFlush(t, nc)
+						writer.Close()
+						msg := natsNexMsg(t, sub, time.Second)
+						require_True(t, bytes.Equal(msg.Data, willMsg))
+					}
+
+					if mode != "connection_closed" {
+						o.Port, o.MQTT.Port = -1, -1
+						if test.ws {
+							o.Websocket.Port = -1
+						}
+						s = testMQTTRunServer(t, o)
+					}
+					if mode != "connection_closed" && !disconnect && test.qos > 0 {
+						nc, js := jsClientConnect(t, s)
+						info, err := js.StreamInfo(mqttStreamName)
+						nc.Close()
+						require_NoError(t, err)
+						require_Equal(t, info.State.Msgs, uint64(1))
+					}
+					mc, r = testMQTTConnect(t, observer, o.MQTT.Host, o.MQTT.Port)
+					defer mc.Close()
+					testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, true)
+					if !disconnect && test.qos > 0 {
+						testMQTTCheckPubMsg(t, mc, r, "will/topic", mqttPubQos1, willMsg)
+						testMQTTFlush(t, mc, nil, r)
+					}
+					testMQTTExpectNothing(t, r)
+
+					if test.retain {
+						// A new subscription must also recover the retained Will,
+						// including QoS 0 Wills which are not queued offline.
+						mc, r := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+						defer mc.Close()
+						testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+						testMQTTSub(t, 1, mc, r, []*mqttFilter{{filter: "will/topic", qos: 1}}, []byte{1})
+						if !disconnect {
+							testMQTTCheckPubMsg(t, mc, r, "will/topic", test.qos<<1|mqttPubFlagRetain, willMsg)
+							testMQTTFlush(t, mc, nil, r)
+						}
+						testMQTTExpectNothing(t, r)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestMQTTLameDuckGracePeriod(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.LameDuckGracePeriod = -250 * time.Millisecond
+	o.LameDuckDuration = 500 * time.Millisecond
+	s := testMQTTRunServer(t, o)
+	defer s.Shutdown()
+
+	var first net.Conn
+	var reader *mqttReader
+	for i := 0; i < 8; i++ {
+		mc, r := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+		defer mc.Close()
+		testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+		if i == 0 {
+			first, reader = mc, r
+		}
+	}
+	start := time.Now()
+	done := make(chan struct{})
+	go func() {
+		s.LameDuckShutdown()
+		close(done)
+	}()
+	checkFor(t, time.Second, time.Millisecond, func() error {
+		if !s.isLameDuckMode() {
+			return fmt.Errorf("not in lame-duck mode")
+		}
+		return nil
+	})
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(o.MQTT.Host, fmt.Sprint(o.MQTT.Port)), time.Second)
+	if err == nil {
+		conn.Close()
+		t.Fatal("MQTT listener is still accepting connections in lame-duck mode")
+	}
+	// Established MQTT connections must stay usable during the grace period.
+	testMQTTFlush(t, first, nil, reader)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("lame-duck shutdown did not complete")
+	}
+	// The eight connections should also use the paced drain window.
+	if elapsed := time.Since(start); elapsed < 330*time.Millisecond {
+		t.Fatalf("MQTT clients were closed too quickly: %v", elapsed)
+	}
+}
+
+func TestMQTTWillOnLeafShutdown(t *testing.T) {
+	ho := testMQTTDefaultOptions()
+	ho.Cluster.Name = "hub"
+	ho.LeafNode.Host, ho.LeafNode.Port = "127.0.0.1", -1
+	hub := testMQTTRunServer(t, ho)
+	defer hub.Shutdown()
+
+	o := testMQTTDefaultOptions()
+	o.JetStream = false
+	o.Cluster.Name = "leaf"
+	o.JsAccDefaultDomain = map[string]string{"$G": ""}
+	o.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", ho.LeafNode.Port))}}
+	s := testMQTTRunServer(t, o)
+	defer s.Shutdown()
+	checkLeafNodeConnected(t, s)
+
+	observer := &mqttConnInfo{clientID: "observer", cleanSess: false}
+	mc, r := testMQTTConnect(t, observer, ho.MQTT.Host, ho.MQTT.Port)
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, mc, r, []*mqttFilter{{filter: "will/topic", qos: 1}}, []byte{1})
+	testMQTTDisconnect(t, mc, nil)
+	mc.Close()
+
+	const writers = 4
+	for i := 0; i < writers; i++ {
+		id := fmt.Sprintf("writer-%d", i)
+		writer, wr := testMQTTConnect(t, &mqttConnInfo{
+			clientID: id, cleanSess: true,
+			will: &mqttWill{topic: []byte("will/topic"), message: []byte(id), qos: 1},
+		}, o.MQTT.Host, o.MQTT.Port)
+		defer writer.Close()
+		testMQTTCheckConnAck(t, wr, mqttConnAckRCConnectionAccepted, false)
+	}
+	s.Shutdown()
+
+	mc, r = testMQTTConnect(t, observer, ho.MQTT.Host, ho.MQTT.Port)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, true)
+	seen := make(map[string]bool)
+	for i := 0; i < writers; i++ {
+		flags, pi, _, payload := testMQTTGetPubMsgEx(t, mc, r, "will/topic", nil)
+		require_Equal(t, flags, mqttPubQos1)
+		require_False(t, seen[string(payload)])
+		seen[string(payload)] = true
+		testMQTTSendPIPacket(mqttPacketPubAck, t, mc, pi)
+	}
+	for i := 0; i < writers; i++ {
+		require_True(t, seen[fmt.Sprintf("writer-%d", i)])
+	}
+	testMQTTFlush(t, mc, nil, r)
+	testMQTTExpectNothing(t, r)
+}
+
+func TestMQTTShutdownReadLoopWait(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("enabled=%v", enabled), func(t *testing.T) {
+			o := testMQTTDefaultOptions()
+			o.MQTT.JSAPITimeout = 20 * time.Millisecond
+			if !enabled {
+				o.MQTT.Port = 0
+			}
+			s := testMQTTRunServer(t, o)
+			defer s.Shutdown()
+			l := &captureWarnLogger{warn: make(chan string, 10)}
+			s.SetLogger(l, false, false)
+			s.mqtt.readLoopWG.Add(1)
+			var release sync.Once
+			defer release.Do(s.mqtt.readLoopWG.Done)
+			done := make(chan struct{})
+			go func() {
+				s.Shutdown()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				release.Do(s.mqtt.readLoopWG.Done)
+				<-done
+				t.Fatal("MQTT read loops prevented shutdown from completing")
+			}
+			select {
+			case warning := <-l.warn:
+				require_True(t, enabled)
+				require_Equal(t, warning, "Timed out waiting for MQTT clients to close")
+			default:
+				require_False(t, enabled)
+			}
+		})
+	}
+}
+
+func TestMQTTShutdownPendingConnect(t *testing.T) {
+	for _, tlsHandshake := range []bool{false, true} {
+		t.Run(fmt.Sprintf("tls=%v", tlsHandshake), func(t *testing.T) {
+			o := testMQTTDefaultOptions()
+			if tlsHandshake {
+				o = testMQTTDefaultTLSOptions(t, false)
+				o.MQTT.TLSTimeout = 30
+			}
+			s := testMQTTRunServer(t, o)
+			defer s.Shutdown()
+			mc, err := net.Dial("tcp", net.JoinHostPort(o.MQTT.Host, fmt.Sprint(o.MQTT.Port)))
+			require_NoError(t, err)
+			defer mc.Close()
+			checkClientsCount(t, s, 1)
+
+			// Neither a missing CONNECT nor an unfinished TLS handshake may
+			// prevent shutdown from waiting for the MQTT read loops to exit.
+			done := make(chan struct{})
+			go func() {
+				s.Shutdown()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Fatal("shutdown is waiting on an incomplete connection")
+			}
+		})
+	}
+}
+
 func TestMQTTQoS2WillReject(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	o.MQTT.rejectQoS2Pub = true

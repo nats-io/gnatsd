@@ -19,6 +19,7 @@ import (
 	"math"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -258,4 +259,123 @@ func TestSubjectTransformDoesntPanicTransformingMissingToken(t *testing.T) {
 	tr, err := NewSubjectTransform("foo.*", "one.two.{{wildcard(1)}}")
 	require_NoError(t, err)
 	require_Equal(t, tr.TransformTokenizedSubject([]string{"foo"}), "one.two.")
+}
+
+func TestSubjectPlaceholderExpansion(t *testing.T) {
+	ctx := subjectPlaceholderContext{account: "ACC", importAccount: "EXP", leafRemote: "REM"}
+	accHash, expHash, remHash := getHash("ACC"), getHash("EXP"), getHash("REM")
+
+	for _, test := range []struct {
+		name     string
+		subject  string
+		ctx      subjectPlaceholderContext
+		expected string
+		err      error
+	}{
+		{"no placeholder", "foo.bar.>", ctx, "foo.bar.>", nil},
+		{"account hash", "foo.{{account-hash()}}.>", ctx, "foo." + accHash + ".>", nil},
+		{"account hash capitalized", "foo.{{Account-Hash()}}", ctx, "foo." + accHash, nil},
+		{"account hash spaces", "foo.{{ account-hash( ) }}", ctx, "foo." + accHash, nil},
+		{"account hash import", "$JS.FC._.{{account-hash-import()}}.>", ctx, "$JS.FC._." + expHash + ".>", nil},
+		{"account hash import lower case", "{{account-hash-import()}}", ctx, expHash, nil},
+		{"account hash leaf remote", "{{account-hash-leaf-remote()}}", ctx, remHash, nil},
+		{"account hash leaf remote capitalized", "{{Account-Hash-Leaf-Remote()}}", ctx, remHash, nil},
+		{"mixed with other function", "{{account-hash()}}.{{wildcard(1)}}.{{account-hash-import()}}", ctx, accHash + ".{{wildcard(1)}}." + expHash, nil},
+		{"other function untouched", "foo.{{wildcard(1)}}", ctx, "foo.{{wildcard(1)}}", nil},
+		{"unknown function untouched", "foo.{{unknown()}}", ctx, "foo.{{unknown()}}", nil},
+		{"camel case untouched", "foo.{{accountHash()}}", ctx, "foo.{{accountHash()}}", nil},
+		{"camel case capitalized untouched", "foo.{{AccountHash()}}", ctx, "foo.{{AccountHash()}}", nil},
+		{"lower case untouched", "foo.{{accounthash()}}", ctx, "foo.{{accounthash()}}", nil},
+		{"camel case import untouched", "foo.{{accountHashImport()}}", ctx, "foo.{{accountHashImport()}}", nil},
+		{"camel case leaf remote untouched", "foo.{{accountHashLeafRemote()}}", ctx, "foo.{{accountHashLeafRemote()}}", nil},
+		{"too many args", "{{account-hash(a,b)}}", ctx, _EMPTY_, ErrMappingDestinationTooManyArgs},
+		{"no arg allowed", "{{account-hash(OTHER)}}", ctx, _EMPTY_, ErrMappingDestinationTooManyArgs},
+		{"no arg allowed for import", "{{account-hash-import(a)}}", ctx, _EMPTY_, ErrMappingDestinationTooManyArgs},
+		{"no arg allowed for leaf remote", "{{account-hash-leaf-remote(a)}}", ctx, _EMPTY_, ErrMappingDestinationTooManyArgs},
+		{"import not available", "{{account-hash-import()}}", subjectPlaceholderContext{account: "ACC"}, _EMPTY_, ErrMappingFunctionNotAvailable},
+		{"leaf remote not available", "{{account-hash-leaf-remote()}}", subjectPlaceholderContext{account: "ACC"}, _EMPTY_, ErrMappingFunctionNotAvailable},
+		{"account not available", "{{account-hash()}}", subjectPlaceholderContext{}, _EMPTY_, ErrMappingFunctionNotAvailable},
+		{"leaf remote pending", "a.{{account-hash-leaf-remote()}}.{{account-hash()}}", subjectPlaceholderContext{account: "ACC", leafRemotePending: true}, "a.{{account-hash-leaf-remote()}}." + accHash, nil},
+		{"leaf remote pending still checks args", "{{account-hash-leaf-remote(x)}}", subjectPlaceholderContext{leafRemotePending: true}, _EMPTY_, ErrMappingDestinationTooManyArgs},
+		{"leaf remote pending does not cover import", "{{account-hash-import()}}", subjectPlaceholderContext{account: "ACC", leafRemotePending: true}, _EMPTY_, ErrMappingFunctionNotAvailable},
+		{"leaf remote pending does not cover account", "{{account-hash()}}", subjectPlaceholderContext{leafRemotePending: true}, _EMPTY_, ErrMappingFunctionNotAvailable},
+		{"name with dot is hashed", "{{account-hash()}}", subjectPlaceholderContext{account: "my.acc"}, getHash("my.acc"), nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := expandSubjectPlaceholders(test.subject, test.ctx)
+			if test.err != nil {
+				require_Error(t, err, ErrInvalidMappingDestination)
+				var mde *mappingDestinationErr
+				if !errors.As(err, &mde) || mde.err != test.err {
+					t.Fatalf("Expected error %v, got %v", test.err, err)
+				}
+				return
+			}
+			require_NoError(t, err)
+			require_Equal(t, got, test.expected)
+		})
+	}
+}
+
+func TestSubjectPlaceholderNotEvaluatedByTransforms(t *testing.T) {
+	// The account scoped functions are resolved when a subject is installed, the transform
+	// engine itself rejects them with a specific error.
+	for _, token := range []string{"{{account-hash()}}", "{{account-hash-import()}}", "{{account-hash-leaf-remote()}}"} {
+		require_True(t, isAccountMappingFunction(token))
+		tt, _, _, _, err := indexPlaceHolders(token)
+		require_Equal(t, tt, BadTransform)
+		require_Error(t, err, ErrMappingFunctionNotAvailable)
+		_, err = NewSubjectTransform("foo.*", "bar."+token+".{{wildcard(1)}}")
+		require_Error(t, err, ErrMappingFunctionNotAvailable)
+		require_Error(t, ValidateMapping("foo", token), ErrMappingFunctionNotAvailable)
+	}
+	require_False(t, isAccountMappingFunction("{{wildcard(1)}}"))
+	require_False(t, isAccountMappingFunction("account-hash()"))
+	require_False(t, isAccountMappingFunction("{{accountHash()}}"))
+	require_False(t, isAccountMappingFunction("{{account()}}"))
+}
+
+func TestPermissionsPlaceholderExpansion(t *testing.T) {
+	ctx := subjectPlaceholderContext{account: "ACC", leafRemote: "REM"}
+	accHash, remHash := getHash("ACC"), getHash("REM")
+
+	// Nothing to expand: same pointer back.
+	perms := &Permissions{Publish: &SubjectPermission{Allow: []string{"foo"}}}
+	require_False(t, permissionsHavePlaceholders(perms))
+	got, err := expandPermissionsPlaceholders(perms, ctx)
+	require_NoError(t, err)
+	require_True(t, got == perms)
+	got, err = expandPermissionsPlaceholders(nil, ctx)
+	require_NoError(t, err)
+	require_True(t, got == nil)
+
+	perms = &Permissions{
+		Publish:   &SubjectPermission{Allow: []string{"foo.{{account-hash()}}"}, Deny: []string{"bar.{{account-hash-leaf-remote()}}.>"}},
+		Subscribe: &SubjectPermission{Allow: []string{"baz.{{account-hash()}} myqueue"}, Deny: []string{"{{account-hash-import()}}"}},
+		Response:  &ResponsePermission{MaxMsgs: 1},
+	}
+	require_True(t, permissionsHavePlaceholders(perms))
+	got, err = expandPermissionsPlaceholders(perms, ctx)
+	// The import function is not available here: that entry is kept as is and reported.
+	require_Error(t, err, ErrMappingFunctionNotAvailable)
+	require_True(t, got != perms)
+	require_Equal(t, got.Publish.Allow[0], "foo."+accHash)
+	require_Equal(t, got.Publish.Deny[0], "bar."+remHash+".>")
+	require_Equal(t, got.Subscribe.Allow[0], "baz."+accHash+" myqueue")
+	require_Equal(t, got.Subscribe.Deny[0], "{{account-hash-import()}}")
+	require_Equal(t, got.Response.MaxMsgs, 1)
+	// The original is untouched.
+	require_Equal(t, perms.Publish.Allow[0], "foo.{{account-hash()}}")
+	require_Equal(t, perms.Publish.Deny[0], "bar.{{account-hash-leaf-remote()}}.>")
+	require_Equal(t, perms.Subscribe.Allow[0], "baz.{{account-hash()}} myqueue")
+
+	// With the leaf remote account pending, only that function is left alone without error;
+	// the import function is still reported.
+	got, err = expandPermissionsPlaceholders(perms, subjectPlaceholderContext{account: "ACC", leafRemotePending: true})
+	require_Error(t, err, ErrMappingFunctionNotAvailable)
+	require_Contains(t, err.Error(), "{{account-hash-import()}}")
+	require_False(t, strings.Contains(err.Error(), "{{account-hash-leaf-remote()}}"))
+	require_Equal(t, got.Publish.Allow[0], "foo."+accHash)
+	require_Equal(t, got.Publish.Deny[0], "bar.{{account-hash-leaf-remote()}}.>")
+	require_Equal(t, got.Subscribe.Deny[0], "{{account-hash-import()}}")
 }
