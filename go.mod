@@ -2,6 +2,8 @@ module github.com/nats-io/nats-server/v2
 
 go 1.26.0
 
+godebug multipathtcp=0
+
 toolchain go1.26.10
 
 require (
