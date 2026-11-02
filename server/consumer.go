@@ -2639,26 +2639,6 @@ func (o *consumer) updateConfig(cfg *ConsumerConfig) error {
 			o.dtmr = time.AfterFunc(o.dthresh, o.deleteNotActive)
 		}
 	}
-	// Check whether the pause has changed
-	{
-		var old, new time.Time
-		if o.cfg.PauseUntil != nil {
-			old = *o.cfg.PauseUntil
-		}
-		if cfg.PauseUntil != nil {
-			new = *cfg.PauseUntil
-		}
-		if !old.Equal(new) {
-			o.updatePauseState(cfg)
-			// A resume has no timer to wake the delivery loop, unlike a
-			// pause that runs out, so waiting pulls and pending messages
-			// would otherwise wait for the next message or pull.
-			o.signalNewMessages()
-			if o.isLeader() {
-				o.sendPauseAdvisoryLocked(cfg)
-			}
-		}
-	}
 
 	// Check for Subject Filters update.
 	newSubjects := gatherSubjectFilters(cfg.FilterSubject, cfg.FilterSubjects)
@@ -2694,6 +2674,27 @@ func (o *consumer) updateConfig(cfg *ConsumerConfig) error {
 				for _, filter := range o.subjf {
 					o.filters.Insert(filter.subject, struct{}{})
 				}
+			}
+		}
+	}
+
+	// Check whether the pause has changed
+	{
+		var old, new time.Time
+		if o.cfg.PauseUntil != nil {
+			old = *o.cfg.PauseUntil
+		}
+		if cfg.PauseUntil != nil {
+			new = *cfg.PauseUntil
+		}
+		if !old.Equal(new) {
+			o.updatePauseState(cfg)
+			// A resume has no timer to wake the delivery loop, unlike a
+			// pause that runs out, so waiting pulls and pending messages
+			// would otherwise wait for the next message or pull.
+			o.signalNewMessages()
+			if o.isLeader() {
+				o.sendPauseAdvisoryLocked(cfg)
 			}
 		}
 	}

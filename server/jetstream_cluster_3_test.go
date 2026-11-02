@@ -13138,4 +13138,3 @@ func performStreamBackup(t *testing.T, nc *nats.Conn, streamName string) (Stream
 	}
 	return body.StreamConfig, body.StreamState, buf.Bytes()
 }
-
