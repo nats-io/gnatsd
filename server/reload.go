@@ -671,8 +671,24 @@ type maxPayloadOption struct {
 func (m *maxPayloadOption) Apply(server *Server) {
 	server.mu.Lock()
 	server.info.MaxPayload = m.newValue
+	server.optsMu.Lock()
+	if server.opts != nil {
+		server.opts.MaxPayload = m.newValue
+	}
+	server.optsMu.Unlock()
+	info := server.copyInfo()
 	for _, client := range server.clients {
-		atomic.StoreInt32(&client.mpay, int32(m.newValue))
+		client.mu.Lock()
+		oldMpay := atomic.LoadInt32(&client.mpay)
+		if client.acc != nil {
+			client.applyAccountLimits()
+		} else {
+			atomic.StoreInt32(&client.mpay, m.newValue)
+		}
+		if oldMpay != atomic.LoadInt32(&client.mpay) {
+			client.sendAsyncInfo(info)
+		}
+		client.mu.Unlock()
 	}
 	server.mu.Unlock()
 	server.Noticef("Reloaded: max_payload = %d", m.newValue)

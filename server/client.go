@@ -2783,6 +2783,19 @@ func (c *client) generateClientInfoJSON(info Info, includeClientIP bool) []byte 
 	return generateInfoJSON(&info)
 }
 
+// sendAsyncInfo will send an updated async INFO protocol message to the client
+// if the client supports async INFO and has completed its initial handshake.
+// Assume lock is held.
+func (c *client) sendAsyncInfo(info Info) {
+	if c.opts.Protocol >= ClientProtoInfo && c.flags.isSet(firstPongSent) {
+		if c.iproc && info.TLSRequired && !c.flags.isSet(didTLSFirst) {
+			info.TLSRequired = false
+			info.TLSAvailable = true
+		}
+		c.enqueueProto(c.generateClientInfoJSON(info, true))
+	}
+}
+
 func (c *client) sendErr(err string) {
 	c.mu.Lock()
 	if c.trace {
