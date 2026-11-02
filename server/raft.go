@@ -201,6 +201,8 @@ type raft struct {
 	active time.Time   // Last activity time, i.e. for heartbeats
 	llqrt  time.Time   // Last quorum lost time
 	lsut   time.Time   // Last scale-up time
+	nlt    time.Time   // No leader time, since when we've been without a leader
+	lgt    time.Time   // Leader grace time, since when we're healthy while the leader changes
 
 	term      uint64 // The current vote term
 	pterm     uint64 // Previous term from the last snapshot
@@ -253,6 +255,8 @@ type raft struct {
 	progress map[string]*ipQueue[uint64] // For leader or server catching up a follower.
 
 	hcommit uint64 // The commit at the time that applies were paused
+	hcterm  uint64 // Term in which hcindex was recorded
+	hcindex uint64 // Leader's last index when we first heard from it in hcterm, must be processed to be healthy
 
 	prop  *ipQueue[*proposedEntry]       // Proposals
 	entry *ipQueue[*appendEntry]         // Append entries
@@ -327,6 +331,7 @@ const (
 	observerModeIntervalDefault     = 48 * time.Hour
 	peerRemoveTimeoutDefault        = 5 * time.Minute
 	rescueQuorumTimeoutDefault      = 5 * time.Minute
+	leaderlessHealthyDefault        = time.Minute
 )
 
 var (
@@ -341,6 +346,7 @@ var (
 	observerModeInterval = observerModeIntervalDefault
 	peerRemoveTimeout    = peerRemoveTimeoutDefault
 	rescueQuorumTimeout  = rescueQuorumTimeoutDefault
+	leaderlessHealthy    = leaderlessHealthyDefault
 )
 
 type RaftConfig struct {
@@ -495,8 +501,10 @@ func (s *Server) initRaftNode(accName string, cfg *RaftConfig, labels pprofLabel
 	s.mu.RUnlock()
 
 	qpfx := fmt.Sprintf("[ACC:%s] RAFT '%s' ", accName, cfg.Name)
+	now := time.Now()
 	n := &raft{
-		created:  time.Now(),
+		created:  now,
+		nlt:      now,
 		id:       hash[:idLen],
 		group:    cfg.Name,
 		sd:       cfg.Store,
@@ -1527,6 +1535,9 @@ func (n *raft) ResumeApply() {
 		n.writeCommitIndexLocked(n.commit)
 	}
 
+	// Commits held while paused must be processed before being healthy again.
+	n.hcindex = max(n.hcindex, n.hcommit)
+
 	// Clear our paused state after we apply.
 	n.paused = false
 	n.hcommit = 0
@@ -2218,19 +2229,28 @@ func (n *raft) isCatchingUp() bool {
 // isCurrent is called from the healthchecks and returns true if we believe
 // that the upper layer is current with the Raft layer, i.e. that it has applied
 // all of the commits that we have given it.
-// Optionally we can also check whether or not we're making forward progress if we
-// aren't current, in which case this function may block for up to ~10ms to find out.
+// If healthy is set, we must instead have processed everything the leader had when
+// we first heard from it in this term. This allows lagging behind a bit under load.
+// If quiet is set, nothing is logged.
 // Lock should be held.
-func (n *raft) isCurrent(includeForwardProgress bool) bool {
+func (n *raft) isCurrent(healthy, quiet bool) bool {
+	debug, warn := n.debug, n.warn
+	if quiet {
+		debug, warn = func(string, ...any) {}, func(string, ...any) {}
+	}
+
 	// Check if we are closed.
 	if n.State() == Closed {
-		n.debug("Not current, node is closed")
+		debug("Not current, node is closed")
 		return false
 	}
 
+	// A learner only stores entries until the leader adds it to the peer set. It can't commit before then.
+	learner := healthy && !n.votingMemberLocked()
+
 	// Check whether we've made progress on any state, 0 is invalid so not healthy.
-	if n.commit == 0 {
-		n.debug("Not current, no commits")
+	if n.commit == 0 && !learner {
+		debug("Not current, no commits")
 		return false
 	}
 
@@ -2238,70 +2258,115 @@ func (n *raft) isCurrent(includeForwardProgress bool) bool {
 	// was cleared.
 	clearBehindState := func() {
 		if n.hcbehind {
-			n.warn("Health check OK, no longer falling behind")
+			warn("Health check OK, no longer falling behind")
 			n.hcbehind = false
 		}
 	}
 
 	// Make sure we are the leader or we know we have heard from the leader recently.
 	if n.State() == Leader {
+		// A new leader is only healthy once it processed all entries from prior terms.
+		if healthy && !n.leaderState.Load() {
+			debug("Not current, leader still processing prior terms")
+			return false
+		}
 		clearBehindState()
 		return true
 	}
 
 	// Check to see that we have heard from the current leader lately.
 	if n.leader != noLeader && n.leader != n.id && n.catchup == nil {
-		okInterval := hbInterval * 2
+		// A leader only sends a heartbeat after a full idle interval, so contact can be nearly two intervals apart.
+		// Allow for an extra interval of delay, so a current follower doesn't flap.
+		okInterval := hbInterval * 3
 		if ps := n.peers[n.leader]; ps == nil || time.Since(ps.ts) > okInterval {
-			n.debug("Not current, no recent leader contact")
+			debug("Not current, no recent leader contact")
 			return false
 		}
 	}
 	if cs := n.catchup; cs != nil {
 		// We're actively catching up, can't mark current even if commit==applied.
-		n.debug("Not current, still catching up pindex=%d, cindex=%d", n.pindex, cs.cindex)
+		debug("Not current, still catching up pindex=%d, cindex=%d", n.pindex, cs.cindex)
 		return false
 	}
 
 	if n.paused && n.hcommit > n.commit {
 		// We're currently paused, waiting to be resumed to apply pending commits.
-		n.debug("Not current, waiting to resume applies commit=%d, hcommit=%d", n.commit, n.hcommit)
+		debug("Not current, waiting to resume applies commit=%d, hcommit=%d", n.commit, n.hcommit)
 		return false
 	}
 
-	if n.commit == n.applied {
+	if !healthy {
 		// At this point if we are current, we can return saying so.
+		if n.commit == n.applied {
+			clearBehindState()
+			return true
+		}
+		return false
+	}
+
+	// Already logged when quorum was paused.
+	// Only checked with a leader, since nothing resumes the quorum without one.
+	if n.quorumPaused && n.leader != noLeader {
+		debug("Not current, quorum paused commit=%d, applied=%d", n.commit, n.applied)
+		return false
+	}
+
+	// We were healthy right before the leader changed.
+	// Only skips waiting for a new leader and for reaching its index.
+	if time.Since(n.lgt) < hbInterval*2 {
 		clearBehindState()
 		return true
-	} else if !includeForwardProgress {
-		// Otherwise, if we aren't allowed to include forward progress
-		// (i.e. we are checking "current" instead of "healthy") then
-		// give up now.
+	}
+
+	if n.leader == noLeader {
+		// Don't block forever if the group can't elect a leader.
+		// It may need this server to be healthy before the other servers are restarted.
+		if time.Since(n.nlt) < leaderlessHealthy {
+			debug("Not current, no leader")
+			return false
+		}
+		// Then we can only check against what we know locally.
+		if n.processed >= n.commit {
+			clearBehindState()
+			return true
+		}
 		return false
 	}
 
-	// Otherwise, wait for a short period of time and see if we are making any
-	// forward progress.
-	if startDelta := n.commit - n.applied; startDelta > 0 {
-		for i := 0; i < 10; i++ { // 10ms, in 1ms increments
-			n.Unlock()
-			time.Sleep(time.Millisecond)
-			n.Lock()
-			if n.State() == Closed {
-				n.debug("Node closed during health check, returning not current")
-				return false
-			}
-			if n.commit-n.applied < startDelta {
-				// The gap is getting smaller, so we're making forward progress.
-				clearBehindState()
-				return true
-			}
-		}
+	// Should be up to date enough with the leader.
+	if n.hcterm != n.term {
+		debug("Not current, no append entry from the leader in this term")
+		return false
 	}
+	// A learner can only have stored up to the leader's index.
+	progress := n.processed
+	if learner {
+		progress = n.pindex
+	}
+	if progress < n.hcindex {
+		n.hcbehind = true
+		warn("Falling behind in health check, processed %d < leader index %d", progress, n.hcindex)
+		return false
+	}
+	clearBehindState()
+	return true
+}
 
-	n.hcbehind = true
-	n.warn("Falling behind in health check, commit %d != applied %d", n.commit, n.applied)
-	return false
+// startLeaderChangeGrace keeps us healthy for a short while if we were healthy right before the leader changes.
+// Must be called before raising the term, since being healthy requires the leader's index of our term.
+// Lock should be held.
+func (n *raft) startLeaderChangeGrace() {
+	// Not when healthy due to a previous grace period, or the fallback for having no leader.
+	if time.Since(n.lgt) < hbInterval*2 || n.leader == noLeader {
+		return
+	}
+	// Not an actual health check, so don't log or change whether we're falling behind.
+	hcbehind := n.hcbehind
+	if n.isCurrent(true, true) {
+		n.lgt = time.Now()
+	}
+	n.hcbehind = hcbehind
 }
 
 // Current returns if we are the leader for our group or an up to date follower.
@@ -2311,17 +2376,17 @@ func (n *raft) Current() bool {
 	}
 	n.Lock()
 	defer n.Unlock()
-	return n.isCurrent(false)
+	return n.isCurrent(false, false)
 }
 
-// Healthy returns if we are the leader for our group and nearly up-to-date.
+// Healthy returns if we are the leader for our group or a follower that's caught up.
 func (n *raft) Healthy() bool {
 	if n == nil {
 		return false
 	}
 	n.Lock()
 	defer n.Unlock()
-	return n.isCurrent(true)
+	return n.isCurrent(true, false)
 }
 
 // HadPreviousLeader indicates if this group ever had a leader.
@@ -2557,7 +2622,7 @@ func (n *raft) Peers() []*Peer {
 		} else if id == n.leader {
 			// This peer is the leader, we don't know our lag, but we can report
 			// on whether we've seen the leader recently.
-			okInterval := hbInterval * 2
+			okInterval := hbInterval * 3
 			current = time.Since(ps.ts) <= okInterval
 		} else {
 			// The remaining condition is another follower that we're not in contact with.
@@ -4675,6 +4740,9 @@ func (n *raft) resetWAL() {
 // Lock should be held
 func (n *raft) updateLeader(newLeader string) {
 	wasLeader := n.leader == n.id
+	if newLeader == noLeader && n.hasleader.Load() {
+		n.nlt = time.Now()
+	}
 	n.leader = newLeader
 	n.hasleader.Store(newLeader != _EMPTY_)
 	if !n.pleader.Load() && newLeader != noLeader {
@@ -4810,6 +4878,7 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 
 	// If this term is greater than ours.
 	if lterm > n.term {
+		n.startLeaderChangeGrace()
 		n.term = lterm
 		n.vote = noVote
 		if isNew {
@@ -4834,6 +4903,17 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 		n.sendRPC(ae.reply, _EMPTY_, ar.encode(arbuf))
 		arPool.Put(ar)
 		return
+	}
+
+	// Remember the first leader index we see in this term, to process before being healthy.
+	// Only raised while catching up.
+	if isNew && (n.hcterm != n.term || catchingUp) {
+		n.hcterm, n.hcindex = n.term, ae.pindex
+		// Need to wait until all entries in this entry (and below) were applied.
+		// Unless it's a heartbeat, in which case it's just all entries below this one.
+		if ae.shouldStore() {
+			n.hcindex++
+		}
 	}
 
 	// Check state if we are catching up.
@@ -6047,6 +6127,7 @@ func (n *raft) processVoteRequest(vr *voteRequest) error {
 	// If this is a higher term go ahead and stepdown.
 	newTerm := vr.term > n.term
 	if newTerm {
+		n.startLeaderChangeGrace()
 		if n.State() != Follower {
 			n.debug("Stepping down from %s, detected higher term: %d vs %d",
 				strings.ToLower(n.State().String()), vr.term, n.term)
@@ -6264,6 +6345,7 @@ func (n *raft) switchToFollowerLocked(leader string) {
 
 	n.debug("Switching to follower")
 
+	n.startLeaderChangeGrace()
 	n.aflr = 0
 	n.leaderState.Store(false)
 	n.leaderSince.Store(nil)
@@ -6353,6 +6435,7 @@ func (n *raft) switchToCandidate() {
 		}
 	}
 	// Increment the term.
+	n.startLeaderChangeGrace()
 	n.term++
 	n.vote = noVote
 	// Reset quorum paused. If it was previously set, we checked above that we've applied all committed entries.
