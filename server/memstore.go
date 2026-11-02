@@ -941,7 +941,7 @@ func (ms *memStore) multiLastSeqsLocked(filters []string, maxSeq uint64, maxAllo
 			} else if ss.Msgs > 1 {
 				// The last is greater than maxSeq.
 				s := bytesToString(subj)
-				for seq := maxSeq; seq > 0; seq-- {
+				for seq := maxSeq; seq >= ss.First; seq-- {
 					if sm, ok := ms.msgs[seq]; ok && sm.subj == s {
 						addIfNotDupe(seq)
 						break
@@ -1620,7 +1620,7 @@ func (ms *memStore) PurgeEx(subject string, sequence, keep uint64) (purged uint6
 	// sequence filter; sequence >= 1 clamps the upper bound to sequence-1
 	// (so sequence == 1 purges nothing).
 	last := ss.Last
-	if sequence >= 1 {
+	if sequence >= 1 && sequence <= last {
 		last = sequence - 1
 	}
 	var bytes, lowSeq uint64
