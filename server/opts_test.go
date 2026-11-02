@@ -1618,6 +1618,14 @@ func TestConfigureOptions(t *testing.T) {
 	expectToFail([]string{"-t", "-c", conf}, "cannot be higher than max_pending")
 	// Command line flags are applied before validating.
 	expectToFail([]string{"-t", "-c", "./configs/test.conf", "-n", "a b"}, "server name cannot contain spaces")
+
+	// Checking whether a server running with the current config can reload a config file.
+	cur := createConfFile(t, []byte("port: -1\n"))
+	mustNotFail([]string{"-t", "-c", cur, "--test_reload", createConfFile(t, []byte("port: -1\ndebug: true\n"))})
+	expectToFail([]string{"-t", "-c", cur, "--test_reload", createConfFile(t, []byte("port: 4333\n"))}, "config reload not supported for Port")
+	// Command line flags apply to both, like they would for the running server.
+	mustNotFail([]string{"-t", "-c", cur, "-p", "4333", "--test_reload", createConfFile(t, []byte("port: 5555\n"))})
+	expectToFail([]string{"-c", cur, "--test_reload", cur}, "can only be used together with -t")
 }
 
 func TestClusterPermissionsConfig(t *testing.T) {

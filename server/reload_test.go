@@ -8065,3 +8065,94 @@ func TestConfigReloadDuringStartupWithJetStream(t *testing.T) {
 		}()
 	}
 }
+
+func TestConfigReloadCheck(t *testing.T) {
+	const (
+		reloadOK = iota
+		restartRequired
+		invalid
+	)
+	verdict := func(err error) int {
+		switch {
+		case err == nil:
+			return reloadOK
+		case errors.Is(err, ErrConfigReloadNotSupported):
+			return restartRequired
+		default:
+			return invalid
+		}
+	}
+	js := func(storeDir, maxMem string) string {
+		return fmt.Sprintf("port: -1\njetstream { store_dir: %q, max_mem: %s }\n", storeDir, maxMem)
+	}
+	storeDir, otherStoreDir := t.TempDir(), t.TempDir()
+	leaf := func(remotes string) string {
+		return fmt.Sprintf("port: -1\nleafnodes { remotes: [ %s ] }\n", remotes)
+	}
+	const remote = `{ url: "nats://127.0.0.1:1234" }`
+
+	for _, test := range []struct {
+		name     string
+		cur      string
+		new      string
+		verdict  int
+		contains []string
+	}{
+		{"logging", "port: -1\n", "port: -1\ndebug: true\n", reloadOK, nil},
+		{"port", "port: -1\n", "port: 4333\n", restartRequired, []string{"for Port"}},
+		{"cluster port",
+			"port: -1\ncluster { name: c, listen: 127.0.0.1:-1 }\n",
+			"port: -1\ncluster { name: c, listen: 127.0.0.1:4334 }\n",
+			restartRequired, []string{"for cluster port"}},
+		{"gateway", "port: -1\n", "port: -1\ngateway { name: g, listen: 127.0.0.1:4335 }\n",
+			restartRequired, []string{"for Gateway"}},
+		{"websocket", "port: -1\n", "port: -1\nwebsocket { listen: 127.0.0.1:-1, no_tls: true }\n",
+			restartRequired, []string{"for Websocket"}},
+		{"jetstream max_mem increase", js(storeDir, "64MB"), js(storeDir, "128MB"), reloadOK, nil},
+		{"jetstream max_mem decrease", js(storeDir, "64MB"), js(storeDir, "32MB"),
+			restartRequired, []string{"for decreasing jetstream max memory"}},
+		{"jetstream store_dir", js(storeDir, "64MB"), js(otherStoreDir, "64MB"),
+			restartRequired, []string{"for jetstream storage directory"}},
+		{"leafnode remote added", leaf(remote), leaf(remote + `, { url: "nats://127.0.0.1:1235" }`), reloadOK, nil},
+		{"leafnode remote hub", leaf(remote), leaf(`{ url: "nats://127.0.0.1:1234", hub: true }`),
+			restartRequired, []string{`field "Hub"`}},
+		{"invalid", "port: -1\n", "port: -1\nmax_payload: 2MB\nmax_pending: 1MB\n",
+			invalid, []string{"cannot be higher than max_pending"}},
+		{"cluster account",
+			"port: -1\naccounts { A: {} }\ncluster { name: c, listen: 127.0.0.1:-1 }\n",
+			"port: -1\naccounts { A: {} }\ncluster { name: c, listen: 127.0.0.1:-1, accounts: [A] }\n",
+			reloadOK, nil},
+		{"cluster pool size",
+			"port: -1\ncluster { name: c, listen: 127.0.0.1:-1, pool_size: -1 }\n",
+			"port: -1\ncluster { name: c, listen: 127.0.0.1:-1 }\n",
+			reloadOK, nil},
+		{"cluster account unknown",
+			"port: -1\ncluster { name: c, listen: 127.0.0.1:-1 }\n",
+			"port: -1\naccounts { A: {} }\ncluster { name: c, listen: 127.0.0.1:-1, accounts: [A] }\n",
+			invalid, []string{`unable to add account "A"`}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			curConf := createConfFile(t, []byte(test.cur))
+			newConf := createConfFile(t, []byte(test.new))
+			curOpts, err := ProcessConfigFile(curConf)
+			require_NoError(t, err)
+			newOpts, err := ProcessConfigFile(newConf)
+			require_NoError(t, err)
+
+			// The current options are prepared like on server startup.
+			setBaselineOptions(curOpts)
+			require_NoError(t, validateOptions(curOpts))
+			err = checkReload(curOpts, newOpts)
+			require_Equal(t, verdict(err), test.verdict)
+			for _, s := range test.contains {
+				require_Contains(t, err.Error(), s)
+			}
+
+			// The check must agree with an actual reload.
+			s, _ := RunServerWithConfig(curConf)
+			defer s.Shutdown()
+			changeCurrentConfigContentWithNewContent(t, curConf, []byte(test.new))
+			require_Equal(t, verdict(s.Reload()), test.verdict)
+		})
+	}
+}
