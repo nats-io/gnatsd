@@ -1611,6 +1611,13 @@ func TestConfigureOptions(t *testing.T) {
 	if !reflect.DeepEqual(opts.TLSConfig.CipherSuites, defaultCipherSuites()) {
 		t.Fatalf("Default ciphers not set, expected %v, got %v", defaultCipherSuites(), opts.TLSConfig.CipherSuites)
 	}
+
+	// Checking the config validates the options, not just the syntax.
+	mustNotFail([]string{"-t", "-c", "./configs/test.conf"})
+	conf := createConfFile(t, []byte("max_payload: 2MB\nmax_pending: 1MB\n"))
+	expectToFail([]string{"-t", "-c", conf}, "cannot be higher than max_pending")
+	// Command line flags are applied before validating.
+	expectToFail([]string{"-t", "-c", "./configs/test.conf", "-n", "a b"}, "server name cannot contain spaces")
 }
 
 func TestClusterPermissionsConfig(t *testing.T) {
