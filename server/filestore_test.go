@@ -7360,6 +7360,114 @@ func TestFileStoreMultiLastSeqs(t *testing.T) {
 	seqs, err = fs.MultiLastSeqs([]string{">"}, 99, -1)
 	require_NoError(t, err)
 	checkResults(seqs, []uint64{97, 98, 99})
+
+	// No subjects match the filter.
+	seqs, err = fs.MultiLastSeqs([]string{"missing.*"}, 0, -1)
+	require_NoError(t, err)
+	checkResults(seqs, nil)
+}
+
+func TestFileStoreMultiLastSeqsDeletedBlocks(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		subjects []string
+		deletes  []uint64
+		filters  []string
+		maxSeq   uint64
+		want     []uint64
+	}{
+		{
+			name:     "removed last block",
+			subjects: []string{"foo.a", "foo.b", "foo.b", "foo.a", "foo.a", "foo.a", "foo.b", "foo.b", "foo.b"},
+			deletes:  []uint64{4, 5, 6},
+			filters:  []string{"foo.a"},
+			maxSeq:   8,
+			want:     []uint64{1},
+		},
+		{
+			name:     "multiple subjects with removed last block",
+			subjects: []string{"foo.a", "foo.c", "foo.c", "foo.a", "foo.c", "foo.c", "foo.b", "foo.b", "foo.b"},
+			deletes:  []uint64{4, 5, 6},
+			filters:  []string{"foo.a", "foo.c"},
+			maxSeq:   8,
+			want:     []uint64{1, 3},
+		},
+		{
+			name:     "subjects with existing and removed last blocks",
+			subjects: []string{"foo.a", "foo.c", "foo.c", "foo.a", "foo.a", "foo.a", "foo.b", "foo.b", "foo.b"},
+			deletes:  []uint64{4, 5, 6},
+			filters:  []string{"foo.a", "foo.c"},
+			maxSeq:   8,
+			want:     []uint64{1, 3},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// Each block holds three messages, so deleting 4-6 removes block 2.
+			fs, err := newFileStore(
+				FileStoreConfig{StoreDir: t.TempDir(), BlockSize: 128},
+				StreamConfig{Name: "TEST", Subjects: []string{"foo.*"}, Storage: FileStorage})
+			require_NoError(t, err)
+			defer fs.Stop()
+			for _, subject := range test.subjects {
+				_, _, err := fs.StoreMsg(subject, nil, []byte("x"), 0)
+				require_NoError(t, err)
+			}
+			for _, seq := range test.deletes {
+				removed, err := fs.RemoveMsg(seq)
+				require_NoError(t, err)
+				require_True(t, removed)
+			}
+			seqs, err := fs.MultiLastSeqs(test.filters, test.maxSeq, 0)
+			require_NoError(t, err)
+			if !slices.Equal(seqs, test.want) {
+				t.Errorf("MultiLastSeqs: expected %v, got %v", test.want, seqs)
+			}
+			var delivered []uint64
+			total, pending, err := fs.MultiLastMsgs(test.filters, 0, test.maxSeq, 1024, func(sm *StoreMsg, _ uint64) bool {
+				delivered = append(delivered, sm.seq)
+				return true
+			})
+			require_NoError(t, err)
+			require_Equal(t, total, uint64(len(test.want)))
+			require_Equal(t, pending, uint64(0))
+			if !slices.Equal(delivered, test.want) {
+				t.Errorf("MultiLastMsgs: expected %v, got %v", test.want, delivered)
+			}
+		})
+	}
+}
+
+func TestFileStoreMultiLastSeqsOverlappingFilters(t *testing.T) {
+	// Each block holds three messages, placing foo.a and foo.b in separate blocks.
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: t.TempDir(), BlockSize: 128},
+		StreamConfig{Name: "TEST", Subjects: []string{"foo.*"}, Storage: FileStorage})
+	require_NoError(t, err)
+	defer fs.Stop()
+	for _, subject := range []string{"foo.a", "foo.a", "foo.a", "foo.b", "foo.b", "foo.b"} {
+		_, _, err := fs.StoreMsg(subject, nil, []byte("x"), 0)
+		require_NoError(t, err)
+	}
+
+	filters := []string{"foo.*", "foo.a"}
+	const maxSeq = 5
+	want := []uint64{3, 5}
+	seqs, err := fs.MultiLastSeqs(filters, maxSeq, 0)
+	require_NoError(t, err)
+	if !slices.Equal(seqs, want) {
+		t.Errorf("MultiLastSeqs: expected %v, got %v", want, seqs)
+	}
+	var delivered []uint64
+	total, pending, err := fs.MultiLastMsgs(filters, 0, maxSeq, 1024, func(sm *StoreMsg, _ uint64) bool {
+		delivered = append(delivered, sm.seq)
+		return true
+	})
+	require_NoError(t, err)
+	require_Equal(t, total, uint64(len(want)))
+	require_Equal(t, pending, uint64(0))
+	if !slices.Equal(delivered, want) {
+		t.Errorf("MultiLastMsgs: expected %v, got %v", want, delivered)
+	}
 }
 
 func TestFileStoreMultiLastSeqsMaxAllowed(t *testing.T) {
@@ -8899,6 +9007,82 @@ func Benchmark_FileStoreCreateConsumerStores(b *testing.B) {
 				ofs, err := fs.ConsumerStore(oname, time.Time{}, &oconfig)
 				require_NoError(b, err)
 				require_NoError(b, ofs.Stop())
+			}
+		})
+	}
+}
+
+func BenchmarkFileStoreLoadNextMsgMultiRepeatedSubjects(b *testing.B) {
+	benchmarkFileStoreLoadMsgMulti(b, false)
+}
+
+func BenchmarkFileStoreLoadPrevMsgMultiRepeatedSubjects(b *testing.B) {
+	benchmarkFileStoreLoadMsgMulti(b, true)
+}
+
+func benchmarkFileStoreLoadMsgMulti(b *testing.B, reverse bool) {
+	for _, test := range []struct {
+		name   string
+		keys   int
+		msgs   int
+		pad    int
+		blocks int
+		filter string
+	}{
+		{"RepeatedMoreSubjects", 4000, 40000, 0, 1, "data.*.*"},
+		{"RepeatedAcrossBlocks", 2000, 16000, 2048, 5, "data.*.*"},
+		{"RepeatedWildcardIndex", 256, 8192, 0, 1, "data.>"},
+		{"Unique", 20000, 80000, 0, 1, "data.*.*"},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			fs, err := newFileStore(
+				FileStoreConfig{StoreDir: b.TempDir(), BlockSize: 8 * 1024 * 1024},
+				StreamConfig{Name: "bench", Subjects: []string{"data.*.*"}, Storage: FileStorage})
+			require_NoError(b, err)
+			defer fs.Stop()
+
+			payload := append([]byte(`{"v": 1}`), bytes.Repeat([]byte(" "), test.pad)...)
+			for i := range test.msgs {
+				subj := fmt.Sprintf("data.%016x.k%d", (i/4)%test.keys, i%4+1)
+				_, _, err := fs.StoreMsg(subj, nil, payload, 0)
+				require_NoError(b, err)
+			}
+			require_Equal(b, fs.numMsgBlocks(), test.blocks)
+
+			loadMsg := fs.LoadNextMsgMulti
+			first, end, step := 1, test.msgs+1, 1
+			if reverse {
+				loadMsg = fs.LoadPrevMsgMulti
+				first, end, step = test.msgs, 0, -1
+			}
+
+			for _, multi := range []bool{true, false} {
+				name := "Single"
+				sl := gsl.NewSublist[struct{}]()
+				if multi {
+					name = "Multi"
+					for kind := 1; kind <= 4; kind++ {
+						require_NoError(b, sl.Insert(fmt.Sprintf("data.*.k%d", kind), struct{}{}))
+					}
+				} else {
+					require_NoError(b, sl.Insert(test.filter, struct{}{}))
+				}
+				b.Run(name, func(b *testing.B) {
+					var smv StoreMsg
+					b.ReportAllocs()
+					b.ResetTimer()
+					for range b.N {
+						for seq := first; seq != end; seq += step {
+							sm, nseq, err := loadMsg(sl, uint64(seq), &smv)
+							if err != nil {
+								b.Fatal(err)
+							}
+							if nseq != uint64(seq) || sm.seq != uint64(seq) {
+								b.Fatalf("Expected sequence %d, got %d (%d)", seq, nseq, sm.seq)
+							}
+						}
+					}
+				})
 			}
 		})
 	}
@@ -13373,6 +13557,80 @@ func TestFileStoreLoadNextMsgSkipAhead(t *testing.T) {
 		}
 		t.Run(fmt.Sprintf("%s/Head", title), func(t *testing.T) { test(t, true, singleSubjPerBlock) })
 		t.Run(fmt.Sprintf("%s/Interior", title), func(t *testing.T) { test(t, false, singleSubjPerBlock) })
+	}
+}
+
+func TestFileStoreLoadNextMsgSkipCheckNotOnSecondToLastBlock(t *testing.T) {
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: t.TempDir()},
+		StreamConfig{Name: "zzz", Subjects: []string{"foo.>"}, Storage: FileStorage})
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	// The filtered subject first appears at the head of the stream, so psim's fblk
+	// for it points at the first block, like long-lived subjects in a stream with MaxAge.
+	_, _, err = fs.StoreMsg("foo.a1.b.c0.d.e.hit", nil, nil, 0)
+	require_NoError(t, err)
+
+	// Just under the subject count where the single wildcard check is skipped.
+	const filler = 60_000
+	for i := range filler {
+		_, _, err = fs.StoreMsg(fmt.Sprintf("foo.a%d.b.%d.d.e.row", i%50, i), nil, nil, 0)
+		require_NoError(t, err)
+	}
+
+	// A caught-up consumer resumes from a sequence in the second-to-last block,
+	// and the next message for it lands in the last block.
+	_, err = fs.newMsgBlockForWrite()
+	require_NoError(t, err)
+	start, _, err := fs.StoreMsg("foo.a2.b.other.d.e.row", nil, nil, 0)
+	require_NoError(t, err)
+	_, err = fs.newMsgBlockForWrite()
+	require_NoError(t, err)
+	target, _, err := fs.StoreMsg("foo.a1.b.c0.d.e.hit", nil, nil, 0)
+	require_NoError(t, err)
+
+	fs.mu.RLock()
+	psimSize, nblks := fs.psim.Size(), len(fs.blks)
+	bi, _ := fs.selectMsgBlockWithIndex(start)
+	fs.mu.RUnlock()
+	require_True(t, psimSize < 64*1024)
+	require_Equal(t, bi, nblks-2)
+
+	sl := gsl.NewSublist[struct{}]()
+	for i := range 45 {
+		require_NoError(t, sl.Insert(fmt.Sprintf("foo.*.*.c%d.*.e.>", i), struct{}{}))
+	}
+
+	for _, test := range []struct {
+		title string
+		load  func(smp *StoreMsg) (*StoreMsg, uint64, error)
+	}{
+		// The selective token comes last, so matching this filter visits every subject.
+		{"Wildcard", func(smp *StoreMsg) (*StoreMsg, uint64, error) {
+			return fs.LoadNextMsg("foo.*.*.*.*.*.hit", true, start, smp)
+		}},
+		// Wildcards come before the selective token, so the intersect can't prune early.
+		{"Multi", func(smp *StoreMsg) (*StoreMsg, uint64, error) {
+			return fs.LoadNextMsgMulti(sl, start, smp)
+		}},
+	} {
+		t.Run(test.title, func(t *testing.T) {
+			// Take the fastest of a few calls so scheduling noise can't fail the test.
+			var smv StoreMsg
+			took := time.Duration(math.MaxInt64)
+			for range 5 {
+				s := time.Now()
+				sm, _, err := test.load(&smv)
+				elapsed := time.Since(s)
+				require_NoError(t, err)
+				require_Equal(t, sm.seq, target)
+				took = min(took, elapsed)
+			}
+			t.Logf("Load took %v with %d subjects", took, psimSize)
+			// Only the last block is left to scan, so this should not cost anything near a psim walk.
+			require_LessThan(t, took, time.Millisecond)
+		})
 	}
 }
 

@@ -317,7 +317,7 @@ func (t *SubjectTree[T]) delete(np *node, subject []byte, si int) (*T, bool) {
 func (t *SubjectTree[T]) match(n node, parts [][]byte, pre []byte, cb func(subject []byte, val *T) bool) bool {
 	// Capture if we are sitting on a terminal fwc.
 	var hasFWC bool
-	if lp := len(parts); lp > 0 && len(parts[lp-1]) > 0 && parts[lp-1][0] == fwc {
+	if lp := len(parts); lp > 0 && isFWCPart(parts[lp-1]) {
 		hasFWC = true
 	}
 
@@ -351,7 +351,7 @@ func (t *SubjectTree[T]) match(n node, parts [][]byte, pre []byte, cb func(subje
 			// We could have a leafnode with no suffix which would be a match.
 			// We could also have a terminal pwc. Check for those here.
 			var hasTermPWC bool
-			if lp := len(parts); lp > 0 && len(parts[lp-1]) == 1 && parts[lp-1][0] == pwc {
+			if lp := len(parts); lp > 0 && isPWCPart(parts[lp-1]) {
 				// If we are sitting on a terminal pwc, put the pwc back and continue.
 				nparts = parts[len(parts)-1:]
 				hasTermPWC = true
@@ -391,7 +391,7 @@ func (t *SubjectTree[T]) match(n node, parts [][]byte, pre []byte, cb func(subje
 		fp := nparts[0]
 		p := pivot(fp, 0)
 		// Check if we have a pwc/fwc part here. This will cause us to iterate.
-		if len(fp) == 1 && (p == pwc || p == fwc) {
+		if isPWCPart(fp) || isFWCPart(fp) {
 			// We need to iterate over all children here for the current node
 			// to see if we match further down.
 			for _, cn := range n.children() {

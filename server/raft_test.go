@@ -2606,6 +2606,154 @@ func TestNRGHealthCheckWaitForPendingCommitsWhenPaused(t *testing.T) {
 	require_True(t, n.Healthy())
 }
 
+func TestNRGHealthy(t *testing.T) {
+	// The leader grace period is twice the heartbeat interval, needs to be long enough to time it.
+	origHBInterval := hbInterval
+	hbInterval = 200 * time.Millisecond
+	defer func() { hbInterval = origHBInterval }()
+
+	s := runRaftTestServer(t)
+	defer s.Shutdown()
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+	processAE := func(n *raft, term, commit, pterm, pindex uint64, entries []*Entry) {
+		ae := &appendEntry{leader: nats0, term: term, commit: commit, pterm: pterm, pindex: pindex, entries: entries}
+		n.processAppendEntry(encode(t, ae), n.aesub)
+	}
+	leaderless := func(n *raft) {
+		n.updateLeader(noLeader)
+		n.nlt, n.lgt = time.Now().Add(-leaderlessHealthy), time.Time{}
+	}
+	// A vote request for a newer term clears the leader.
+	requestVote := func(n *raft) {
+		require_NoError(t, n.processVoteRequest(&voteRequest{term: n.term + 1, lastTerm: n.pterm, lastIndex: n.pindex, candidate: nats0}))
+	}
+
+	for i, test := range []struct {
+		title   string
+		setup   func(n *raft)
+		healthy bool
+		behind  bool // Whether falling behind was logged.
+	}{
+		{title: "follower processed leader index", healthy: true},
+		{title: "closed", setup: func(n *raft) { n.state.Store(int32(Closed)) }},
+		{title: "no commits", setup: func(n *raft) { n.commit = 0 }},
+		{title: "leader processing prior terms", setup: func(n *raft) { n.state.Store(int32(Leader)) }},
+		{title: "leader processed prior terms", healthy: true, setup: func(n *raft) {
+			n.state.Store(int32(Leader))
+			n.leaderState.Store(true)
+		}},
+		{title: "follower below leader index", behind: true, setup: func(n *raft) { n.hcindex = 2 }},
+		{title: "follower with pending commits past leader index", healthy: true, setup: func(n *raft) { n.pindex, n.commit = 2, 2 }},
+		{title: "catching up", setup: func(n *raft) { n.catchup = &catchupState{} }},
+		{title: "paused with pending commits", setup: func(n *raft) { n.paused, n.hcommit = true, 2 }},
+		{title: "paused without pending commits", healthy: true, setup: func(n *raft) { n.paused, n.hcommit = true, 1 }},
+		{title: "falling behind on applies", setup: func(n *raft) { n.quorumPaused = true }},
+		{title: "no recent leader contact", setup: func(n *raft) { n.peers[nats0].ts = time.Now().Add(-4 * hbInterval) }},
+		{title: "leader contact over two heartbeats ago", healthy: true, setup: func(n *raft) { n.peers[nats0].ts = time.Now().Add(-5 * hbInterval / 2) }},
+		{title: "new term without leader contact", setup: func(n *raft) { n.term = 2 }},
+		{title: "new term records leader index", behind: true, setup: func(n *raft) {
+			processAE(n, 2, 1, 1, 1, entries)
+			n.lgt = time.Time{}
+		}},
+		{title: "same term keeps leader index", healthy: true, setup: func(n *raft) { processAE(n, 1, 1, 1, 1, entries) }},
+		{title: "multiple entries record a single index", healthy: true, setup: func(n *raft) {
+			processAE(n, 2, 1, 1, 1, []*Entry{newEntry(EntryNormal, esm), newEntry(EntryNormal, esm), newEntry(EntryNormal, esm)})
+			processAE(n, 2, 2, 2, 2, nil)
+			n.Applied(2)
+			n.lgt = time.Time{}
+		}},
+		{title: "new term replaces leader index of truncated entry", healthy: true, setup: func(n *raft) {
+			processAE(n, 2, 1, 1, 1, entries)
+			processAE(n, 3, 1, 1, 1, nil)
+			n.lgt = time.Time{}
+		}},
+		{title: "new term within leader grace", healthy: true, setup: func(n *raft) { processAE(n, 2, 1, 1, 1, entries) }},
+		{title: "vote request within leader grace", healthy: true, setup: requestVote},
+		{title: "vote request past leader grace", setup: func(n *raft) {
+			requestVote(n)
+			n.lgt = time.Now().Add(-2 * hbInterval)
+		}},
+		{title: "vote request without grace while behind", setup: func(n *raft) {
+			n.hcindex = 2
+			requestVote(n)
+			require_False(t, n.hcbehind)
+		}},
+		{title: "vote request without grace while quorum paused", setup: func(n *raft) {
+			n.quorumPaused = true
+			requestVote(n)
+		}},
+		{title: "vote request without grace after no leader past timeout", behind: true, setup: func(n *raft) {
+			leaderless(n)
+			requestVote(n)
+			processAE(n, n.term, 1, 1, 1, entries)
+		}},
+		{title: "vote request without extending grace", setup: func(n *raft) {
+			n.hcindex = 2
+			n.lgt = time.Now().Add(-hbInterval)
+			requestVote(n)
+			time.Sleep(hbInterval * 3 / 2)
+		}},
+		{title: "vote request without grace after losing leader contact", setup: func(n *raft) {
+			n.peers[nats0].ts = time.Now().Add(-4 * hbInterval)
+			requestVote(n)
+		}},
+		{title: "election timeout without grace after losing leader contact", setup: func(n *raft) {
+			// The election timeout is at least four heartbeats, so leader contact is already lost.
+			n.peers[nats0].ts = time.Now().Add(-4 * hbInterval)
+			// Skip the peer interest check, nats-0 isn't a real server.
+			n.qn = 1
+			n.switchToCandidate()
+			require_Equal(t, n.term, 2)
+		}},
+		{title: "leader stepping down within leader grace", healthy: true, setup: func(n *raft) {
+			n.state.Store(int32(Leader))
+			n.leaderState.Store(true)
+			n.switchToFollowerLocked(noLeader)
+		}},
+		{title: "leader processing prior terms stepping down without grace", setup: func(n *raft) {
+			n.state.Store(int32(Leader))
+			n.switchToFollowerLocked(noLeader)
+		}},
+		{title: "no leader", setup: func(n *raft) {
+			n.updateLeader(noLeader)
+			n.lgt = time.Time{}
+		}},
+		{title: "no leader past timeout", healthy: true, setup: leaderless},
+		{title: "no leader past timeout with pending commits", setup: func(n *raft) {
+			leaderless(n)
+			n.pindex, n.commit = 2, 2
+		}},
+		{title: "no leader past timeout while quorum paused", healthy: true, setup: func(n *raft) {
+			leaderless(n)
+			n.quorumPaused = true
+		}},
+	} {
+		t.Run(test.title, func(t *testing.T) {
+			ms, err := newMemStore(&StreamConfig{Name: "TEST", Storage: MemoryStorage})
+			require_NoError(t, err)
+			cfg := &RaftConfig{Name: fmt.Sprintf("TEST-%d", i), Store: t.TempDir(), Log: ms}
+			require_NoError(t, s.bootstrapRaftNode(cfg, []string{s.sys.shash[:idLen]}, true))
+			n, err := s.initRaftNode(globalAccountName, cfg, pprofLabels{})
+			require_NoError(t, err)
+			n.addPeer(nats0)
+
+			// Follower that processed the leader's first entry.
+			processAE(n, 1, 0, 0, 0, entries)
+			processAE(n, 1, 1, 1, 1, nil)
+			n.Applied(1)
+
+			if test.setup != nil {
+				test.setup(n)
+			}
+			require_Equal(t, n.Healthy(), test.healthy)
+			require_Equal(t, n.hcbehind, test.behind)
+		})
+	}
+}
+
 func TestNRGAppendEntryCanEstablishQuorumAfterLeaderChange(t *testing.T) {
 	n, cleanup := initSingleMemRaftNode(t)
 	defer cleanup()
@@ -8209,5 +8357,149 @@ func TestNRGPreferredCandidateResendsVoteRequest(t *testing.T) {
 			})
 			require_Equal(t, n.Term(), vr.term)
 		})
+	}
+}
+
+func TestNRGLeaderTransferTargetRetriesQuickly(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	n.Lock()
+	n.lxfer = true
+	n.commit = n.processed + 1
+	n.Unlock()
+
+	n.switchToCandidate()
+	require_Equal(t, n.State(), Follower)
+	select {
+	case <-n.electTimer().C:
+	case <-time.After(2 * minCampaignTimeout):
+		t.Fatal("Transfer target didn't retry quickly")
+	}
+}
+
+func TestNRGLeaderTransferTargetFollowsNewLeader(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	nats1 := "yrzKKRBu" // "nats-1"
+
+	// The old leader names us as its successor.
+	entries := []*Entry{newEntry(EntryLeaderTransfer, []byte(n.id))}
+	n.processAppendEntry(encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries}), n.aesub)
+	require_True(t, n.lxfer)
+
+	// Granting another candidate our vote moves us to its term.
+	require_NoError(t, n.processVoteRequest(&voteRequest{term: 2, lastTerm: 1, lastIndex: 1, candidate: nats1}))
+	require_Equal(t, n.term, 2)
+	require_True(t, n.lxfer)
+
+	// Following the new leader in that same term clears the transfer.
+	n.processAppendEntry(encode(t, &appendEntry{leader: nats1, term: 2, commit: 0, pterm: 1, pindex: 1, entries: nil}), n.aesub)
+	require_Equal(t, n.leader, nats1)
+	require_False(t, n.lxfer)
+}
+
+func TestNRGStepDownToStalledPeerElectsQuickly(t *testing.T) {
+	for _, replicas := range []int{3, 5} {
+		t.Run(fmt.Sprintf("R%d", replicas), func(t *testing.T) {
+			c := createJetStreamClusterExplicit(t, fmt.Sprintf("R%dS", replicas), replicas)
+			defer c.shutdown()
+
+			rg := c.createRaftGroup("TEST", replicas, newStateAdder)
+			leader := rg.waitOnLeader()
+			require_NotNil(t, leader)
+
+			// Stand-in for a successor stuck in writeTermVote.
+			stalled := rg.nonLeader().node().(*raft)
+			stalled.Lock()
+			unlock := time.AfterFunc(10*time.Second, stalled.Unlock)
+			defer func() {
+				if unlock.Stop() {
+					stalled.Unlock()
+				}
+			}()
+
+			require_NoError(t, leader.node().StepDown(stalled.ID()))
+			// Like in lame duck mode, the old leader only votes.
+			leader.node().SetObserver(true)
+
+			// Without shortening the followers' election timers, this would take at least 1.5s.
+			checkFor(t, minElectionTimeout-100*time.Millisecond, 10*time.Millisecond, func() error {
+				if rg.leader() == nil {
+					return errors.New("no leader yet")
+				}
+				return nil
+			})
+		})
+	}
+}
+
+func TestNRGVoteRequestPersistsNewTerm(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	// Granting persists the new term with the vote.
+	require_NoError(t, n.processVoteRequest(&voteRequest{term: 1, lastTerm: 0, lastIndex: 0, candidate: nats0}))
+	term, voted, err := n.readTermVote()
+	require_NoError(t, err)
+	require_Equal(t, term, 1)
+	require_Equal(t, voted, nats0)
+
+	// Denying an outdated candidate still persists the new term.
+	n.pterm, n.pindex = 1, 100
+	require_NoError(t, n.processVoteRequest(&voteRequest{term: 2, lastTerm: 1, lastIndex: 2, candidate: nats0}))
+	term, voted, err = n.readTermVote()
+	require_NoError(t, err)
+	require_Equal(t, term, 2)
+	require_Equal(t, voted, noVote)
+}
+
+func TestNRGStepDownPrefersCaughtUpPeer(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	rg := c.createRaftGroup("TEST", 3, newStateAdder)
+
+	// Repeat, as peers are visited in random order.
+	for range 10 {
+		leader := rg.waitOnLeader()
+		require_NotNil(t, leader)
+		ln := leader.node().(*raft)
+
+		// Followers only count as caught up once they've acked since the election.
+		leader.(*stateAdder).proposeDelta(1)
+		followers := rg.followers()
+		checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+			for _, f := range followers {
+				if !ln.IsFollowerCaughtUp(f.node().ID()) {
+					return fmt.Errorf("follower %s not caught up", f.node().ID())
+				}
+			}
+			return nil
+		})
+
+		// Pretend we're catching up one of the followers.
+		catchingUp := followers[0].node().ID()
+		ln.Lock()
+		if ln.progress == nil {
+			ln.progress = make(map[string]*ipQueue[uint64])
+		}
+		q := newIPQueue[uint64](ln.s, "test")
+		ln.progress[catchingUp] = q
+		ln.Unlock()
+
+		require_NoError(t, ln.StepDown())
+		ln.Lock()
+		delete(ln.progress, catchingUp)
+		ln.Unlock()
+		q.unregister()
+
+		nl := rg.waitOnLeader()
+		require_NotNil(t, nl)
+		require_NotEqual(t, nl.node().ID(), catchingUp)
 	}
 }

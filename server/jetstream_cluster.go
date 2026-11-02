@@ -825,6 +825,16 @@ func (cc *jetStreamCluster) streamGroupNode(account, stream string) (RaftNode, b
 	return rg.node, rg.Desired != nil || len(rg.Peers) > 1, true
 }
 
+// assetStartGrace is how long a newly assigned stream or consumer can still be starting.
+// Health checks don't report it as broken during that time.
+const assetStartGrace = 5 * time.Second
+
+// hasApplied returns whether the group has applied any entries.
+func hasApplied(n RaftNode) bool {
+	_, _, applied := n.Progress()
+	return applied > 0
+}
+
 // isStreamHealthy will determine if the stream is up to date or very close.
 // For R1 it will make sure the stream is present on this server.
 func (js *jetStream) isStreamHealthy(acc *Account, sa *streamAssignment) error {
@@ -860,11 +870,18 @@ func (js *jetStream) isStreamHealthy(acc *Account, sa *streamAssignment) error {
 	if o := sa.desiredOrigin(); o != nil {
 		originReplicas = o.Replicas
 	}
+	// Only when created while we were running, otherwise we may need to catch up after a restart.
+	starting := sa.Created.After(js.srv.start) && time.Since(sa.Created) < assetStartGrace
 	js.mu.RUnlock()
 
 	// First lookup stream and make sure its there.
 	mset, err := acc.lookupStream(streamName)
 	if err != nil {
+		if starting {
+			// No further checks, stream is not available yet but should be soon.
+			// We'll start erroring once we're sure this stream is actually broken.
+			return nil
+		}
 		return errors.New("stream not found")
 	}
 
@@ -880,6 +897,10 @@ func (js *jetStream) isStreamHealthy(acc *Account, sa *streamAssignment) error {
 	switch {
 	case replicas <= 1:
 		return nil // No further checks for R=1 streams
+
+	case starting && (node == nil || msetNode == nil):
+		// Nodes not set up yet, but should be soon.
+		return nil
 
 	case node == nil:
 		// Still running at an origin that needs no node. Only checked here, so a group
@@ -902,6 +923,10 @@ func (js *jetStream) isStreamHealthy(acc *Account, sa *streamAssignment) error {
 
 	case streamWerr != nil:
 		return fmt.Errorf("stream write error: %v", streamWerr)
+
+	case starting && !hasApplied(node):
+		// A new group that hasn't applied anything has nothing to catch up on yet.
+		return nil
 
 	case !mset.isMonitorRunning():
 		return errors.New("monitor goroutine not running")
@@ -947,8 +972,9 @@ func (js *jetStream) isConsumerHealthy(mset *stream, sa *streamAssignment, consu
 		js.mu.RUnlock()
 		return fmt.Errorf("consumer assignment error: %w", err)
 	}
-	created := ca.Created
 	node := ca.Group.node
+	// Only when created while we were running, otherwise we may need to catch up after a restart.
+	starting := ca.Created.After(js.srv.start) && time.Since(ca.Created) < assetStartGrace
 	// The stream may be running at its origin while its config already carries the
 	// target replica count. A consumer that has not been mapped onto the new peers
 	// yet inherits that target, so fall back on the origin count below.
@@ -961,7 +987,7 @@ func (js *jetStream) isConsumerHealthy(mset *stream, sa *streamAssignment, consu
 	// Check if not running at all.
 	o := mset.lookupConsumer(consumer)
 	if o == nil {
-		if time.Since(created) < 5*time.Second {
+		if starting {
 			// No further checks, consumer is not available yet but should be soon.
 			// We'll start erroring once we're sure this consumer is actually broken.
 			return nil
@@ -978,6 +1004,10 @@ func (js *jetStream) isConsumerHealthy(mset *stream, sa *streamAssignment, consu
 	switch {
 	case rc <= 1:
 		return nil // No further checks for R=1 consumers
+
+	case starting && (node == nil || oNode == nil):
+		// Nodes not set up yet, but should be soon.
+		return nil
 
 	case node == nil:
 		// Not mapped onto the new peers yet, so still running at the stream's origin
@@ -1001,6 +1031,10 @@ func (js *jetStream) isConsumerHealthy(mset *stream, sa *streamAssignment, consu
 
 	case nrgWerr != nil:
 		return fmt.Errorf("node write error: %v", nrgWerr)
+
+	case starting && !hasApplied(node):
+		// A new group that hasn't applied anything has nothing to catch up on yet.
+		return nil
 
 	case !o.isMonitorRunning():
 		return errors.New("monitor goroutine not running")
@@ -1209,6 +1243,7 @@ func (js *jetStream) setupMetaGroup() error {
 		peers := s.ActivePeers()
 		s.Debugf("JetStream cluster initial peers: %+v", peers)
 		if err := s.bootstrapRaftNode(cfg, peers, false); err != nil {
+			fs.Stop()
 			return err
 		}
 		if cfg.Observer {
@@ -1238,6 +1273,7 @@ func (js *jetStream) setupMetaGroup() error {
 			// set extension state to undetermined.
 			ps.domainExt = extUndetermined
 			if err := writePeerState(s.diskIOSemaphore(), storeDir, ps); err != nil {
+				fs.Stop()
 				return err
 			}
 		}
@@ -4820,7 +4856,7 @@ func (js *jetStream) applyStreamMsgOp(mset *stream, op entryOp, mbuf []byte, isR
 			// Decrement from pending operations. Once it reaches zero, it can be deleted.
 			if i.ops > 0 {
 				var sz uint64
-				if mset.store.Type() == FileStorage {
+				if mset.stype == FileStorage {
 					sz = fileStoreMsgSizeRaw(len(csubject), len(hdr), len(msg))
 				} else {
 					sz = memStoreMsgSizeRaw(len(csubject), len(hdr), len(msg))
@@ -6624,7 +6660,7 @@ func (js *jetStream) processClusterCreateConsumer(oca, ca *consumerAssignment, s
 								resp.Error = NewJSConsumerInvalidResetError(err)
 								s.sendAPIErrResponse(client, acc, subject, reply, _EMPTY_, s.jsonResponse(&resp))
 							} else if canRespond {
-								if resp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.info()); resp.ConsumerInfo == nil {
+								if resp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.resetInfo(resetSeq)); resp.ConsumerInfo == nil {
 									// The consumer was closed before we could respond.
 									resp.Error = NewJSConsumerInvalidResetError(errConsumerClosed)
 									s.sendAPIErrResponse(client, acc, subject, reply, _EMPTY_, s.jsonResponse(&resp))
@@ -7344,7 +7380,7 @@ func (js *jetStream) applyConsumerEntries(o *consumer, ce *CommittedEntry, isLea
 							a = nil
 						}
 						var resp = JSApiConsumerResetResponse{ApiResponse: ApiResponse{Type: JSApiConsumerResetResponseType}}
-						if resp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.info()); resp.ConsumerInfo == nil {
+						if resp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.resetInfo(sseq)); resp.ConsumerInfo == nil {
 							// The consumer was closed before we could respond.
 							resp.Error = NewJSConsumerInvalidResetError(errConsumerClosed)
 							s.sendInternalAccountMsg(a, reply, s.jsonResponse(&resp))
@@ -7566,7 +7602,7 @@ func (js *jetStream) processConsumerLeaderChangeWithAssignment(o *consumer, ca *
 				rresp.Error = NewJSConsumerInvalidResetError(err)
 				s.sendAPIErrResponse(client, acc, subject, reply, _EMPTY_, s.jsonResponse(&rresp))
 			} else if canRespond {
-				if rresp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.info()); rresp.ConsumerInfo == nil {
+				if rresp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.resetInfo(resetSeq)); rresp.ConsumerInfo == nil {
 					// The consumer was closed before we could respond.
 					rresp.Error = NewJSConsumerInvalidResetError(errConsumerClosed)
 					s.sendAPIErrResponse(client, acc, subject, reply, _EMPTY_, s.jsonResponse(&rresp))

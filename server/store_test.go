@@ -1442,6 +1442,86 @@ func TestStoreMultiLastMsgs(t *testing.T) {
 	)
 }
 
+func TestStoreLoadLastSeq(t *testing.T) {
+	test := func(t *testing.T, fs StreamStore) {
+		for _, subj := range []string{"foo.a", "foo.b", "foo.c", "foo.a", "foo.b", "bar", "foo.c", "foo.a", "foo.b"} {
+			_, _, err := fs.StoreMsg(subj, nil, []byte("x"), 0)
+			require_NoError(t, err)
+		}
+		if fs, ok := fs.(*fileStore); ok {
+			require_True(t, fs.numMsgBlocks() > 1)
+		}
+		// LoadLastSeq must agree with LoadLastMsg.
+		check := func(subj string, expected uint64) {
+			t.Helper()
+			var smv StoreMsg
+			sm, merr := fs.LoadLastMsg(subj, &smv)
+			seq, err := fs.LoadLastSeq(subj)
+			if sm == nil {
+				require_Error(t, merr, ErrStoreMsgNotFound)
+				require_Error(t, err, ErrStoreMsgNotFound)
+			} else {
+				require_NoError(t, err)
+				require_Equal(t, seq, sm.seq)
+			}
+			require_Equal(t, seq, expected)
+		}
+		check("foo.a", 8)
+		check("foo.b", 9)
+		check("foo.c", 7)
+		check("bar", 6)
+		check("foo.*", 9)
+		check(_EMPTY_, 9)
+		check(fwcs, 9)
+		check("baz", 0)
+
+		// Removing a subject's last message out of order moves it back to the previous one.
+		_, err := fs.RemoveMsg(8)
+		require_NoError(t, err)
+		check("foo.a", 4)
+
+		// The stream's last sequence stays after its message is removed, but has no message.
+		_, err = fs.RemoveMsg(9)
+		require_NoError(t, err)
+		check("foo.b", 5)
+		check("foo.*", 7)
+		check(_EMPTY_, 0)
+		check(fwcs, 0)
+
+		_, err = fs.RemoveMsg(4)
+		require_NoError(t, err)
+		check("foo.a", 1)
+		_, err = fs.RemoveMsg(1)
+		require_NoError(t, err)
+		check("foo.a", 0)
+
+		_, err = fs.Purge()
+		require_NoError(t, err)
+		check("foo.b", 0)
+		check(fwcs, 0)
+	}
+
+	cfg := StreamConfig{Name: "zzz", Subjects: []string{"foo.*", "bar"}}
+	t.Run("Memory", func(t *testing.T) {
+		cfg.Storage = MemoryStorage
+		ms, err := newMemStore(&cfg)
+		require_NoError(t, err)
+		defer ms.Stop()
+		test(t, ms)
+	})
+	t.Run("File", func(t *testing.T) {
+		cfg.Storage = FileStorage
+		testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
+			// Small blocks, so stale last block indexes make the lookup walk back across blocks.
+			fcfg.BlockSize = 128
+			fs, err := newFileStore(fcfg, cfg)
+			require_NoError(t, err)
+			defer fs.Stop()
+			test(t, fs)
+		})
+	})
+}
+
 func TestStoreNumPendingLastPerSubjectExcludeOvercount(t *testing.T) {
 	testAllStoreAllPermutations(
 		t, false,

@@ -4125,7 +4125,11 @@ func (s *Server) processStreamRestore(ci *ClientInfo, acc *Account, cfg *StreamC
 			case <-notActive.C:
 				err := fmt.Errorf("restore for stream '%s > %s' is stalled", acc.Name, streamName)
 				closeWithError(err)
-				doneCh <- err
+				// Wait for the restore to unwind, it may have created the stream already.
+				if !restoreDone {
+					restoreResult = <-restoreCh
+				}
+				finish(replySubj, err, restoreResult.mset)
 				return
 			}
 		}
@@ -5051,21 +5055,10 @@ func (s *Server) jsConsumerInfoRequest(sub *subscription, c *client, _ *Account,
 
 			// Check if we should ignore all together.
 			if node == nil {
-				// We have been assigned but have not created a node yet. If we are a member return
-				// our config and defaults for state and no cluster info.
+				// We have been assigned but have not created a node yet.
 				if isMember {
-					// Since we access consumerAssignment, need js lock.
-					js.mu.RLock()
-					resp.ConsumerInfo = &ConsumerInfo{
-						Stream:    ca.Stream,
-						Name:      ca.Name,
-						Created:   ca.Created,
-						Config:    setDynamicConsumerMetadata(ca.Config),
-						TimeStamp: time.Now().UTC(),
-					}
-					b := s.jsonResponse(resp)
-					js.mu.RUnlock()
-					s.sendAPIResponse(ci, acc, subject, reply, string(msg), b)
+					resp.Error = NewJSConsumerNotFoundError()
+					s.sendDelayedAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp), nil, errRespDelay)
 				}
 				return
 			}

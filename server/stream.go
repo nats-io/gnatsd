@@ -672,6 +672,7 @@ type sourceInfo struct {
 	msgs  *ipQueue[*inMsg]    // Intra-process queue for incoming messages.
 	sseq  uint64              // Last stream message sequence number seen from the source.
 	dseq  uint64              // Last delivery (i.e. consumer's) sequence number.
+	cseq  uint64              // Stream message sequence number of the last delivery counted towards dseq.
 	lag   uint64              // 0 or number of messages pending (as last reported by the consumer) - 1.
 	err   *ApiError           // The API error that caused the last consumer setup to fail.
 	fails int                 // The number of times trying to setup the consumer failed.
@@ -2826,6 +2827,15 @@ func (mset *stream) updateWithAdvisory(config *StreamConfig, sendAdvisory bool, 
 	mset.ddwin = cfg.Duplicates
 	mset.ddMu.Unlock()
 
+	// Rate limited consumers use the max msg size as their burst.
+	if cfg.MaxMsgSize != ocfg.MaxMsgSize {
+		for _, o := range mset.consumers {
+			o.mu.Lock()
+			o.setRateLimit(o.cfg.RateLimit)
+			o.mu.Unlock()
+		}
+	}
+
 	// If we're changing retention and haven't errored because of consumer
 	// replicas by now, whip through and update the consumer retention.
 	if ocfg.Retention != cfg.Retention {
@@ -3351,33 +3361,38 @@ func (mset *stream) processInboundMirrorMsg(m *inMsg) bool {
 	}
 
 	// Mirror info tracking.
-	olag, osseq, odseq := mset.mirror.lag, mset.mirror.sseq, mset.mirror.dseq
+	olag, osseq, odseq, ocseq := mset.mirror.lag, mset.mirror.sseq, mset.mirror.dseq, mset.mirror.cseq
 	if sseq <= mset.mirror.sseq {
 		// Ignore older messages.
 		// If the deliver sequence matches, we only update delivered accounting.
-		if dseq == mset.mirror.dseq+1 {
+		// A stale delivery from before a consumer reset could match too, but it won't be above the last counted.
+		if dseq == mset.mirror.dseq+1 && sseq > mset.mirror.cseq {
 			mset.mirror.dseq++
+			mset.mirror.cseq = sseq
 		}
 		mset.mu.Unlock()
 		return true
 	} else if sseq == mset.mirror.sseq+1 {
 		mset.mirror.dseq = dseq
 		mset.mirror.sseq++
+		mset.mirror.cseq = sseq
 	} else if mset.mirror.cname == _EMPTY_ {
 		mset.mirror.cname = cname
-		mset.mirror.dseq, mset.mirror.sseq = dseq, sseq
+		mset.mirror.dseq, mset.mirror.sseq, mset.mirror.cseq = dseq, sseq, sseq
 	} else {
 		// If the deliver sequence matches then the upstream stream has expired or deleted messages.
 		if dseq == mset.mirror.dseq+1 {
 			if err := mset.skipMsgs(mset.mirror.sseq+1, sseq-1); err != nil {
 				mset.mirror.sseq = osseq
 				mset.mirror.dseq = odseq
+				mset.mirror.cseq = ocseq
 				mset.mu.Unlock()
 				mset.retryMirrorConsumer()
 				return false
 			}
 			mset.mirror.dseq++
 			mset.mirror.sseq = sseq
+			mset.mirror.cseq = sseq
 		} else {
 			mset.mu.Unlock()
 			mset.retryMirrorConsumer()
@@ -3456,6 +3471,7 @@ func (mset *stream) processInboundMirrorMsg(m *inMsg) bool {
 				mset.mirror.lag = olag
 				mset.mirror.dseq = odseq
 				mset.mirror.sseq = osseq
+				mset.mirror.cseq = ocseq
 				if sseq <= lseq {
 					mset.mirror.sseq = lseq
 				}
@@ -3936,7 +3952,7 @@ func (mset *stream) setupMirrorConsumer() error {
 
 			// Capture consumer name.
 			mirror.cname = ccr.ConsumerInfo.Name
-			mirror.dseq = 0
+			mirror.dseq, mirror.cseq = 0, ccr.ConsumerInfo.Delivered.Stream
 			mirror.fcid, mirror.fcsc = _EMPTY_, 0
 			mirror.sseq = max(ccr.ConsumerInfo.Delivered.Stream, state.LastSeq)
 			mirror.qch = make(chan struct{})
@@ -4339,7 +4355,7 @@ func (mset *stream) trySetupSourceConsumer(iname string, seq uint64, startTime t
 				si.cname = ccr.ConsumerInfo.Name
 
 				// Do not set si.sseq to seq here. si.sseq will be set in processInboundSourceMsg
-				si.dseq = 0
+				si.dseq, si.cseq = 0, ccr.ConsumerInfo.Delivered.Stream
 				si.fcid, si.fcsc = _EMPTY_, 0
 				si.qch = make(chan struct{})
 				// Set the last seen as now so that we don't fail at the first check.
@@ -4417,7 +4433,7 @@ func (mset *stream) processAllSourceMsgs() {
 						cleanUp()
 						return
 					}
-					break
+					// The batch holds messages from all sources, so only skip this one.
 				}
 				im.returnToPool()
 			}
@@ -4589,28 +4605,26 @@ func (mset *stream) processInboundSourceMsg(si *sourceInfo, m *inMsg) bool {
 	}
 
 	// Tracking is done here.
-	osseq, odseq := si.sseq, si.dseq
+	osseq, odseq, ocseq := si.sseq, si.dseq, si.cseq
 	if sseq <= si.sseq {
 		// Ignore older messages.
 		// If the deliver sequence matches, we only update delivered accounting.
-		if dseq == si.dseq+1 {
+		// A stale delivery from before a consumer reset could match too, but it won't be above the last counted.
+		if dseq == si.dseq+1 && sseq > si.cseq {
 			si.dseq++
+			si.cseq = sseq
 		}
 		mset.mu.Unlock()
 		return true
 	} else if dseq == si.dseq+1 {
 		si.dseq++
-		si.sseq = sseq
-	} else if dseq > si.dseq {
-		if si.cname == _EMPTY_ {
-			si.cname = cname
-			si.dseq, si.sseq = dseq, sseq
-		} else {
-			mset.retrySourceConsumerAtSeq(si.iname, si.sseq+1)
-			mset.mu.Unlock()
-			return false
-		}
+		si.sseq, si.cseq = sseq, sseq
+	} else if dseq > si.dseq && si.cname == _EMPTY_ {
+		si.cname = cname
+		si.dseq, si.sseq, si.cseq = dseq, sseq, sseq
 	} else {
+		// Either we missed messages, or this newer message was delivered before one we already counted.
+		mset.retrySourceConsumerAtSeq(si.iname, si.sseq+1)
 		mset.mu.Unlock()
 		return false
 	}
@@ -4691,6 +4705,7 @@ func (mset *stream) processInboundSourceMsg(si *sourceInfo, m *inMsg) bool {
 			mset.mu.Lock()
 			si.dseq = odseq
 			si.sseq = osseq
+			si.cseq = ocseq
 			mset.retrySourceConsumerAtSeq(iName, sseq)
 			mset.mu.Unlock()
 		}
@@ -6617,13 +6632,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 					seqSubj = optSubj
 				}
 
-				// TODO(dlc) - We could make a new store func that does this all in one.
-				var smv StoreMsg
-				var fseq uint64
-				sm, err := store.LoadLastMsg(seqSubj, &smv)
-				if sm != nil {
-					fseq = sm.seq
-				}
+				fseq, err := store.LoadLastSeq(seqSubj)
 				if err == ErrStoreMsgNotFound && seq == 0 {
 					fseq, err = 0, nil
 				}
@@ -7154,10 +7163,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 
 	// If we are republishing grab last sequence for this exact subject. Aids in gap detection for lightweight clients.
 	if republish {
-		var smv StoreMsg
-		if sm, _ := store.LoadLastMsg(subject, &smv); sm != nil {
-			tlseq = sm.seq
-		}
+		tlseq, _ = store.LoadLastSeq(subject)
 	}
 
 	// If clustered this was already checked and we do not want to check here and possibly introduce skew.
@@ -8696,22 +8702,16 @@ func (mset *stream) stop(deleteFlag, advisory bool) error {
 
 	if deleteFlag {
 		// cleanup directories after the stream
-		accDir := filepath.Join(js.config.StoreDir, accName)
 		if store != nil {
 			// Ignore errors.
 			store.Delete(false)
 		} else {
+			accDir := filepath.Join(js.config.StoreDir, accName)
 			streamDir := filepath.Join(accDir, streamsDir)
 			os.RemoveAll(filepath.Join(streamDir, name))
 		}
 		// Release any resources.
 		js.releaseStreamResources(&mset.cfg)
-		// Do cleanup in separate go routine similar to how fs will use purge here..
-		go func() {
-			// no op if not empty
-			os.Remove(filepath.Join(accDir, streamsDir))
-			os.Remove(accDir)
-		}()
 	} else if store != nil {
 		// Ignore errors.
 		store.Stop()
@@ -8820,8 +8820,10 @@ func (mset *stream) checkInterestState() {
 	rp := mset.cfg.Retention
 	mset.cfgMu.RUnlock()
 	// Remove as many messages from the "head" of the stream if there's no interest anymore.
-	if rp == InterestPolicy && asflr != math.MaxUint64 {
-		mset.store.Compact(asflr)
+	// Only compact up to the current stream state, consumers may be ahead while replaying.
+	// A check floor of 0 means a consumer has not completed a check yet, and Compact(0) purges.
+	if rp == InterestPolicy && asflr != math.MaxUint64 && asflr > 0 {
+		mset.store.Compact(min(asflr, ss.LastSeq+1))
 	}
 }
 

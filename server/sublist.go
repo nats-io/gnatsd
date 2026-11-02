@@ -1327,7 +1327,12 @@ func ValidateMapping(src string, dest string) error {
 		}
 
 		// if it looks like it contains a mapping function, it should be a valid mapping function
-		if length > 4 && t[0] == '{' && t[1] == '{' && t[length-2] == '}' && t[length-1] == '}' {
+		if isMappingFunctionToken(t) {
+			// Account scoped functions must have been resolved before the mapping is validated.
+			// Better error in case some (future) code path builds a transform without expanding it first.
+			if isAccountMappingFunction(t) {
+				return &mappingDestinationErr{t, ErrMappingFunctionNotAvailable}
+			}
 			if !partitionMappingFunctionRegEx.MatchString(t) &&
 				!wildcardMappingFunctionRegEx.MatchString(t) &&
 				!splitFromLeftMappingFunctionRegEx.MatchString(t) &&
@@ -1377,8 +1382,7 @@ func tokensCanMatch(t1, t2 string) bool {
 	if len(t1) == 0 || len(t2) == 0 {
 		return false
 	}
-	t1c, t2c := t1[0], t2[0]
-	if t1c == pwc || t2c == pwc || t1c == fwc || t2c == fwc {
+	if t1 == pwcs || t2 == pwcs || t1 == fwcs || t2 == fwcs {
 		return true
 	}
 	return t1 == t2
@@ -1534,7 +1538,7 @@ func isSubsetMatchTokenized(tokens, test []string) bool {
 			}
 			continue
 		}
-		if t2[0] != pwc && strings.Compare(t1, t2) != 0 {
+		if t2 != pwcs && strings.Compare(t1, t2) != 0 {
 			return false
 		}
 	}

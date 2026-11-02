@@ -14,6 +14,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"math"
@@ -248,7 +249,13 @@ func indexPlaceHolders(token string) (int16, []int, int32, string, error) {
 		}
 
 		// New 'mustache' style mapping
-		if length > 4 && token[0] == '{' && token[1] == '{' && token[length-2] == '}' && token[length-1] == '}' {
+		if isMappingFunctionToken(token) {
+			// Account scoped functions are resolved when the subject is installed, never at transform time.
+			// Better error returned here in case some future code path builds a transform without expanding it first
+			if isAccountMappingFunction(token) {
+				return BadTransform, []int{}, -1, _EMPTY_, &mappingDestinationErr{token, ErrMappingFunctionNotAvailable}
+			}
+
 			// wildcard(wildcard token index) (equivalent to $)
 			args := getMappingFunctionArgs(wildcardMappingFunctionRegEx, token)
 			if args != nil {
@@ -685,4 +692,220 @@ func subjectInfo(subject string) (bool, []string, int, bool) {
 		}
 	}
 	return true, tokens, npwcs, sfwc
+}
+
+// Account scoped mapping functions.
+//
+// Unlike the functions above, these are not evaluated per message: they are resolved once, into a literal token,
+// when the subject that contains them is installed (account mappings, imports and exports, leafnode remote deny
+// lists). This is what allows them to be used in subjects that are never transformed, such as import/export
+// subjects and deny lists, and what keeps import transforms reversible. They are not resolved anywhere else
+// (e.g. stream transforms), where the transform engine rejects them.
+var (
+	accountHashMappingFunctionRegEx           = regexp.MustCompile(`{{\s*[aA]ccount-[hH]ash\s*\((.*)\)\s*}}`)
+	accountHashImportMappingFunctionRegEx     = regexp.MustCompile(`{{\s*[aA]ccount-[hH]ash-[iI]mport\s*\((.*)\)\s*}}`)
+	accountHashLeafRemoteMappingFunctionRegEx = regexp.MustCompile(`{{\s*[aA]ccount-[hH]ash-[lL]eaf-[rR]emote\s*\((.*)\)\s*}}`)
+)
+
+// subjectPlaceholderContext holds the account names the account scoped mapping functions hash.
+// An empty value means that the function is not available in the context the subject is used in.
+type subjectPlaceholderContext struct {
+	account       string // {{account-hash()}}
+	importAccount string // {{account-hash-import()}}
+	leafRemote    string // {{account-hash-leaf-remote()}}
+	// When set, the remote account of a leafnode connection is not known yet: {{account-hash-leaf-remote()}}
+	// is left untouched instead of being an error, to be resolved when the permissions are applied again.
+	leafRemotePending bool
+}
+
+// The account scoped mapping functions take no arguments.
+type accountMappingFunction struct {
+	re      *regexp.Regexp
+	value   func(ctx *subjectPlaceholderContext) string
+	pending func(ctx *subjectPlaceholderContext) bool // the value may become available later
+}
+
+func neverPending(*subjectPlaceholderContext) bool { return false }
+
+var accountMappingFunctions = []accountMappingFunction{
+	{accountHashImportMappingFunctionRegEx, func(c *subjectPlaceholderContext) string { return c.importAccount }, neverPending},
+	{accountHashLeafRemoteMappingFunctionRegEx, func(c *subjectPlaceholderContext) string { return c.leafRemote }, func(c *subjectPlaceholderContext) bool { return c.leafRemotePending }},
+	{accountHashMappingFunctionRegEx, func(c *subjectPlaceholderContext) string { return c.account }, neverPending},
+}
+
+// isMappingFunctionToken reports whether the token has the {{...}} shape of a mapping function.
+func isMappingFunctionToken(token string) bool {
+	l := len(token)
+	return l > 4 && token[0] == '{' && token[1] == '{' && token[l-2] == '}' && token[l-1] == '}'
+}
+
+// isAccountMappingFunction reports whether the token is one of the account scoped mapping functions.
+func isAccountMappingFunction(token string) bool {
+	if !isMappingFunctionToken(token) {
+		return false
+	}
+	for _, f := range accountMappingFunctions {
+		if f.re.MatchString(token) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasSubjectPlaceholders is a cheap check for subjects that may contain mapping functions.
+func hasSubjectPlaceholders(subject string) bool {
+	return strings.Contains(subject, "{{")
+}
+
+// expandSubjectPlaceholderToken resolves a single account scoped mapping function token.
+// Returns the hash and true when the token was resolved, or the token itself and false when it is not
+// an account scoped mapping function or when its value is pending.
+func expandSubjectPlaceholderToken(token string, ctx *subjectPlaceholderContext) (string, bool, error) {
+	if !isMappingFunctionToken(token) {
+		return token, false, nil
+	}
+	for _, f := range accountMappingFunctions {
+		args := getMappingFunctionArgs(f.re, token)
+		if args == nil {
+			continue
+		}
+		// No arguments for the account mapping functions
+		if len(args) > 1 || strings.TrimSpace(args[0]) != _EMPTY_ {
+			return _EMPTY_, false, &mappingDestinationErr{token, ErrMappingDestinationTooManyArgs}
+		}
+		value := f.value(ctx)
+		if value == _EMPTY_ {
+			if f.pending(ctx) {
+				return token, false, nil
+			}
+			return _EMPTY_, false, &mappingDestinationErr{token, ErrMappingFunctionNotAvailable}
+		}
+		return getHash(value), true, nil
+	}
+	return token, false, nil
+}
+
+// expandSubjectPlaceholders replaces the account scoped mapping functions in subject with their literal values.
+// Any other mapping function, and any other token, is left untouched. Errors are of type *mappingDestinationErr.
+func expandSubjectPlaceholders(subject string, ctx subjectPlaceholderContext) (string, error) {
+	if !hasSubjectPlaceholders(subject) {
+		return subject, nil
+	}
+	tokens := strings.Split(subject, tsep)
+	changed := false
+	for i, token := range tokens {
+		value, ok, err := expandSubjectPlaceholderToken(token, &ctx)
+		if err != nil {
+			return _EMPTY_, err
+		}
+		if ok {
+			tokens[i] = value
+			changed = true
+		}
+	}
+	if !changed {
+		return subject, nil
+	}
+	return strings.Join(tokens, tsep), nil
+}
+
+// expandSubjectsPlaceholders resolves the account scoped mapping functions in the given subjects in place.
+// Empty subjects are skipped.
+func expandSubjectsPlaceholders(ctx subjectPlaceholderContext, subjects ...*string) error {
+	for _, subject := range subjects {
+		if *subject == _EMPTY_ {
+			continue
+		}
+		expanded, err := expandSubjectPlaceholders(*subject, ctx)
+		if err != nil {
+			return err
+		}
+		*subject = expanded
+	}
+	return nil
+}
+
+// expandPermissionSubjectPlaceholders is expandSubjectPlaceholders for permission entries, which for
+// subscribe permissions may carry a queue name after the subject.
+func expandPermissionSubjectPlaceholders(entry string, ctx subjectPlaceholderContext) (string, error) {
+	if !hasSubjectPlaceholders(entry) {
+		return entry, nil
+	}
+	subject, queue, hasQueue := strings.Cut(entry, " ")
+	expanded, err := expandSubjectPlaceholders(subject, ctx)
+	if err != nil {
+		return _EMPTY_, err
+	}
+	if hasQueue {
+		return expanded + " " + queue, nil
+	}
+	return expanded, nil
+}
+
+// permissionsHavePlaceholders reports whether any subject in perms may contain a mapping function.
+func permissionsHavePlaceholders(perms *Permissions) bool {
+	if perms == nil {
+		return false
+	}
+	for _, sp := range []*SubjectPermission{perms.Publish, perms.Subscribe} {
+		if sp == nil {
+			continue
+		}
+		for _, s := range sp.Allow {
+			if hasSubjectPlaceholders(s) {
+				return true
+			}
+		}
+		for _, s := range sp.Deny {
+			if hasSubjectPlaceholders(s) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// expandPermissionSubjectsPlaceholders returns a copy of the permission entries with the account scoped mapping
+// functions replaced by their literal values. Entries that fail to expand are kept as is and reported in the
+// returned error, which may combine several errors. The given slice is never modified.
+func expandPermissionSubjectsPlaceholders(subjects []string, ctx subjectPlaceholderContext) ([]string, error) {
+	if len(subjects) == 0 {
+		return subjects, nil
+	}
+	var errs []error
+	expanded := make([]string, len(subjects))
+	for i, s := range subjects {
+		e, err := expandPermissionSubjectPlaceholders(s, ctx)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("permission subject %q: %w", s, err))
+			e = s
+		}
+		expanded[i] = e
+	}
+	return expanded, errors.Join(errs...)
+}
+
+// expandPermissionsPlaceholders returns perms with the account scoped mapping functions in its subjects replaced
+// by their literal values. The given perms are never modified: the same pointer is returned when there is nothing
+// to expand, a clone otherwise. Entries that fail to expand are kept as is and reported in the returned error,
+// which may combine several errors.
+func expandPermissionsPlaceholders(perms *Permissions, ctx subjectPlaceholderContext) (*Permissions, error) {
+	if !permissionsHavePlaceholders(perms) {
+		return perms, nil
+	}
+	var errs []error
+	clone := perms.clone()
+	for _, sp := range []*SubjectPermission{clone.Publish, clone.Subscribe} {
+		if sp == nil {
+			continue
+		}
+		var err error
+		if sp.Allow, err = expandPermissionSubjectsPlaceholders(sp.Allow, ctx); err != nil {
+			errs = append(errs, err)
+		}
+		if sp.Deny, err = expandPermissionSubjectsPlaceholders(sp.Deny, ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return clone, errors.Join(errs...)
 }

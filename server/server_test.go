@@ -200,6 +200,49 @@ func TestStartupAndShutdown(t *testing.T) {
 	}
 }
 
+func TestClientCreationDuringShutdown(t *testing.T) {
+	for _, create := range []struct {
+		name string
+		fn   func(*Server, net.Conn) *client
+	}{
+		{"nats", func(s *Server, conn net.Conn) *client { return s.createClient(conn) }},
+		{"websocket", func(s *Server, conn net.Conn) *client { return s.createWSClient(conn, &websocket{}) }},
+		{"mqtt", func(s *Server, conn net.Conn) *client { return s.createMQTTClient(conn, nil) }},
+	} {
+		for _, mode := range []string{"lame_duck", "shutdown"} {
+			t.Run(create.name+"/"+mode, func(t *testing.T) {
+				s := RunServer(DefaultOptions())
+				defer s.Shutdown()
+				if mode == "lame_duck" {
+					_, ok := s.enterLameDuckMode()
+					require_True(t, ok)
+				} else {
+					s.Shutdown()
+				}
+
+				conn, peer := net.Pipe()
+				defer conn.Close()
+				defer peer.Close()
+				closed := make(chan struct{})
+				go func() {
+					io.Copy(io.Discard, peer)
+					close(closed)
+				}()
+				c := create.fn(s, conn)
+				if c != nil {
+					c.closeConnection(ServerShutdown)
+					t.Fatal("accepted a client while draining or shutting down")
+				}
+				select {
+				case <-closed:
+				case <-time.After(time.Second):
+					t.Fatal("rejected connection is still open")
+				}
+			})
+		}
+	}
+}
+
 func TestConcurrentShutdown(t *testing.T) {
 	opts := DefaultOptions()
 	opts.DisableShortFirstPing = true
@@ -802,6 +845,74 @@ func TestCustomClientAuthentication(t *testing.T) {
 
 	t.Run("with nonce", func(t *testing.T) { testAuth(t, true) })
 	t.Run("without nonce", func(t *testing.T) { testAuth(t, false) })
+}
+
+type optionalTLSAuth struct {
+	states chan *tls.ConnectionState
+}
+
+func (a *optionalTLSAuth) Check(c ClientAuthentication) bool {
+	a.states <- c.GetTLSConnectionState()
+	return true
+}
+
+func TestCustomClientAuthenticationOptionalTLS(t *testing.T) {
+	cert, err := tls.LoadX509KeyPair("../test/configs/certs/client-cert.pem", "../test/configs/certs/client-key.pem")
+	require_NoError(t, err)
+
+	for _, withCert := range []bool{true, false} {
+		t.Run(fmt.Sprintf("%v", withCert), func(t *testing.T) {
+			conf := createConfFile(t, []byte(`
+				listen: "127.0.0.1:-1"
+				tls {
+					cert_file: "../test/configs/certs/server-cert.pem"
+					key_file: "../test/configs/certs/server-key.pem"
+					ca_file: "../test/configs/certs/ca.pem"
+					verify: optional
+				}
+			`))
+
+			opts, err := ProcessConfigFile(conf)
+			require_NoError(t, err)
+
+			opts.NoLog, opts.NoSigs = true, true
+			auth := &optionalTLSAuth{states: make(chan *tls.ConnectionState, 1)}
+			opts.CustomClientAuthentication = auth
+
+			s := RunServer(opts)
+			defer s.Shutdown()
+
+			clientTLS := &tls.Config{}
+			if withCert {
+				clientTLS.Certificates = []tls.Certificate{cert}
+			}
+
+			nc, err := nats.Connect(
+				s.ClientURL(),
+				nats.Secure(clientTLS),
+				nats.RootCAs("../test/configs/certs/ca.pem"),
+				nats.NoReconnect(),
+			)
+			require_NoError(t, err)
+			defer nc.Close()
+
+			state := require_ChanRead(t, auth.states, time.Second)
+			require_NotNil(t, state)
+			require_True(t, state.HandshakeComplete)
+			require_NotEqual(t, state.Version, 0)
+			require_NotEqual(t, state.CipherSuite, 0)
+			if withCert {
+				require_True(t, len(state.PeerCertificates) > 0)
+				require_True(t, len(state.VerifiedChains) > 0)
+				require_True(t, len(state.VerifiedChains[0]) > 0)
+				require_True(t, bytes.Equal(state.PeerCertificates[0].Raw, cert.Certificate[0]))
+				require_True(t, bytes.Equal(state.VerifiedChains[0][0].Raw, cert.Certificate[0]))
+			} else {
+				require_Equal(t, len(state.PeerCertificates), 0)
+				require_Equal(t, len(state.VerifiedChains), 0)
+			}
+		})
+	}
 }
 
 func TestCustomRouterAuthentication(t *testing.T) {

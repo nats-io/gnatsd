@@ -86,7 +86,17 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 	ukp, _ := nkeys.CreateUser()
 	pub, _ := ukp.PublicKey()
 
+	// Shutdown() stops eventing before it closes the listeners, so a client can
+	// get here after the system account is gone.
+	s.mu.RLock()
+	if s.sys == nil {
+		s.mu.RUnlock()
+		errStr = "Authorization callout not available, eventing shut down"
+		s.Debugf(errStr)
+		return false, errStr
+	}
 	reply := s.newRespInbox()
+	s.mu.RUnlock()
 	respCh := make(chan string, 1)
 
 	decodeResponse := func(rc *client, rmsg []byte, acc *Account) (*jwt.UserClaims, error) {
@@ -326,16 +336,20 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 			return
 		}
 
+		c.mu.Lock()
+		c.flags.set(authCallout)
 		// See if the response wants to override the username.
 		if arc.Name != _EMPTY_ {
-			c.mu.Lock()
 			c.opts.Username = arc.Name
 			// Clear any others.
 			c.opts.Nkey = _EMPTY_
 			c.pubKey = _EMPTY_
 			c.opts.Token = _EMPTY_
-			c.mu.Unlock()
 		}
+		// Carry the user's tags and name onto the client, as with regular JWT auth.
+		c.tags = arc.Tags
+		c.nameTag = arc.Name
+		c.mu.Unlock()
 
 		// Check if we need to set an auth timer if the user jwt expires.
 		c.setExpiration(arc.Claims(), expiration)

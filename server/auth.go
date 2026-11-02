@@ -676,6 +676,12 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 		return false
 	}
 
+	// Clear any previous callout authorization. processClientOrLeafCallout
+	// sets this flag only after successfully authorizing the client.
+	c.mu.Lock()
+	c.flags.clear(authCallout)
+	c.mu.Unlock()
+
 	// Indicate if this connection came from a trusted proxy. Note that if
 	// trustedProxy could be false even if the connection is proxied, but it
 	// means that there was no trusted proxy configured.

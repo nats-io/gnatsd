@@ -2609,6 +2609,35 @@ func (s *Server) Shutdown() {
 	// that pending pull requests are invalid.
 	s.signalPullConsumers()
 
+	s.mu.Lock()
+	clients := make([]*client, 0, len(s.clients))
+	for _, c := range s.clients {
+		clients = append(clients, c)
+	}
+	s.mu.Unlock()
+
+	// Client cleanup can publish MQTT Wills, so keep JetStream, eventing,
+	// and inter-server connections available until it has finished.
+	for _, c := range clients {
+		c.closeConnection(ServerShutdown)
+	}
+	if opts := s.getOpts(); opts.MQTT.Port != 0 {
+		timeout := opts.MQTT.JSAPITimeout
+		if timeout == 0 {
+			timeout = mqttDefaultJSAPITimeout
+		}
+		done := make(chan struct{})
+		go func() {
+			s.mqtt.readLoopWG.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(timeout):
+			s.Warnf("Timed out waiting for MQTT clients to close")
+		}
+	}
+
 	// Transfer off any raft nodes that we are a leader by stepping them down.
 	s.stepdownRaftNodes()
 
@@ -3384,14 +3413,16 @@ func (s *Server) createClientEx(conn net.Conn, inProcess bool) *client {
 	// list of connections to close. It won't contain this one, so we need
 	// to bail out now otherwise the readLoop started down there would not
 	// be interrupted. Skip also if in lame duck mode.
-	if !s.isRunning() || s.ldm {
+	if !s.isRunning() || s.isShuttingDown() || s.ldm {
 		// There are some tests that create a server but don't start it,
 		// and use "async" clients and perform the parsing manually. Such
 		// clients would branch here (since server is not running). However,
-		// when a server was really running and has been shutdown, we must
+		// when a server is shutting down or in lame duck mode, we must
 		// close this connection.
-		if s.isShuttingDown() {
-			conn.Close()
+		if s.isShuttingDown() || s.ldm {
+			s.mu.Unlock()
+			c.closeConnection(ServerShutdown)
+			return nil
 		}
 		s.mu.Unlock()
 		return c
@@ -4458,11 +4489,26 @@ func (s *Server) LameDuckShutdown() {
 // at some interval to avoid a reconnect storm.
 // We will also transfer any raft leaders and shutdown JetStream.
 func (s *Server) lameDuckMode() {
+	if expected, ok := s.enterLameDuckMode(); ok {
+		s.runLameDuckMode(expected)
+	}
+}
+
+// startLameDuckMode enters lame duck mode before returning, and runs the rest of it in a goroutine.
+func (s *Server) startLameDuckMode() {
+	if expected, ok := s.enterLameDuckMode(); ok {
+		go s.runLameDuckMode(expected)
+	}
+}
+
+// enterLameDuckMode sets lame duck mode and closes the listeners.
+// Returns false if lame duck mode was not entered.
+func (s *Server) enterLameDuckMode() (int, bool) {
 	s.mu.Lock()
 	// Check if there is actually anything to do
 	if s.isShuttingDown() || s.ldm || s.listener == nil {
 		s.mu.Unlock()
-		return
+		return 0, false
 	}
 	s.Noticef("Entering lame duck mode, stop accepting new clients")
 	s.ldm = true
@@ -4471,12 +4517,23 @@ func (s *Server) lameDuckMode() {
 	s.listener.Close()
 	s.listener = nil
 	expected += s.closeWebsocketServer()
+	if s.mqtt.listener != nil {
+		expected++
+		s.mqtt.listener.Close()
+		s.mqtt.listener = nil
+	}
 	if s.leafNodeListener != nil {
 		expected++
 		s.leafNodeListener.Close()
 		s.leafNodeListener = nil
 	}
 	s.ldmCh = make(chan bool, expected)
+	s.mu.Unlock()
+	return expected, true
+}
+
+// runLameDuckMode transfers leaders and drains clients before shutting down.
+func (s *Server) runLameDuckMode(expected int) {
 	opts := s.getOpts()
 	gp := opts.LameDuckGracePeriod
 	// For tests, we want the grace period to be in some cases bigger
@@ -4485,7 +4542,6 @@ func (s *Server) lameDuckMode() {
 	if gp < 0 {
 		gp *= -1
 	}
-	s.mu.Unlock()
 
 	// If we are running any raftNodes transfer leaders.
 	if hadTransfers := s.transferRaftLeaders(); hadTransfers {
@@ -4497,15 +4553,9 @@ func (s *Server) lameDuckMode() {
 		}
 	}
 
-	// Now check and shutdown jetstream.
-	s.shutdownJetStream()
-
-	// Now shutdown the nodes
-	s.shutdownRaftNodes()
-
 	// Wait for accept loops to be done to make sure that no new
 	// client can connect
-	for i := 0; i < expected; i++ {
+	for range expected {
 		<-s.ldmCh
 	}
 
@@ -4576,10 +4626,7 @@ func (s *Server) lameDuckMode() {
 		}
 		if batch == 1 || i%batch == 0 {
 			// We pick a random interval which will be at least si/2
-			v := rand.Int64N(si)
-			if v < si/2 {
-				v = si / 2
-			}
+			v := max(rand.Int64N(si), si/2)
 			t.Reset(time.Duration(v))
 			// Sleep for given interval or bail out if kicked by Shutdown().
 			select {
