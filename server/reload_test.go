@@ -8139,10 +8139,7 @@ func TestConfigReloadCheck(t *testing.T) {
 			newOpts, err := ProcessConfigFile(newConf)
 			require_NoError(t, err)
 
-			// The current options are prepared like on server startup.
-			setBaselineOptions(curOpts)
-			require_NoError(t, validateOptions(curOpts))
-			err = checkReload(curOpts, newOpts)
+			err = CheckReload(curOpts, newOpts)
 			require_Equal(t, verdict(err), test.verdict)
 			for _, s := range test.contains {
 				require_Contains(t, err.Error(), s)
@@ -8152,6 +8149,14 @@ func TestConfigReloadCheck(t *testing.T) {
 			s, _ := RunServerWithConfig(curConf)
 			defer s.Shutdown()
 			changeCurrentConfigContentWithNewContent(t, curConf, []byte(test.new))
+
+			// Checking on the running server must not apply the options.
+			opts := s.getOpts()
+			newOpts, err = ProcessConfigFile(curConf)
+			require_NoError(t, err)
+			require_Equal(t, verdict(s.CheckReloadOptions(newOpts)), test.verdict)
+			require_Equal(t, s.getOpts(), opts)
+
 			require_Equal(t, verdict(s.Reload()), test.verdict)
 		})
 	}
