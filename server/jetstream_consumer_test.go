@@ -8630,6 +8630,49 @@ func TestJetStreamConsumerPauseResumeViaEndpoint(t *testing.T) {
 	require_False(t, getConsumerInfo().Paused)
 }
 
+func TestJetStreamConsumerPauseResumeDelivers(t *testing.T) {
+	for _, push := range []bool{false, true} {
+		t.Run(map[bool]string{false: "pull", true: "push"}[push], func(t *testing.T) {
+			s := RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+
+			nc, js := jsClientConnect(t, s)
+			defer nc.Close()
+
+			_, err := js.AddStream(&nats.StreamConfig{
+				Name:     "TEST",
+				Subjects: []string{"foo"},
+			})
+			require_NoError(t, err)
+			_, err = js.Publish("foo", nil)
+			require_NoError(t, err)
+
+			sub, err := nc.SubscribeSync(nats.NewInbox())
+			require_NoError(t, err)
+			deadline := time.Now().Add(time.Hour)
+			cc := ConsumerConfig{Name: "CONSUMER", AckPolicy: AckExplicit, PauseUntil: &deadline}
+			if push {
+				cc.DeliverSubject = sub.Subject
+			}
+			jsTestPause_CreateOrUpdateConsumer(t, nc, ActionCreate, "TEST", cc)
+			if !push {
+				req, err := json.Marshal(&JSApiConsumerGetNextRequest{Batch: 1, Expires: 10 * time.Second})
+				require_NoError(t, err)
+				require_NoError(t, nc.PublishRequest(fmt.Sprintf(JSApiRequestNextT, "TEST", "CONSUMER"), sub.Subject, req))
+			}
+			_, err = sub.NextMsg(250 * time.Millisecond)
+			require_Error(t, err, nats.ErrTimeout)
+
+			// Nothing is published after the resume, so only the resume
+			// itself can get the pending message delivered.
+			jsTestPause_PauseConsumer(t, nc, "TEST", "CONSUMER", time.Time{})
+			msg, err := sub.NextMsg(2 * time.Second)
+			require_NoError(t, err)
+			require_Equal(t, msg.Header.Get("Status"), "")
+		})
+	}
+}
+
 func TestJetStreamConsumerPauseMetadataRace(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
