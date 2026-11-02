@@ -6527,9 +6527,6 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 			}
 			// If we get here we only have warnings and can still continue
 			fmt.Fprint(os.Stderr, err)
-		} else if opts.CheckConfig {
-			// Report configuration file syntax test was successful and exit.
-			return opts, nil
 		}
 
 		// Call this again to override config file options with options from command line.
@@ -6606,6 +6603,15 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 	// have a routes override, we need to report misconfiguration.
 	if opts.RoutesStr != _EMPTY_ && opts.Cluster.ListenStr == _EMPTY_ && opts.Cluster.Host == _EMPTY_ && opts.Cluster.Port == 0 {
 		return nil, errors.New("solicited routes require cluster capabilities, e.g. --cluster")
+	}
+
+	// Validate the same way server startup does, on a copy to not change the options.
+	if opts.CheckConfig {
+		copts := opts.Clone()
+		setBaselineOptions(copts)
+		if err = validateOptions(copts); err != nil {
+			return nil, err
+		}
 	}
 
 	return opts, nil
