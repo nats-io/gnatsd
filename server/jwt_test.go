@@ -8560,6 +8560,9 @@ func TestReloadMaxPayloadAccountLimitsAndAsyncInfo(t *testing.T) {
 	oldMpayB := atomic.LoadInt32(&cB.client.mpay)
 
 	// Reload max_payload to 2048
+	newOpts := *s.getOpts()
+	newOpts.MaxPayload = 2048
+	s.setOpts(&newOpts)
 	mopt := &maxPayloadOption{newValue: 2048}
 	mopt.Apply(s)
 
@@ -8589,6 +8592,9 @@ func TestReloadMaxPayloadAccountLimitsAndAsyncInfo(t *testing.T) {
 	}
 
 	// Now reload max_payload to 250 (lower than Client A's account limit of 500)
+	newOpts2 := *s.getOpts()
+	newOpts2.MaxPayload = 250
+	s.setOpts(&newOpts2)
 	mopt2 := &maxPayloadOption{newValue: 250}
 	mopt2.Apply(s)
 
