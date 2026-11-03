@@ -1648,34 +1648,7 @@ func TestLeafNodeInfoOnConnectWithoutLeafNodeURLsAccepted(t *testing.T) {
 	require_Equal(t, "hub", c.leaf.remoteServer)
 }
 
-// TestLeafNodeAcceptSideClosedDuringConnectNotLeaked is a regression test for
-// https://github.com/nats-io/nats-server/issues/8827.
-//
-// On the accepting (hub) side, processLeafNodeConnect() registers the leaf
-// node connection with addLeafNodeConnection() but, unlike the soliciting
-// side's leafNodeFinishConnectProcess(), it used to never check afterward
-// whether the connection had already closed concurrently (for instance, due
-// to the leaf auth timer firing while the CONNECT was being processed). Since
-// closeConnection() is a no-op on a connection it has already closed (it
-// cannot find anything to remove from s.leafs before it has been added),
-// such a connection would be added to s.leafs and never removed, inflating
-// NumLeafNodes()/Leafz forever.
-//
-// It is also possible for the race to land inside registerWithAccount()
-// (called earlier during authentication): c.acc is set and then, after the
-// lock is released but before acc.addClient() runs, closeConnection() fires
-// and finds nothing to remove from the account either; acc.addClient() then
-// still inserts the already-closed leaf into the account. So besides
-// s.leafs, the account-level bookkeeping (acc.clients / nleafs, and the
-// server's active accounts count) must be cleaned up too, mirroring
-// leafNodeFinishConnectProcess()'s acc.removeClient()/decActiveAccounts()
-// calls.
-//
-// This directly drives processLeafNodeConnect() with a client already marked
-// as closed, which deterministically reproduces the race window without
-// relying on timing. The client is also registered with the account via
-// acc.addClient() beforehand, to simulate that registerWithAccount() had
-// already inserted it into the account before the close was observed.
+// https://github.com/nats-io/nats-server/issues/8827
 func TestLeafNodeAcceptSideClosedDuringConnectNotLeaked(t *testing.T) {
 	s := RunServer(DefaultOptions())
 	defer s.Shutdown()
@@ -1699,9 +1672,7 @@ func TestLeafNodeAcceptSideClosedDuringConnectNotLeaked(t *testing.T) {
 	// account (acc.addClient()) before the close was detected, as would
 	// happen on the accept side during authentication.
 	acc.addClient(c)
-	if n := acc.NumLeafNodes(); n != 1 {
-		t.Fatalf("expected account to report 1 leaf node after addClient, got %d", n)
-	}
+	require_Equal(t, acc.NumLeafNodes(), 1)
 
 	// Simulate the connection having been closed concurrently with the
 	// CONNECT processing, before addLeafNodeConnection() runs (e.g. the
@@ -1711,17 +1682,10 @@ func TestLeafNodeAcceptSideClosedDuringConnectNotLeaked(t *testing.T) {
 	c.flags.set(closeConnection)
 	c.mu.Unlock()
 
-	if err := c.processLeafNodeConnect(s, []byte("{}"), _EMPTY_); err != nil {
-		t.Fatalf("processLeafNodeConnect returned error: %v", err)
-	}
+	require_NoError(t, c.processLeafNodeConnect(s, []byte("{}"), _EMPTY_))
 
-	if n := s.NumLeafNodes(); n != 0 {
-		t.Fatalf("expected an already-closed leaf connection to not be left registered, "+
-			"but NumLeafNodes()=%d", n)
-	}
-	if n := acc.NumLeafNodes(); n != 0 {
-		t.Fatalf("expected account-level leaf node count to be back to 0, but NumLeafNodes()=%d", n)
-	}
+	require_Equal(t, s.NumLeafNodes(), 0)
+	require_Equal(t, acc.NumLeafNodes(), 0)
 }
 
 func TestLeafNodePubAllowedPruning(t *testing.T) {
