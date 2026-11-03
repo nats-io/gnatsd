@@ -9765,10 +9765,21 @@ func (s *Server) jsClusteredMsgDeleteRequest(ci *ClientInfo, acc *Account, mset 
 	s.sendAPIResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(resp))
 }
 
+// proposalConfigJSON returns the stream config to include in a proposal.
+// The config of an unsupported stream may only be partially decoded.
+// Its original JSON is kept instead.
+func (sa *streamAssignment) proposalConfigJSON() json.RawMessage {
+	if sa.unsupported != nil {
+		return sa.ConfigJSON
+	}
+	cfg, _ := json.Marshal(sa.Config)
+	return cfg
+}
+
 func encodeAddStreamAssignment(sa *streamAssignment) []byte {
 	csa := sa.clone()
 	csa.Client = csa.Client.forProposal()
-	csa.ConfigJSON, _ = json.Marshal(sa.Config)
+	csa.ConfigJSON = sa.proposalConfigJSON()
 	var bb bytes.Buffer
 	bb.WriteByte(byte(assignStreamOp))
 	json.NewEncoder(&bb).Encode(csa)
@@ -9778,7 +9789,7 @@ func encodeAddStreamAssignment(sa *streamAssignment) []byte {
 func encodeUpdateStreamAssignment(sa *streamAssignment) []byte {
 	csa := sa.clone()
 	csa.Client = csa.Client.forProposal()
-	csa.ConfigJSON, _ = json.Marshal(sa.Config)
+	csa.ConfigJSON = sa.proposalConfigJSON()
 	var bb bytes.Buffer
 	bb.WriteByte(byte(updateStreamOp))
 	json.NewEncoder(&bb).Encode(csa)
@@ -9788,7 +9799,7 @@ func encodeUpdateStreamAssignment(sa *streamAssignment) []byte {
 func encodeDeleteStreamAssignment(sa *streamAssignment) []byte {
 	csa := sa.clone()
 	csa.Client = csa.Client.forProposal()
-	csa.ConfigJSON, _ = json.Marshal(sa.Config)
+	csa.ConfigJSON = sa.proposalConfigJSON()
 	var bb bytes.Buffer
 	bb.WriteByte(byte(removeStreamOp))
 	json.NewEncoder(&bb).Encode(csa)
@@ -10275,10 +10286,21 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 	cc.trackInflightConsumerProposal(acc.Name, stream, ca, false)
 }
 
+// proposalConfigJSON returns the consumer config to include in a proposal.
+// The config of an unsupported consumer may only be partially decoded.
+// Its original JSON is kept instead.
+func (ca *consumerAssignment) proposalConfigJSON() json.RawMessage {
+	if ca.unsupported != nil {
+		return ca.ConfigJSON
+	}
+	cfg, _ := json.Marshal(ca.Config)
+	return cfg
+}
+
 func encodeAddConsumerAssignment(ca *consumerAssignment) []byte {
 	cca := ca.clone()
 	cca.Client = cca.Client.forProposal()
-	cca.ConfigJSON, _ = json.Marshal(ca.Config)
+	cca.ConfigJSON = ca.proposalConfigJSON()
 	var bb bytes.Buffer
 	bb.WriteByte(byte(assignConsumerOp))
 	json.NewEncoder(&bb).Encode(cca)
@@ -10288,7 +10310,7 @@ func encodeAddConsumerAssignment(ca *consumerAssignment) []byte {
 func encodeDeleteConsumerAssignment(ca *consumerAssignment) []byte {
 	cca := ca.clone()
 	cca.Client = cca.Client.forProposal()
-	cca.ConfigJSON, _ = json.Marshal(ca.Config)
+	cca.ConfigJSON = ca.proposalConfigJSON()
 	var bb bytes.Buffer
 	bb.WriteByte(byte(removeConsumerOp))
 	json.NewEncoder(&bb).Encode(cca)
@@ -10321,7 +10343,7 @@ func decodeConsumerAssignmentConfig(ca *consumerAssignment) error {
 func encodeAddConsumerAssignmentCompressed(ca *consumerAssignment) []byte {
 	cca := ca.clone()
 	cca.Client = cca.Client.forProposal()
-	cca.ConfigJSON, _ = json.Marshal(ca.Config)
+	cca.ConfigJSON = ca.proposalConfigJSON()
 	var bb bytes.Buffer
 	bb.WriteByte(byte(assignCompressedConsumerOp))
 	s2e := s2.NewWriter(&bb)
