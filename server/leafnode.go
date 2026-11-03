@@ -2504,13 +2504,21 @@ func (c *client) processLeafNodeConnect(s *Server, arg []byte, lang string) erro
 	// addLeafNodeConnection() call above (for instance, the leaf auth timer
 	// firing while this was being processed). In that case, closeConnection()
 	// ran before the connection was added to s.leafs, so it found nothing to
-	// remove there. Check again here and clean up if needed, mirroring what
+	// remove there. It may also have run in the window inside
+	// registerWithAccount() (called earlier during authentication) after
+	// c.acc was set but before acc.addClient() registered the client, in
+	// which case the account-level cleanup there found nothing to remove
+	// either, and the leaf was still inserted into the account afterwards.
+	// Check again here and clean up if needed, mirroring what
 	// leafNodeFinishConnectProcess() does for the soliciting side.
 	c.mu.Lock()
 	closed := c.isClosed()
 	c.mu.Unlock()
 	if closed {
 		s.removeLeafNodeConnection(c)
+		if prev := acc.removeClient(c); prev == 1 {
+			s.decActiveAccounts()
+		}
 		return nil
 	}
 
