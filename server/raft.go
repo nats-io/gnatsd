@@ -4967,7 +4967,8 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 	// This encourages the leader to sync us via a snapshot instead. We use max(applied, papplied) to avoid
 	// incorrectly triggering this pause immediately after receiving a snapshot.
 	applied := max(n.applied, n.papplied)
-	commit := max(n.commit, n.papplied)
+	// Commits held while applies are paused count too, they're replayed all at once on resume.
+	commit := max(n.commit, n.hcommit, n.papplied)
 	if sub != nil && (commit > applied || n.quorumPaused) {
 		diff := commit - applied
 		if n.quorumPaused {
