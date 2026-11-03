@@ -1661,9 +1661,21 @@ func TestLeafNodeInfoOnConnectWithoutLeafNodeURLsAccepted(t *testing.T) {
 // such a connection would be added to s.leafs and never removed, inflating
 // NumLeafNodes()/Leafz forever.
 //
+// It is also possible for the race to land inside registerWithAccount()
+// (called earlier during authentication): c.acc is set and then, after the
+// lock is released but before acc.addClient() runs, closeConnection() fires
+// and finds nothing to remove from the account either; acc.addClient() then
+// still inserts the already-closed leaf into the account. So besides
+// s.leafs, the account-level bookkeeping (acc.clients / nleafs, and the
+// server's active accounts count) must be cleaned up too, mirroring
+// leafNodeFinishConnectProcess()'s acc.removeClient()/decActiveAccounts()
+// calls.
+//
 // This directly drives processLeafNodeConnect() with a client already marked
 // as closed, which deterministically reproduces the race window without
-// relying on timing.
+// relying on timing. The client is also registered with the account via
+// acc.addClient() beforehand, to simulate that registerWithAccount() had
+// already inserted it into the account before the close was observed.
 func TestLeafNodeAcceptSideClosedDuringConnectNotLeaked(t *testing.T) {
 	s := RunServer(DefaultOptions())
 	defer s.Shutdown()
@@ -1672,14 +1684,24 @@ func TestLeafNodeAcceptSideClosedDuringConnectNotLeaked(t *testing.T) {
 	defer clientConn.Close()
 	defer serverConn.Close()
 
+	acc := s.GlobalAccount()
+
 	c := &client{
 		kind: LEAF,
 		srv:  s,
 		nc:   serverConn,
-		acc:  s.GlobalAccount(),
+		acc:  acc,
 		leaf: &leaf{},
 	}
 	c.cid = 123456789
+
+	// Simulate that registerWithAccount() already added this client to the
+	// account (acc.addClient()) before the close was detected, as would
+	// happen on the accept side during authentication.
+	acc.addClient(c)
+	if n := acc.NumLeafNodes(); n != 1 {
+		t.Fatalf("expected account to report 1 leaf node after addClient, got %d", n)
+	}
 
 	// Simulate the connection having been closed concurrently with the
 	// CONNECT processing, before addLeafNodeConnection() runs (e.g. the
@@ -1696,6 +1718,9 @@ func TestLeafNodeAcceptSideClosedDuringConnectNotLeaked(t *testing.T) {
 	if n := s.NumLeafNodes(); n != 0 {
 		t.Fatalf("expected an already-closed leaf connection to not be left registered, "+
 			"but NumLeafNodes()=%d", n)
+	}
+	if n := acc.NumLeafNodes(); n != 0 {
+		t.Fatalf("expected account-level leaf node count to be back to 0, but NumLeafNodes()=%d", n)
 	}
 }
 
