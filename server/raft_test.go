@@ -8257,6 +8257,43 @@ func TestNRGPausingQuorumCancelsCatchup(t *testing.T) {
 	t.Run("AlreadyPaused", func(t *testing.T) { test(t, true) })
 }
 
+func TestNRGPausedFollowerOverrunPausesQuorum(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	esm := encodeStreamMsgAllowCompress("foo", _EMPTY_, nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	// Applies are paused, like during a stream catchup.
+	require_NoError(t, n.PauseApply())
+
+	// The leader keeps replicating and committing well past the threshold.
+	total := uint64(pauseQuorumThreshold + 10_000)
+	for index := uint64(1); index <= total; index++ {
+		ae := encode(t, &appendEntry{leader: nats0, term: 1, commit: index - 1, pterm: 1, pindex: index - 1, entries: entries})
+		if index == 1 {
+			ae.pterm = 0
+		}
+		n.processAppendEntry(ae, n.aesub)
+	}
+
+	n.RLock()
+	pindex, commit, quorumPaused := n.pindex, n.commit, n.quorumPaused
+	n.RUnlock()
+
+	// Resuming replays the held commits onto the apply queue in one go.
+	n.ResumeApply()
+	queued := n.apply.len()
+
+	// The held commits must stop the follower from storing more.
+	// The check sees the previous entry's commit, which itself lags by one.
+	require_Equal(t, commit, 0)
+	require_True(t, quorumPaused)
+	require_Equal(t, pindex, pauseQuorumThreshold+2)
+	require_Equal(t, queued, pauseQuorumThreshold+1)
+}
+
 func TestNRGApplyCommitDoesNotResetWALAtSnapshotBoundary(t *testing.T) {
 	n, cleanup := initSingleMemRaftNode(t)
 	defer cleanup()
