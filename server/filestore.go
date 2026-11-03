@@ -561,15 +561,14 @@ func newFileStoreWithCreatedAndMode(fcfg FileStoreConfig, cfg StreamConfig, crea
 	// Use defer to ensure the lock is released if any of the enforcement operations
 	// run into issues to avoid potential deadlocks on exit.
 	unlocked := false
-	defer func() {
+	defer func(fs *fileStore) {
 		if !unlocked {
 			fs.mu.Unlock()
 		}
-	}()
+	}(fs)
 
 	// Recover per-message state like TTLs and schedules.
 	if err = fs.recoverPerMessageState(); err != nil {
-		fs.mu.Unlock()
 		return nil, err
 	}
 
