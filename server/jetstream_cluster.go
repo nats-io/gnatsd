@@ -8602,6 +8602,12 @@ func (s *Server) jsClusteredStreamRequest(ci *ClientInfo, acc *Account, subject,
 
 	// Capture if we have existing/inflight assignment first.
 	if osa := js.streamAssignmentOrInflight(acc.Name, cfg.Name); osa != nil {
+		// The config of an unsupported stream may only be partially decoded.
+		if osa.unsupported != nil {
+			resp.Error = NewJSStreamOfflineReasonError(errors.New(osa.unsupported.reason))
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
+			return
+		}
 		copyStreamMetadata(cfg, osa.Config)
 		// Set the index name on both to ensure the DeepEqual works
 		matchSourceIndexNames(cfg, osa.Config)
@@ -8740,6 +8746,13 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 	osa := js.streamAssignmentOrInflight(acc.Name, cfg.Name)
 	if osa == nil {
 		resp.Error = NewJSStreamNotFoundError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
+		return
+	}
+
+	// The config of an unsupported stream may only be partially decoded.
+	if osa.unsupported != nil {
+		resp.Error = NewJSStreamOfflineReasonError(errors.New(osa.unsupported.reason))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
 		return
 	}
@@ -9935,6 +9948,13 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 		return
 	}
 
+	// The config of an unsupported stream may only be partially decoded.
+	if sa.unsupported != nil {
+		resp.Error = NewJSStreamOfflineReasonError(errors.New(sa.unsupported.reason))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+
 	// Was a consumer name provided?
 	var oname string
 	if isDurableConsumer(cfg) || cfg.Name != _EMPTY_ {
@@ -10012,6 +10032,12 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 	// if name was set by the user.
 	if oname != _EMPTY_ {
 		if ca = js.consumerAssignmentOrInflight(acc.Name, stream, oname); ca != nil {
+			// The config of an unsupported consumer may only be partially decoded.
+			if ca.unsupported != nil {
+				resp.Error = NewJSConsumerOfflineReasonError(errors.New(ca.unsupported.reason))
+				s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+				return
+			}
 			// Provided config might miss metadata, copy from existing config.
 			copyConsumerMetadata(cfg, ca.Config)
 

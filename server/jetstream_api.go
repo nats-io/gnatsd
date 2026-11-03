@@ -2406,6 +2406,12 @@ func (s *Server) jsStreamRemovePeerRequest(sub *subscription, c *client, _ *Acco
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
+	// Reject operations on an unsupported stream.
+	if sa.unsupported != nil {
+		resp.Error = NewJSStreamOfflineReasonError(errors.New(sa.unsupported.reason))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
 
 	js.mu.RLock()
 	rg := sa.Group
@@ -2647,6 +2653,12 @@ func (s *Server) jsLeaderServerStreamMoveRequest(sub *subscription, c *client, _
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
+	// The config of an unsupported stream may only be partially decoded.
+	if osa.unsupported != nil {
+		resp.Error = NewJSStreamOfflineReasonError(errors.New(osa.unsupported.reason))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
 
 	// if server was picked, make sure src peer exists and move it to first position.
 	// removal will drop peers from the left
@@ -2791,6 +2803,12 @@ func (s *Server) jsLeaderServerStreamCancelMoveRequest(sub *subscription, c *cli
 
 	if !streamFound {
 		resp.Error = NewJSStreamNotFoundError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	// Reject operations on an unsupported stream.
+	if osa.unsupported != nil {
+		resp.Error = NewJSStreamOfflineReasonError(errors.New(osa.unsupported.reason))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
