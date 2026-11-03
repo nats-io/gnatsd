@@ -23904,6 +23904,42 @@ func TestJetStreamOfflineStreamAndConsumerAfterDowngrade(t *testing.T) {
 	require_Equal(t, cl.Offline["DowngradeConsumerTest"], offlineReason)
 }
 
+func TestJetStreamOfflineConsumerWithUnknownEnumAfterDowngrade(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+	port := s.getOpts().Port
+	sd := s.JetStreamConfig().StoreDir
+
+	mset, err := s.globalAccount().addStream(&StreamConfig{Name: "TEST", Storage: FileStorage})
+	require_NoError(t, err)
+	_, err = mset.addConsumer(&ConsumerConfig{
+		Durable:   "CONSUMER",
+		AckPolicy: AckExplicit,
+		Metadata:  map[string]string{"_nats.req.level": strconv.Itoa(math.MaxInt)},
+	})
+	require_NoError(t, err)
+	s.Shutdown()
+
+	metafile := filepath.Join(sd, globalAccountName, streamsDir, "TEST", consumerDir, "CONSUMER", JetStreamMetaFile)
+	buf, err := os.ReadFile(metafile)
+	require_NoError(t, err)
+	nbuf := bytes.Replace(buf, []byte(`"ack_policy":"explicit"`), []byte(`"ack_policy":"unknown"`), 1)
+	require_False(t, bytes.Equal(buf, nbuf))
+	require_NoError(t, os.WriteFile(metafile, nbuf, defaultFilePerms))
+
+	s = RunJetStreamServerOnPort(port, sd)
+	defer s.Shutdown()
+
+	mset, err = s.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	require_True(t, mset.closed.Load())
+	obs := mset.getPublicConsumers()
+	require_Len(t, len(obs), 1)
+	require_True(t, obs[0].isClosed())
+	require_Equal(t, obs[0].name, "CONSUMER")
+	require_Equal(t, obs[0].offlineReason, `unsupported - config error: invalid value "unknown" for field "ack_policy"`)
+}
+
 func TestJetStreamPersistModeAsync(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
