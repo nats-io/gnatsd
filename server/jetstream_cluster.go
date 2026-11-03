@@ -370,7 +370,7 @@ type unsupportedStreamAssignment struct {
 func newUnsupportedStreamAssignment(s *Server, sa *streamAssignment, err error) *unsupportedStreamAssignment {
 	reason := "stopped"
 	if err != nil {
-		if errstr := err.Error(); strings.HasPrefix(errstr, "json:") {
+		if errstr := err.Error(); strings.HasPrefix(errstr, "json:") || errors.Is(err, errInvalidConfigValue) {
 			reason = fmt.Sprintf("unsupported - config error: %s", strings.TrimPrefix(err.Error(), "json: "))
 		} else {
 			reason = fmt.Sprintf("stopped - %s", errstr)
@@ -506,7 +506,7 @@ type unsupportedConsumerAssignment struct {
 func newUnsupportedConsumerAssignment(ca *consumerAssignment, err error) *unsupportedConsumerAssignment {
 	reason := "stopped"
 	if err != nil {
-		if errstr := err.Error(); strings.HasPrefix(errstr, "json:") {
+		if errstr := err.Error(); strings.HasPrefix(errstr, "json:") || errors.Is(err, errInvalidConfigValue) {
 			reason = fmt.Sprintf("unsupported - config error: %s", strings.TrimPrefix(err.Error(), "json: "))
 		} else {
 			reason = fmt.Sprintf("stopped - %s", errstr)
@@ -9794,23 +9794,16 @@ func decodeStreamAssignment(s *Server, buf []byte) (*streamAssignment, error) {
 }
 
 func decodeStreamAssignmentConfig(s *Server, sa *streamAssignment) error {
-	var unsupported bool
-	var cfg StreamConfig
-	var err error
-	decoder := json.NewDecoder(bytes.NewReader(sa.ConfigJSON))
-	decoder.DisallowUnknownFields()
-	if err = decoder.Decode(&cfg); err != nil {
-		unsupported = true
-		cfg = StreamConfig{}
-		if err2 := json.Unmarshal(sa.ConfigJSON, &cfg); err2 != nil {
-			return err2
-		}
+	cfg, strictErr, err := decodeConfig[StreamConfig](sa.ConfigJSON)
+	if err != nil {
+		return err
 	}
 	sa.Config = &cfg
 	fixCfgMirrorWithDedupWindow(sa.Config)
+	fixCfgUnsetStorage(sa.Config)
 
-	if unsupported || (sa.Config != nil && !supportsRequiredApiLevel(sa.Config.Metadata)) {
-		sa.unsupported = newUnsupportedStreamAssignment(s, sa, err)
+	if strictErr != nil || !supportsRequiredApiLevel(sa.Config.Metadata) {
+		sa.unsupported = newUnsupportedStreamAssignment(s, sa, strictErr)
 	}
 	return nil
 }
@@ -10288,21 +10281,13 @@ func decodeConsumerAssignment(buf []byte) (*consumerAssignment, error) {
 }
 
 func decodeConsumerAssignmentConfig(ca *consumerAssignment) error {
-	var unsupported bool
-	var cfg ConsumerConfig
-	var err error
-	decoder := json.NewDecoder(bytes.NewReader(ca.ConfigJSON))
-	decoder.DisallowUnknownFields()
-	if err = decoder.Decode(&cfg); err != nil {
-		unsupported = true
-		cfg = ConsumerConfig{}
-		if err2 := json.Unmarshal(ca.ConfigJSON, &cfg); err2 != nil {
-			return err2
-		}
+	cfg, strictErr, err := decodeConfig[ConsumerConfig](ca.ConfigJSON)
+	if err != nil {
+		return err
 	}
 	ca.Config = &cfg
-	if unsupported || (ca.Config != nil && !supportsRequiredApiLevel(ca.Config.Metadata)) {
-		ca.unsupported = newUnsupportedConsumerAssignment(ca, err)
+	if strictErr != nil || !supportsRequiredApiLevel(ca.Config.Metadata) {
+		ca.unsupported = newUnsupportedConsumerAssignment(ca, strictErr)
 	}
 	return nil
 }
