@@ -2558,6 +2558,12 @@ func (s *Server) jsStreamCancelMoveRequest(_ *subscription, c *client, _ *Accoun
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
+	// The config of an unsupported stream may only be partially decoded.
+	if osa.unsupported != nil {
+		resp.Error = NewJSStreamOfflineReasonError(errors.New(osa.unsupported.reason))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
 	// A group that has no desired state or origin has no reconfigure in progress.
 	if osa.desiredOrigin() == nil {
 		resp.Error = NewJSStreamReconfigureNotInProgressError()
@@ -3233,6 +3239,12 @@ func (s *Server) jsLeaderServerStreamMoveRequest(sub *subscription, c *client, _
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
+	// The config of an unsupported stream may only be partially decoded.
+	if osa.unsupported != nil {
+		resp.Error = NewJSStreamOfflineReasonError(errors.New(osa.unsupported.reason))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
 
 	cfg := *osa.Config.clone()
 	currPeers, currCluster := copyStrings(osa.Group.Peers), osa.Group.Cluster
@@ -3386,6 +3398,12 @@ func (s *Server) jsLeaderServerStreamCancelMoveRequest(sub *subscription, c *cli
 	osa := js.streamAssignmentOrInflight(accName, streamName)
 	if osa == nil {
 		resp.Error = NewJSStreamNotFoundError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	// The config of an unsupported stream may only be partially decoded.
+	if osa.unsupported != nil {
+		resp.Error = NewJSStreamOfflineReasonError(errors.New(osa.unsupported.reason))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}

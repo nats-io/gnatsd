@@ -12390,6 +12390,119 @@ func TestJetStreamClusterOfflineR1ConsumerDenyUpdate(t *testing.T) {
 	require_Error(t, err, NewJSConsumerOfflineError())
 }
 
+func TestJetStreamClusterUnsupportedStreamAndConsumerDenyUpdate(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+	ncsys, err := nats.Connect(c.randomServer().ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer ncsys.Close()
+
+	// An unsupported stream, and a supported stream with an unsupported consumer.
+	scfg := &nats.StreamConfig{Name: "UNSUPPORTED", Subjects: []string{"foo"}, Replicas: 3}
+	_, err = js.AddStream(scfg)
+	require_NoError(t, err)
+	_, err = js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"bar"}, Replicas: 3})
+	require_NoError(t, err)
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "CONSUMER", Replicas: 3})
+	require_NoError(t, err)
+	c.waitOnAllCurrent()
+
+	ml := c.leader()
+	sjs := ml.getJetStream()
+	sjs.mu.Lock()
+	meta := sjs.cluster.meta
+	sa := sjs.streamAssignment(globalAccountName, "UNSUPPORTED")
+	sa.Config.Metadata = map[string]string{"_nats.req.level": strconv.Itoa(math.MaxInt)}
+	require_NoError(t, meta.Propose(meta.Term(), encodeUpdateStreamAssignment(sa)))
+	ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+	ca.Config.Metadata = map[string]string{"_nats.req.level": strconv.Itoa(math.MaxInt)}
+	require_NoError(t, meta.Propose(meta.Term(), encodeAddConsumerAssignment(ca)))
+	sjs.mu.Unlock()
+
+	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+		for _, s := range c.servers {
+			js := s.getJetStream()
+			js.mu.RLock()
+			sa := js.streamAssignment(globalAccountName, "UNSUPPORTED")
+			ca := js.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+			unsupported := sa != nil && sa.unsupported != nil && ca != nil && ca.unsupported != nil
+			js.mu.RUnlock()
+			if !unsupported {
+				return fmt.Errorf("%s has not marked the stream and consumer unsupported", s.Name())
+			}
+		}
+		return nil
+	})
+
+	offlineReason := fmt.Sprintf("unsupported - required API level: %d, current API level: %d", math.MaxInt, JSApiLevel)
+	streamErr := NewJSStreamOfflineReasonError(errors.New(offlineReason))
+	// An unsupported consumer also marks its stream unsupported, which is reported first.
+	consumerStreamErr := NewJSStreamOfflineReasonError(errors.New(`stopped - unsupported consumer "CONSUMER"`))
+
+	request := func(t *testing.T, nc *nats.Conn, subject string, data []byte) error {
+		t.Helper()
+		msg, err := nc.Request(subject, data, 2*time.Second)
+		require_NoError(t, err)
+		var resp ApiResponse
+		require_NoError(t, json.Unmarshal(msg.Data, &resp))
+		if resp.Error == nil {
+			return nil
+		}
+		return resp.Error
+	}
+	consumerRequest := func(t *testing.T, stream string, cfg ConsumerConfig, action ConsumerAction) error {
+		t.Helper()
+		req, err := json.Marshal(&CreateConsumerRequest{Stream: stream, Config: cfg, Action: action})
+		require_NoError(t, err)
+		return request(t, nc, fmt.Sprintf(JSApiDurableCreateT, stream, cfg.Durable), req)
+	}
+
+	for _, test := range []struct {
+		name     string
+		req      func(t *testing.T) error
+		expected error
+	}{
+		{"StreamCreate", func(t *testing.T) error {
+			_, err := js.AddStream(scfg)
+			return err
+		}, streamErr},
+		{"StreamUpdate", func(t *testing.T) error {
+			_, err := js.UpdateStream(&nats.StreamConfig{Name: "UNSUPPORTED", Subjects: []string{"foo"}, Replicas: 3, MaxMsgs: 10})
+			return err
+		}, streamErr},
+		{"StreamCancelMove", func(t *testing.T) error {
+			return request(t, nc, fmt.Sprintf(JSApiStreamCancelMoveT, "UNSUPPORTED"), nil)
+		}, streamErr},
+		{"ServerStreamMove", func(t *testing.T) error {
+			return request(t, ncsys, fmt.Sprintf(JSApiServerStreamMoveT, globalAccountName, "UNSUPPORTED"), []byte("{}"))
+		}, streamErr},
+		{"ServerStreamCancelMove", func(t *testing.T) error {
+			return request(t, ncsys, fmt.Sprintf(JSApiServerStreamCancelMoveT, globalAccountName, "UNSUPPORTED"), nil)
+		}, streamErr},
+		{"ConsumerCreateOnUnsupportedStream", func(t *testing.T) error {
+			return consumerRequest(t, "UNSUPPORTED", ConsumerConfig{Durable: "NEW", Replicas: 3}, ActionCreate)
+		}, streamErr},
+		{"ConsumerCreate", func(t *testing.T) error {
+			return consumerRequest(t, "TEST", ConsumerConfig{Durable: "CONSUMER", Replicas: 3}, ActionCreate)
+		}, consumerStreamErr},
+		{"ConsumerUpdate", func(t *testing.T) error {
+			return consumerRequest(t, "TEST", ConsumerConfig{Durable: "CONSUMER", Replicas: 3, MaxDeliver: 10}, ActionUpdate)
+		}, consumerStreamErr},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			require_Error(t, test.req(t), test.expected)
+		})
+	}
+
+	// Deleting is still allowed.
+	require_NoError(t, js.DeleteConsumer("TEST", "CONSUMER"))
+	require_NoError(t, js.DeleteStream("UNSUPPORTED"))
+	require_NoError(t, js.DeleteStream("TEST"))
+}
+
 func TestJetStreamClusterSnapshotStreamAssetOnShutdown(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
