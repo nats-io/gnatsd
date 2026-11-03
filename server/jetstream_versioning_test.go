@@ -778,3 +778,31 @@ func TestJetStreamUnsupportedAssignmentWithUnknownEnum(t *testing.T) {
 	_, err = decodeConsumerAssignment([]byte(`{"name":"C","stream":"S","consumer":"invalid"}`))
 	require_Error(t, err)
 }
+
+func TestJetStreamUnsupportedAssignmentProposalKeepsConfig(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	scfg := `{"name":"S","storage":"unknown","unknown":true}`
+	sa, err := decodeStreamAssignment(s, fmt.Appendf(nil, `{"stream":%s,"group":{"name":"G","peers":["A"],"store":"file"}}`, scfg))
+	require_NoError(t, err)
+	require_NotNil(t, sa.unsupported)
+	for _, buf := range [][]byte{encodeAddStreamAssignment(sa), encodeUpdateStreamAssignment(sa), encodeDeleteStreamAssignment(sa)} {
+		nsa, err := decodeStreamAssignment(s, buf[1:])
+		require_NoError(t, err)
+		require_Equal(t, string(nsa.ConfigJSON), scfg)
+	}
+
+	ccfg := `{"durable_name":"C","ack_policy":"unknown","unknown":true}`
+	ca, err := decodeConsumerAssignment(fmt.Appendf(nil, `{"name":"C","stream":"S","consumer":%s,"group":{"name":"G","peers":["A"],"store":"file"}}`, ccfg))
+	require_NoError(t, err)
+	require_NotNil(t, ca.unsupported)
+	for _, buf := range [][]byte{encodeAddConsumerAssignment(ca), encodeDeleteConsumerAssignment(ca)} {
+		nca, err := decodeConsumerAssignment(buf[1:])
+		require_NoError(t, err)
+		require_Equal(t, string(nca.ConfigJSON), ccfg)
+	}
+	nca, err := decodeConsumerAssignmentCompressed(encodeAddConsumerAssignmentCompressed(ca)[1:])
+	require_NoError(t, err)
+	require_Equal(t, string(nca.ConfigJSON), ccfg)
+}
