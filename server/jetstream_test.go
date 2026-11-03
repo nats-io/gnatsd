@@ -11674,6 +11674,58 @@ func TestJetStreamMemoryCorruption(t *testing.T) {
 	}
 }
 
+func TestJetStreamRecoverStreamErrorPreservesData(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+	acc := s.GlobalAccount()
+	storeDir := filepath.Join(s.JetStreamConfig().StoreDir, globalAccountName, streamsDir, "TEST")
+	cfg := StreamConfig{Name: "TEST", Storage: FileStorage, Subjects: []string{"foo"}, MaxBytes: 1024}
+	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: 64}, cfg)
+	require_NoError(t, err)
+	defer fs.Stop()
+	for seq := uint64(1); seq <= 2; seq++ {
+		require_NoError(t, fs.StoreRawMsg("foo", nil, bytes.Repeat([]byte("A"), 64), seq, time.Now().Add(-time.Hour).UnixNano(), 0, false))
+	}
+	require_Equal(t, fs.numMsgBlocks(), 2)
+	blockPath := fs.getFirstBlock().mfn
+	lastBlockPath := fs.lmb.mfn
+	require_NoError(t, fs.Stop())
+
+	original, err := os.ReadFile(blockPath)
+	require_NoError(t, err)
+	lastBlock, err := os.ReadFile(lastBlockPath)
+	require_NoError(t, err)
+	meta := CompressionInfo{Algorithm: S2Compression, OriginalSize: uint64(len(original))}
+	corrupt := meta.MarshalMetadata()
+	require_NoError(t, os.WriteFile(blockPath, corrupt, defaultFilePerms))
+
+	cfg.MaxAge = time.Minute
+	mset, err := acc.recoverStream(&cfg)
+	require_Error(t, err, errors.New("compressed buffer is too short"))
+	require_True(t, mset == nil)
+	for path, expected := range map[string][]byte{blockPath: corrupt, lastBlockPath: lastBlock} {
+		actual, err := os.ReadFile(path)
+		require_NoError(t, err)
+		require_True(t, bytes.Equal(actual, expected))
+	}
+	_, reserved, err := s.JetStreamReservedResources()
+	require_NoError(t, err)
+	require_Equal(t, reserved, 0)
+	_, err = acc.lookupStream("TEST")
+	require_Error(t, err)
+	_, registered := s.ipQueues.Load("[ACC:$G] stream 'TEST' messages")
+	require_False(t, registered)
+
+	require_NoError(t, os.WriteFile(blockPath, original, defaultFilePerms))
+	cfg.MaxAge = 0
+	mset, err = acc.recoverStream(&cfg)
+	require_NoError(t, err)
+	require_Equal(t, mset.state().Msgs, 2)
+	require_NoError(t, mset.delete())
+	_, err = os.Stat(storeDir)
+	require_True(t, os.IsNotExist(err))
+}
+
 func TestJetStreamRecoverBadStreamSubjects(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	sd := s.JetStreamConfig().StoreDir

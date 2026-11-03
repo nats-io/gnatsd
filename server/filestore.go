@@ -553,11 +553,11 @@ func newFileStoreWithCreated(fcfg FileStoreConfig, cfg StreamConfig, created tim
 	// Use defer to ensure the lock is released if any of the enforcement operations
 	// run into issues to avoid potential deadlocks on exit.
 	unlocked := false
-	defer func() {
+	defer func(fs *fileStore) {
 		if !unlocked {
 			fs.mu.Unlock()
 		}
-	}()
+	}(fs)
 
 	// See if we can bring back our TTL timed hash wheel state from disk.
 	if cfg.AllowMsgTTL {

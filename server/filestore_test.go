@@ -1252,6 +1252,57 @@ func TestFileStoreRemoveOutOfOrderRecovery(t *testing.T) {
 	})
 }
 
+func TestFileStoreRecoveryErrorDoesNotPanic(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		cfg      StreamConfig
+		wantMsgs uint64
+	}{
+		{name: "MaxAge", cfg: StreamConfig{MaxAge: time.Minute}},
+		{name: "MaxMsgs", cfg: StreamConfig{MaxMsgs: 1}, wantMsgs: 1},
+		{name: "MaxBytes", cfg: StreamConfig{MaxBytes: 1}},
+		{name: "MaxMsgsPerSubject", cfg: StreamConfig{MaxMsgsPer: 1}, wantMsgs: 1},
+		{name: "PerMessageState", cfg: StreamConfig{Sources: []*StreamSource{{Name: "SOURCE"}}}, wantMsgs: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fcfg := FileStoreConfig{StoreDir: t.TempDir(), BlockSize: 64}
+			cfg := StreamConfig{Name: "TEST", Storage: FileStorage}
+			fs, err := newFileStore(fcfg, cfg)
+			require_NoError(t, err)
+			defer fs.Stop()
+
+			ts := time.Now().Add(-time.Hour).UnixNano()
+			for seq := uint64(1); seq <= 2; seq++ {
+				require_NoError(t, fs.StoreRawMsg("foo", nil, bytes.Repeat([]byte("A"), 64), seq, ts, 0, false))
+			}
+			require_Equal(t, fs.numMsgBlocks(), 2)
+			blockPath := fs.getFirstBlock().mfn
+			require_NoError(t, fs.Stop())
+
+			original, err := os.ReadFile(blockPath)
+			require_NoError(t, err)
+			// Keep the stream index and last block intact so recovery reaches the unreadable block.
+			meta := CompressionInfo{Algorithm: S2Compression, OriginalSize: uint64(len(original))}
+			require_NoError(t, os.WriteFile(blockPath, meta.MarshalMetadata(), defaultFilePerms))
+
+			cfg = test.cfg
+			cfg.Name, cfg.Storage = "TEST", FileStorage
+			recovered, err := newFileStore(fcfg, cfg)
+			if recovered != nil {
+				defer recovered.Stop()
+			}
+			require_Error(t, err, errors.New("compressed buffer is too short"))
+			require_True(t, recovered == nil)
+
+			require_NoError(t, os.WriteFile(blockPath, original, defaultFilePerms))
+			recovered, err = newFileStore(fcfg, cfg)
+			require_NoError(t, err)
+			defer recovered.Stop()
+			require_Equal(t, recovered.State().Msgs, test.wantMsgs)
+		})
+	}
+}
+
 func TestFileStoreAgeLimitRecovery(t *testing.T) {
 	maxAge := 1 * time.Second
 
