@@ -5209,9 +5209,15 @@ func TestJetStreamClusterAccountUsageDrifts(t *testing.T) {
 
 		// Remote usage updates can be delayed, so wait for a bit for values we want.
 		checkFor(t, 10*time.Second, 250*time.Millisecond, func() error {
+			// The meta leader may be moving (stepdowns, restarts, resets), so
+			// account info can transiently fail, retry instead of failing.
 			info, err := js.AccountInfo()
-			require_NoError(t, err)
-			require_True(t, len(info.Tiers) >= 2)
+			if err != nil {
+				return err
+			}
+			if len(info.Tiers) < 2 {
+				return fmt.Errorf("Expected at least 2 tiers, got %d", len(info.Tiers))
+			}
 			// These can move.
 			if u := info.Tiers["R1"].Store; u != r1u {
 				return fmt.Errorf("Expected R1 to be %v, got %v", friendlyBytes(r1u), friendlyBytes(u))
