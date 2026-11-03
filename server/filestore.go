@@ -13869,8 +13869,12 @@ func (o *consumerFileStore) UpdateAcks(dseq, sseq uint64) error {
 		kick = true
 	}
 
+	// Check for AckAll (or AckFlowControl which functions like AckAll).
+	ackAll := o.cfg.AckPolicy == AckAll || o.cfg.AckPolicy == AckFlowControl
+
 	// On restarts the old leader may get a replay from the raft logs that are old.
-	if dseq <= o.state.AckFloor.Consumer {
+	// AckAll checks the stream sequence, since older servers could set the delivery floor above pending messages.
+	if (ackAll && sseq <= o.state.AckFloor.Stream) || (!ackAll && dseq <= o.state.AckFloor.Consumer) {
 		return nil
 	}
 
@@ -13881,8 +13885,11 @@ func (o *consumerFileStore) UpdateAcks(dseq, sseq uint64) error {
 	// Done with the consistency checks, we'll always kick for below updates.
 	kick = true
 
-	// Check for AckAll here (or AckFlowControl which functions like AckAll).
-	if o.cfg.AckPolicy == AckAll || o.cfg.AckPolicy == AckFlowControl {
+	if ackAll {
+		// Use the original delivery sequence.
+		if p := o.state.Pending[sseq]; dseq > p.Sequence && p.Sequence > 0 {
+			dseq = p.Sequence
+		}
 		sgap := sseq - o.state.AckFloor.Stream
 		o.state.AckFloor.Consumer = dseq
 		o.state.AckFloor.Stream = sseq
@@ -13898,6 +13905,11 @@ func (o *consumerFileStore) UpdateAcks(dseq, sseq uint64) error {
 				delete(o.state.Pending, seq)
 				delete(o.state.Redelivered, seq)
 			}
+		}
+		// Nothing pending, so move the floor up to the last delivered message.
+		if len(o.state.Pending) == 0 {
+			o.state.AckFloor.Consumer = o.state.Delivered.Consumer
+			o.state.AckFloor.Stream = o.state.Delivered.Stream
 		}
 		return nil
 	}
