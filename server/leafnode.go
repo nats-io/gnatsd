@@ -2484,6 +2484,20 @@ func (c *client) processLeafNodeConnect(s *Server, arg []byte, lang string) erro
 		return nil
 	}
 
+	// It is possible that the connection was closed concurrently with the
+	// addLeafNodeConnection() call above (for instance, the leaf auth timer
+	// firing while this was being processed). In that case, closeConnection()
+	// ran before the connection was added to s.leafs, so it found nothing to
+	// remove there. Check again here and clean up if needed, mirroring what
+	// leafNodeFinishConnectProcess() does for the soliciting side.
+	c.mu.Lock()
+	closed := c.isClosed()
+	c.mu.Unlock()
+	if closed {
+		s.removeLeafNodeConnection(c)
+		return nil
+	}
+
 	// If we have permissions bound to this leafnode we need to send then back to the
 	// origin server for local enforcement.
 	s.sendPermsAndAccountInfo(c)

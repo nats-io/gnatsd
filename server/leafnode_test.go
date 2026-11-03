@@ -1559,6 +1559,57 @@ func TestLeafNodeInfoPermissionUpdatesAllowedForSolicitedLeaf(t *testing.T) {
 	require_False(t, c.canSubscribe("other.foo"))
 }
 
+// TestLeafNodeAcceptSideClosedDuringConnectNotLeaked is a regression test for
+// https://github.com/nats-io/nats-server/issues/8827.
+//
+// On the accepting (hub) side, processLeafNodeConnect() registers the leaf
+// node connection with addLeafNodeConnection() but, unlike the soliciting
+// side's leafNodeFinishConnectProcess(), it used to never check afterward
+// whether the connection had already closed concurrently (for instance, due
+// to the leaf auth timer firing while the CONNECT was being processed). Since
+// closeConnection() is a no-op on a connection it has already closed (it
+// cannot find anything to remove from s.leafs before it has been added),
+// such a connection would be added to s.leafs and never removed, inflating
+// NumLeafNodes()/Leafz forever.
+//
+// This directly drives processLeafNodeConnect() with a client already marked
+// as closed, which deterministically reproduces the race window without
+// relying on timing.
+func TestLeafNodeAcceptSideClosedDuringConnectNotLeaked(t *testing.T) {
+	s := RunServer(DefaultOptions())
+	defer s.Shutdown()
+
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	c := &client{
+		kind: LEAF,
+		srv:  s,
+		nc:   serverConn,
+		acc:  s.GlobalAccount(),
+		leaf: &leaf{},
+	}
+	c.cid = 123456789
+
+	// Simulate the connection having been closed concurrently with the
+	// CONNECT processing, before addLeafNodeConnection() runs (e.g. the
+	// leaf auth timer firing). The first closeConnection() call in that
+	// race finds nothing in s.leafs to remove yet.
+	c.mu.Lock()
+	c.flags.set(closeConnection)
+	c.mu.Unlock()
+
+	if err := c.processLeafNodeConnect(s, []byte("{}"), _EMPTY_); err != nil {
+		t.Fatalf("processLeafNodeConnect returned error: %v", err)
+	}
+
+	if n := s.NumLeafNodes(); n != 0 {
+		t.Fatalf("expected an already-closed leaf connection to not be left registered, "+
+			"but NumLeafNodes()=%d", n)
+	}
+}
+
 func TestLeafNodePubAllowedPruning(t *testing.T) {
 	c := &client{}
 	c.setPermissions(&Permissions{Publish: &SubjectPermission{Allow: []string{"foo"}}})
