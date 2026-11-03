@@ -1127,7 +1127,7 @@ func (a *Account) addStreamWithAssignmentAndMode(config *StreamConfig, fsConfig 
 	}
 
 	if err := mset.setupStore(fsCfg, recovering || restoring); err != nil {
-		mset.stop(true, false)
+		mset.stop(!recovering, false)
 		return nil, NewJSStreamStoreFailedError(err)
 	}
 
@@ -8881,7 +8881,7 @@ func (mset *stream) stop(deleteFlag, advisory bool) error {
 	sysc := mset.sysc
 	mset.sysc = nil
 
-	if deleteFlag {
+	if deleteFlag || mset.store == nil {
 		// Unregistering ipQueues do not prevent them from push/pop
 		// just will remove them from the central monitoring map
 		mset.msgs.unregister()
