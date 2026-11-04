@@ -11933,6 +11933,83 @@ func TestFileStoreMessageScheduleDecodeRejectsMalformed(t *testing.T) {
 	}
 }
 
+func TestFileStoreLoadPrevMsgSkipsBlocks(t *testing.T) {
+	run := func(t *testing.T, filters []string, removeLast bool) {
+		fcfg := FileStoreConfig{StoreDir: t.TempDir(), BlockSize: 256}
+		cfg := StreamConfig{Name: "zzz", Subjects: []string{"foo.*"}, Storage: FileStorage}
+		fs, err := newFileStore(fcfg, cfg)
+		require_NoError(t, err)
+		for i := range 100 {
+			subj := "foo.b"
+			if i == 30 || i == 60 {
+				subj = "foo.a"
+			}
+			_, _, err = fs.StoreMsg(subj, nil, nil, 0)
+			require_NoError(t, err)
+		}
+		require_True(t, fs.numMsgBlocks() >= 10)
+		// Leaves psim's last block for "foo.a" pointing past its last message.
+		if removeLast {
+			_, err = fs.RemoveMsg(61)
+			require_NoError(t, err)
+		}
+
+		// Restart, so the per-block subject state is no longer in memory.
+		require_NoError(t, fs.Stop())
+		fs, err = newFileStore(fcfg, cfg)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		// A single filter goes through LoadPrevMsg, multiple through loadPrevMsgMultiLocked.
+		sl := gsl.NewSimpleSublist()
+		for _, filter := range filters {
+			require_NoError(t, sl.Insert(filter, struct{}{}))
+		}
+		var smv StoreMsg
+		var got []uint64
+		for start := uint64(100); ; {
+			_, seq, err := fs.LoadPrevMsgMulti(sl, start, &smv)
+			if err == ErrStoreEOF {
+				break
+			}
+			require_NoError(t, err)
+			got = append(got, seq)
+			start = seq - 1
+		}
+		if removeLast {
+			require_True(t, slices.Equal(got, []uint64{31}))
+			return
+		}
+		require_True(t, slices.Equal(got, []uint64{61, 31}))
+
+		// The blocks between the last match and the last block were skipped.
+		fs.mu.RLock()
+		defer fs.mu.RUnlock()
+		bi, _ := fs.selectMsgBlockWithIndex(61)
+		require_True(t, bi < len(fs.blks)-2)
+		for _, mb := range fs.blks[bi+1 : len(fs.blks)-1] {
+			mb.mu.Lock()
+			notLoaded := mb.fssNotLoaded()
+			mb.mu.Unlock()
+			require_True(t, notLoaded)
+		}
+	}
+	for _, test := range []struct {
+		title   string
+		filters []string
+	}{
+		{title: "Literal", filters: []string{"foo.a"}},
+		{title: "Wildcard", filters: []string{"*.a"}},
+		{title: "Multi", filters: []string{"foo.a", "foo.c"}},
+	} {
+		for _, removeLast := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/RemoveLast=%v", test.title, removeLast), func(t *testing.T) {
+				run(t, test.filters, removeLast)
+			})
+		}
+	}
+}
+
 func TestFileStoreCorruptedNonOrderedSequences(t *testing.T) {
 	for _, test := range []struct {
 		title   string
