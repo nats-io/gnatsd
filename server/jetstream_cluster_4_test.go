@@ -9823,3 +9823,39 @@ func TestJetStreamClusterHealthzNewReplicatedAssets(t *testing.T) {
 	default:
 	}
 }
+
+func TestJetStreamClusterR1StreamWriteErrFailsHealthz(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 1,
+	})
+	require_NoError(t, err)
+
+	sl := c.streamLeader(globalAccountName, "TEST")
+	mset, err := sl.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	require_Equal(t, sl.healthz(nil).Error, _EMPTY_)
+
+	// Make the next disk write fail.
+	fs := mset.store.(*fileStore)
+	fs.mu.RLock()
+	lmb := fs.lmb
+	fs.mu.RUnlock()
+	lmb.mu.Lock()
+	lmb.mockWriteErr = true
+	lmb.mu.Unlock()
+
+	// The publish gets no ack, and healthz must now report the write error.
+	_, err = js.Publish("foo", nil, nats.AckWait(250*time.Millisecond))
+	require_Error(t, err, nats.ErrTimeout)
+	hs := sl.healthz(nil)
+	require_Equal(t, hs.StatusCode, 503)
+	require_Contains(t, hs.Error, "'$G > TEST'", "stream write error", "mock write error")
+}
