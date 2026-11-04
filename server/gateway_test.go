@@ -8122,9 +8122,7 @@ func TestGatewayNoAccountUnsubInInterestOnlyMode(t *testing.T) {
 	// account now has no subscriptions at all.
 	var gws []*client
 	sa.getInboundGatewayConnections(&gws)
-	if len(gws) != 1 {
-		t.Fatalf("Expected 1 inbound gateway connection, got %d", len(gws))
-	}
+	require_Len(t, len(gws), 1)
 	acc := sa.globalAccount()
 	sa.gatewayHandleSubjectNoInterest(gws[0], acc, []byte(acc.Name), []byte("foo"))
 
@@ -8138,4 +8136,41 @@ func TestGatewayNoAccountUnsubInInterestOnlyMode(t *testing.T) {
 	natsPub(t, ncB, "bar", []byte("hello"))
 	natsFlush(t, ncB)
 	natsNexMsg(t, sub, time.Second)
+}
+
+// Same as above, but the message arrives while the account is switching to
+// interest-only mode, before the switch completes.
+func TestGatewayNoAccountUnsubWhileSwitchingToInterestOnlyMode(t *testing.T) {
+	ob := testDefaultOptionsForGateway("B")
+	sb := runGatewayServer(ob)
+	defer sb.Shutdown()
+
+	oa := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
+	sa := runGatewayServer(oa)
+	defer sa.Shutdown()
+
+	waitForOutboundGateways(t, sa, 1, time.Second)
+	waitForOutboundGateways(t, sb, 1, time.Second)
+	waitForInboundGateways(t, sa, 1, time.Second)
+	waitForInboundGateways(t, sb, 1, time.Second)
+	checkGWInterestOnlyMode(t, sb, "A", globalAccountName)
+
+	var gws []*client
+	sa.getInboundGatewayConnections(&gws)
+	require_Len(t, len(gws), 1)
+	gwc := gws[0]
+	gwc.mu.Lock()
+	e := gwc.gw.insim[globalAccountName]
+	require_NotNil(t, e)
+	e.mode = Transitioning
+	gwc.mu.Unlock()
+
+	acc := sa.globalAccount()
+	sa.gatewayHandleSubjectNoInterest(gwc, acc, []byte(acc.Name), []byte("foo"))
+
+	gwc.mu.Lock()
+	e = gwc.gw.insim[globalAccountName]
+	gwc.mu.Unlock()
+	require_NotNil(t, e)
+	checkGWInterestOnlyMode(t, sb, "A", globalAccountName)
 }
