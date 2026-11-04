@@ -12465,6 +12465,68 @@ func TestFileStoreSourcesRecoveredOneMessageAfterFlush(t *testing.T) {
 	require_Equal(t, fs.SourcesState()["ORIGIN > >"].Seq, last)
 }
 
+func TestFileStorePerMessageStateIndexWrittenWithoutNewMessages(t *testing.T) {
+	tests := []struct {
+		title  string
+		file   string
+		enable func(cfg *StreamConfig)
+	}{
+		{
+			title:  "Sources",
+			file:   sourcesStreamStateFile,
+			enable: func(cfg *StreamConfig) { cfg.Sources = []*StreamSource{{Name: "ORIGIN"}} },
+		},
+		{
+			title:  "TTL",
+			file:   filepath.Join(msgDir, ttlStreamStateFile),
+			enable: func(cfg *StreamConfig) { cfg.AllowMsgTTL = true },
+		},
+		{
+			title:  "Schedules",
+			file:   filepath.Join(msgDir, msgSchedulingStreamStateFile),
+			enable: func(cfg *StreamConfig) { cfg.AllowMsgSchedules = true },
+		},
+	}
+	for _, test := range tests {
+		for _, restart := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/Restart=%v", test.title, restart), func(t *testing.T) {
+				dir := t.TempDir()
+				fcfg := FileStoreConfig{StoreDir: dir}
+				cfg := StreamConfig{Name: "zzz", Subjects: []string{"foo"}, Storage: FileStorage}
+
+				fs, err := newFileStore(fcfg, cfg)
+				require_NoError(t, err)
+				_, _, err = fs.StoreMsg("foo", nil, nil, 0)
+				require_NoError(t, err)
+				require_NoError(t, fs.forceWriteFullState())
+
+				test.enable(&cfg)
+				if restart {
+					require_NoError(t, fs.Stop())
+					fs, err = newFileStore(fcfg, cfg)
+					require_NoError(t, err)
+				} else {
+					require_NoError(t, fs.UpdateConfig(&cfg))
+				}
+				// Nothing else is stored before stopping.
+				require_NoError(t, fs.Stop())
+
+				_, err = os.Stat(filepath.Join(dir, test.file))
+				require_NoError(t, err)
+
+				// The index is current, so the next start has nothing to scan or write.
+				fs, err = newFileStore(fcfg, cfg)
+				require_NoError(t, err)
+				defer fs.Stop()
+				fs.mu.RLock()
+				dirty := fs.dirty
+				fs.mu.RUnlock()
+				require_Equal(t, dirty, 0)
+			})
+		}
+	}
+}
+
 func TestFileStoreSourcesRecoveredFromPre210Header(t *testing.T) {
 	dir := t.TempDir()
 	fcfg := FileStoreConfig{StoreDir: dir}
@@ -12503,6 +12565,150 @@ func TestFileStoreSourcesRecoveredFromPre210Header(t *testing.T) {
 	defer fs.Stop()
 
 	require_Equal(t, fs.SourcesState()["ORIGIN > >"].Seq, last)
+}
+
+func TestFileStoreSourcesBackwardScanSkipsUnmatchedFilter(t *testing.T) {
+	origin1 := &StreamSource{Name: "ORIGIN1", FilterSubject: "s1.>"}
+	origin2 := &StreamSource{Name: "ORIGIN2", FilterSubject: "s2.>"}
+	origin3 := &StreamSource{Name: "ORIGIN3", FilterSubject: "s1.>"}
+	for _, test := range []struct {
+		title       string
+		removeIndex bool
+		source      *StreamSource
+		walkAll     bool
+	}{
+		// Adding a source with nothing stored for it.
+		{title: "AddedSource", source: origin2},
+		// Starting without the sources index, as on the first start after an upgrade.
+		// ORIGIN1 resolves in the last block, then only ORIGIN2 is left.
+		{title: "MissingIndex", removeIndex: true, source: origin2},
+		// The filter matches stored subjects, but all carry ORIGIN1's header, so it walks every block.
+		{title: "MatchingSubjects", source: origin3, walkAll: true},
+	} {
+		t.Run(test.title, func(t *testing.T) {
+			dir := t.TempDir()
+			fcfg := FileStoreConfig{StoreDir: dir, BlockSize: 256}
+			cfg := StreamConfig{Name: "zzz", Subjects: []string{">"}, Storage: FileStorage, Sources: []*StreamSource{origin1}}
+			fs, err := newFileStore(fcfg, cfg)
+			require_NoError(t, err)
+			for i := range 100 {
+				hdr := genHeader(nil, JSStreamSource, fmt.Sprintf("ORIGIN1 %d s1.> > s1.x", i+1))
+				_, _, err = fs.StoreMsg("s1.x", hdr, nil, 0)
+				require_NoError(t, err)
+			}
+			require_True(t, fs.numMsgBlocks() >= 10)
+
+			// Restart, so the per-block subject state is no longer in memory.
+			require_NoError(t, fs.Stop())
+			if test.removeIndex {
+				require_NoError(t, os.Remove(filepath.Join(dir, sourcesStreamStateFile)))
+				cfg.Sources = append(cfg.Sources, test.source)
+			}
+			fs, err = newFileStore(fcfg, cfg)
+			require_NoError(t, err)
+			defer fs.Stop()
+			if !test.removeIndex {
+				cfg.Sources = append(cfg.Sources, test.source)
+				require_NoError(t, fs.UpdateConfig(&cfg))
+			}
+			state := fs.SourcesState()
+			require_Equal(t, state[origin1.composeIName()].Seq, 100)
+			require_Equal(t, state[test.source.composeIName()].Seq, 0)
+
+			var loaded int
+			fs.mu.RLock()
+			for _, mb := range fs.blks {
+				mb.mu.Lock()
+				if !mb.fssNotLoaded() {
+					loaded++
+				}
+				mb.mu.Unlock()
+			}
+			fs.mu.RUnlock()
+			if test.walkAll {
+				require_Equal(t, loaded, fs.numMsgBlocks())
+			} else {
+				require_True(t, loaded <= 1)
+			}
+		})
+	}
+}
+
+func TestFileStoreLoadPrevMsgSkipsBlocks(t *testing.T) {
+	run := func(t *testing.T, filters []string, removeLast bool) {
+		fcfg := FileStoreConfig{StoreDir: t.TempDir(), BlockSize: 256}
+		cfg := StreamConfig{Name: "zzz", Subjects: []string{"foo.*"}, Storage: FileStorage}
+		fs, err := newFileStore(fcfg, cfg)
+		require_NoError(t, err)
+		for i := range 100 {
+			subj := "foo.b"
+			if i == 30 || i == 60 {
+				subj = "foo.a"
+			}
+			_, _, err = fs.StoreMsg(subj, nil, nil, 0)
+			require_NoError(t, err)
+		}
+		require_True(t, fs.numMsgBlocks() >= 10)
+		// Leaves psim's last block for "foo.a" pointing past its last message.
+		if removeLast {
+			_, err = fs.RemoveMsg(61)
+			require_NoError(t, err)
+		}
+
+		// Restart, so the per-block subject state is no longer in memory.
+		require_NoError(t, fs.Stop())
+		fs, err = newFileStore(fcfg, cfg)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		// A single filter goes through LoadPrevMsg, multiple through loadPrevMsgMultiLocked.
+		sl := gsl.NewSimpleSublist()
+		for _, filter := range filters {
+			require_NoError(t, sl.Insert(filter, struct{}{}))
+		}
+		var smv StoreMsg
+		var got []uint64
+		for start := uint64(100); ; {
+			_, seq, err := fs.LoadPrevMsgMulti(sl, start, &smv)
+			if err == ErrStoreEOF {
+				break
+			}
+			require_NoError(t, err)
+			got = append(got, seq)
+			start = seq - 1
+		}
+		if removeLast {
+			require_True(t, slices.Equal(got, []uint64{31}))
+			return
+		}
+		require_True(t, slices.Equal(got, []uint64{61, 31}))
+
+		// The blocks between the last match and the last block were skipped.
+		fs.mu.RLock()
+		defer fs.mu.RUnlock()
+		bi, _ := fs.selectMsgBlockWithIndex(61)
+		require_True(t, bi < len(fs.blks)-2)
+		for _, mb := range fs.blks[bi+1 : len(fs.blks)-1] {
+			mb.mu.Lock()
+			notLoaded := mb.fssNotLoaded()
+			mb.mu.Unlock()
+			require_True(t, notLoaded)
+		}
+	}
+	for _, test := range []struct {
+		title   string
+		filters []string
+	}{
+		{title: "Literal", filters: []string{"foo.a"}},
+		{title: "Wildcard", filters: []string{"*.a"}},
+		{title: "Multi", filters: []string{"foo.a", "foo.c"}},
+	} {
+		for _, removeLast := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/RemoveLast=%v", test.title, removeLast), func(t *testing.T) {
+				run(t, test.filters, removeLast)
+			})
+		}
+	}
 }
 
 func TestFileStoreCorruptedNonOrderedSequences(t *testing.T) {
