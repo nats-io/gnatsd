@@ -4522,3 +4522,31 @@ func TestLeafNodeConnectInfo(t *testing.T) {
 		})
 	}
 }
+
+func TestLeafNodeRouteDuplicateRSubNoInterestLeak(t *testing.T) {
+	opts := testDefaultOptionsForLeafNodes()
+	opts.Cluster.Name = "xyz"
+	opts.Cluster.Host = opts.Host
+	opts.Cluster.Port = -1
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
+	defer lc.Close()
+	_, leafExpect := setupLeaf(t, lc, 1)
+
+	rc := createRouteConn(t, opts.Cluster.Host, opts.Cluster.Port)
+	defer rc.Close()
+	checkInfoMsg(t, rc)
+	routeSend, routeExpect := setupRouteEx(t, rc, opts, "RC")
+
+	// A route can get the same RS+ twice, from the initial sync and a concurrent update.
+	routeSend("RS+ $G foo\r\nRS+ $G foo\r\nPING\r\n")
+	routeExpect(pongRe)
+	leafExpect(lsubRe)
+
+	// A single RS- must remove the interest on the leafnode.
+	routeSend("RS- $G foo\r\nPING\r\n")
+	routeExpect(pongRe)
+	leafExpect(lunsubRe)
+}

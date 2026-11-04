@@ -1707,6 +1707,10 @@ func (c *client) processRemoteSub(argo []byte, hasOrigin bool) (err error) {
 		delta = sub.qw - atomic.LoadInt32(&osub.qw)
 		atomic.StoreInt32(&osub.qw, sub.qw)
 		sl.UpdateRemoteQSub(osub)
+	} else {
+		// If RS+ for a sub that we already have, ignore.
+		c.mu.Unlock()
+		return nil
 	}
 	c.mu.Unlock()
 
