@@ -1126,8 +1126,17 @@ func (a *Account) addStreamWithAssignmentAndMode(config *StreamConfig, fsConfig 
 		fsCfg.SyncOnFlush = true
 	}
 
+	var removeStoreDir bool
+	if cfg.Storage == FileStorage && !recovering {
+		_, err := os.Stat(storeDir)
+		removeStoreDir = os.IsNotExist(err)
+	}
 	if err := mset.setupStore(fsCfg, recovering || restoring); err != nil {
-		mset.stop(!recovering, false)
+		// Resources have not been reserved, and an existing directory may contain recovery data.
+		mset.stop(false, false)
+		if removeStoreDir {
+			os.RemoveAll(storeDir)
+		}
 		return nil, NewJSStreamStoreFailedError(err)
 	}
 
