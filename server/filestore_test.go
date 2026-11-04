@@ -1410,6 +1410,72 @@ func TestFileStoreRecoveryErrorDoesNotPanic(t *testing.T) {
 	}
 }
 
+func TestFileStoreRecoveryErrorStopsAgeCheck(t *testing.T) {
+	fcfg := FileStoreConfig{StoreDir: t.TempDir(), BlockSize: 64}
+	cfg := StreamConfig{Name: "TEST", Storage: FileStorage}
+	fs, err := newFileStore(fcfg, cfg)
+	require_NoError(t, err)
+	defer fs.Stop()
+	for seq := uint64(1); seq <= 2; seq++ {
+		require_NoError(t, fs.StoreRawMsg("foo", nil, bytes.Repeat([]byte("A"), 64), seq, time.Now().UnixNano(), 0, false))
+	}
+	require_Equal(t, fs.numMsgBlocks(), 2)
+	blockPath, lastBlockPath := fs.getFirstBlock().mfn, fs.lmb.mfn
+	require_NoError(t, fs.Stop())
+	original := make(map[string][]byte)
+	for _, path := range []string{blockPath, lastBlockPath, filepath.Join(fcfg.StoreDir, msgDir, streamStreamStateFile)} {
+		data, err := os.ReadFile(path)
+		require_NoError(t, err)
+		original[path] = data
+	}
+	meta := CompressionInfo{Algorithm: S2Compression, OriginalSize: uint64(len(original[blockPath]))}
+	require_NoError(t, os.WriteFile(blockPath, meta.MarshalMetadata(), defaultFilePerms))
+
+	const maxAge = time.Second
+	cfg.MaxAge, cfg.MaxMsgsPer = maxAge, 1
+	recovered, err := newFileStore(fcfg, cfg)
+	require_Error(t, err, errors.New("compressed buffer is too short"))
+	require_True(t, recovered == nil)
+	indexPath := filepath.Join(fcfg.StoreDir, msgDir, streamStreamStateFile)
+	index, err := os.ReadFile(indexPath)
+	require_NoError(t, err)
+	require_True(t, bytes.Equal(index, original[indexPath]))
+
+	require_NoError(t, os.WriteFile(blockPath, original[blockPath], defaultFilePerms))
+	cfg.MaxAge, cfg.MaxMsgsPer = 0, 0
+	recovered, err = newFileStore(fcfg, cfg)
+	require_NoError(t, err)
+	defer recovered.Stop()
+	// Allow the failed store's age timer to fire after the repaired store is open.
+	time.Sleep(2 * maxAge)
+	for _, path := range []string{blockPath, lastBlockPath} {
+		data, err := os.ReadFile(path)
+		require_NoError(t, err)
+		require_True(t, bytes.Equal(data, original[path]))
+	}
+	require_Equal(t, recovered.State().Msgs, 2)
+}
+
+func TestFileStoreClosedAgeCheck(t *testing.T) {
+	fs, err := newFileStore(FileStoreConfig{StoreDir: t.TempDir()}, StreamConfig{
+		Name: "TEST", Storage: FileStorage, MaxAge: time.Hour,
+	})
+	require_NoError(t, err)
+	defer fs.Stop()
+	_, _, err = fs.StoreMsg("foo", nil, []byte("hello"), 0)
+	require_NoError(t, err)
+	require_NoError(t, fs.Stop())
+
+	// A timer callback may already be queued when Stop cancels the timer.
+	fs.expireMsgs()
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	defer fs.cancelAgeChk()
+	require_True(t, fs.ageChk == nil)
+	fs.resetAgeChk(0)
+	require_True(t, fs.ageChk == nil)
+}
+
 func TestFileStoreAgeLimitRecovery(t *testing.T) {
 	maxAge := 1 * time.Second
 
