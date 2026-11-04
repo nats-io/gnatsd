@@ -455,11 +455,12 @@ func newFileStoreWithCreated(fcfg FileStoreConfig, cfg StreamConfig, created tim
 	ats.Register()
 
 	// If we error before completion make sure to cleanup.
-	defer func() {
+	defer func(fs *fileStore) {
 		if err != nil {
-			ats.Unregister()
+			// The state flusher has not started, and recovery may be incomplete.
+			fs.stop(false, false)
 		}
-	}()
+	}(fs)
 
 	// Only create a THW if we're going to allow TTLs.
 	if cfg.AllowMsgTTL {
@@ -7079,6 +7080,9 @@ func (fs *fileStore) startAgeChk() {
 
 // Lock should be held.
 func (fs *fileStore) resetAgeChk(delta int64) {
+	if fs.recovering || fs.isClosed() {
+		return
+	}
 	// If we're already expiring messages, it will make sure to reset.
 	// Don't trigger again, as that could result in many expire goroutines.
 	if fs.ageChkRun {
@@ -7162,6 +7166,11 @@ func (fs *fileStore) expireMsgs() {
 	var sm *StoreMsg
 
 	fs.mu.Lock()
+	if fs.recovering || fs.isClosed() {
+		fs.cancelAgeChk()
+		fs.mu.Unlock()
+		return
+	}
 	maxAge := int64(fs.cfg.MaxAge)
 	minAge := ats.AccessTime() - maxAge
 	rmcb := fs.rmcb
