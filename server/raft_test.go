@@ -5564,7 +5564,7 @@ func TestNRGSendSnapshotInstallsSnapshot(t *testing.T) {
 	require_Equal(t, n.snapfile, _EMPTY_)
 
 	// On scaleup, we send a snapshot.
-	require_NoError(t, n.SendSnapshot([]byte("snapshot_data")))
+	require_NoError(t, n.SendSnapshot(n.term, []byte("snapshot_data")))
 	require_Equal(t, n.pindex, 2)
 	require_Equal(t, n.snapfile, _EMPTY_)
 
@@ -11526,4 +11526,118 @@ func TestNRGStepDownPrefersCaughtUpPeer(t *testing.T) {
 		require_NotNil(t, nl)
 		require_NotEqual(t, nl.node().ID(), catchingUp)
 	}
+}
+
+func TestNRGLogDrainedWithPoppedProposal(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	rg := c.createMemRaftGroup("TEST", 1, newStateAdder)
+	n := rg.waitOnLeader().node().(*raft)
+	waitDrained := func() {
+		t.Helper()
+		checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+			if drained, err := n.LogDrained(n.Term()); err != nil {
+				return err
+			} else if !drained {
+				return errors.New("log not drained")
+			}
+			return nil
+		})
+	}
+	waitDrained()
+
+	// Hold the lock, the leader loop pops the proposal but can't add it to the log.
+	var pindex uint64
+	for popped := false; !popped; {
+		n.Lock()
+		pindex = n.pindex
+		n.prop.push(newProposedEntry(newEntry(EntryNormal, binary.AppendVarint(nil, 1)), _EMPTY_, n.term))
+		for start := time.Now(); !popped && time.Since(start) < 100*time.Millisecond; {
+			popped = n.prop.len() == 0 && n.prop.inProgress() > 0
+			time.Sleep(time.Millisecond)
+		}
+		// The leader loop was waiting on the lock itself, try again.
+		if !popped {
+			n.Unlock()
+			waitDrained()
+		}
+	}
+
+	// A reader waiting on the lock gets it before the leader loop adds the proposal to the log.
+	drained := make(chan bool, 1)
+	term := n.term
+	go func() {
+		ok, _ := n.LogDrained(term)
+		drained <- ok
+	}()
+	time.Sleep(50 * time.Millisecond)
+	n.Unlock()
+	require_False(t, <-drained)
+
+	// Once drained, the log includes the proposal.
+	waitDrained()
+	index, _, _ := n.Progress()
+	require_True(t, index > pindex)
+}
+
+func TestNRGLogDrainedNotLeader(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Not the leader yet.
+	_, err := n.LogDrained(n.term)
+	require_Error(t, err, errNotLeader)
+
+	n.switchToCandidate()
+	n.switchToLeader()
+	term := n.term
+	_, err = n.LogDrained(term)
+	require_NoError(t, err)
+
+	// Not the leader in an older term.
+	_, err = n.LogDrained(term - 1)
+	require_Error(t, err, errNotLeader)
+
+	// Not the leader after stepping down, even if re-elected in a newer term.
+	require_NoError(t, n.StepDown())
+	_, err = n.LogDrained(term)
+	require_Error(t, err, errNotLeader)
+}
+
+func TestNRGSnapshotInCurrentTermAfterSend(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Provide peer vote interest so the isolation guard permits campaigning.
+	nc, err := nats.Connect(n.s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+	_, err = nc.SubscribeSync(n.vsubj)
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
+
+	// Peers that never respond, so the sent snapshot isn't committed.
+	n.Lock()
+	n.addPeer("S1Nunr6R")
+	n.addPeer("yrzKKRBu")
+	n.Unlock()
+
+	// Become leader, without a snapshot yet.
+	n.switchToCandidate()
+	n.switchToLeader()
+	require_NoError(t, n.applyCommit(1))
+	require_Equal(t, n.snapfile, _EMPTY_)
+	require_False(t, n.SnapshotInCurrentTerm())
+
+	// A sent snapshot counts before it's committed and installed.
+	require_NoError(t, n.SendSnapshot(n.term, []byte("snapshot_data")))
+	require_Equal(t, n.snapfile, _EMPTY_)
+	require_True(t, n.SnapshotInCurrentTerm())
+
+	// Not in a newer term.
+	n.Lock()
+	n.term++
+	n.Unlock()
+	require_False(t, n.SnapshotInCurrentTerm())
 }
