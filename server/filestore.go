@@ -3687,6 +3687,62 @@ func (fs *fileStore) selectSkipFirstBlock(bi int, start, stop uint32) (int, erro
 	return bi + 1, nil
 }
 
+// This is used to see if we can selectively jump back blocks based on filter subject and a starting block index.
+// Will return -1 and ErrStoreEOF if no matches at all or no more from where we are.
+func (fs *fileStore) checkSkipLastBlock(filter string, wc bool, bi int) (int, error) {
+	// If we match everything, just move to previous blk.
+	if filter == _EMPTY_ || filter == fwcs {
+		return bi - 1, nil
+	}
+	if wc && fs.psim.Size() > highCardinalityThreshold {
+		return bi - 1, nil
+	}
+	start, stop := fs.filteredBlockRange(filter, wc)
+	if stop == 0 {
+		return -1, ErrStoreEOF
+	}
+	return fs.selectSkipLastBlock(bi, start, stop)
+}
+
+// This is used to see if we can selectively jump back blocks based on filter subjects and a starting block index.
+// Will return -1 and ErrStoreEOF if no matches at all or no more from where we are.
+func (fs *fileStore) checkSkipLastBlockMulti(sl *gsl.SimpleSublist, bi int) (int, error) {
+	// Don't bother if full wildcard.
+	if sl.MatchesFullWildcard() || fs.psim.Size() > highCardinalityThreshold {
+		return bi - 1, nil
+	}
+	// Move through psim to gather start and stop bounds.
+	// Only subjects with msgs before bi can move stop, since we missed searching bi.
+	mbi, guard := fs.blks[bi].getIndex(), fs.blks[bi-1].getIndex()
+	start, stop := uint32(math.MaxUint32), uint32(0)
+	stree.IntersectGSL(fs.psim, sl, func(_ []byte, psi *psi) bool {
+		start = min(start, psi.fblk)
+		if psi.fblk < mbi {
+			stop = max(stop, psi.lblk)
+		}
+		// One of the subjects matches the previous block, so there's no point in carrying on trying to skip.
+		return stop < guard
+	})
+	return fs.selectSkipLastBlock(bi, start, stop)
+}
+
+func (fs *fileStore) selectSkipLastBlock(bi int, start, stop uint32) (int, error) {
+	// All matching msgs are behind us.
+	// Greater than AND equal is important because we were called because we missed searching bi.
+	if start >= fs.blks[bi].getIndex() {
+		return -1, ErrStoreEOF
+	}
+	// If stop is < previous index return dereference of fs.blks index.
+	if stop < fs.blks[bi-1].getIndex() {
+		if mb := fs.bim[stop]; mb != nil {
+			ni, _ := fs.selectMsgBlockWithIndex(atomic.LoadUint64(&mb.last.seq))
+			return ni, nil
+		}
+	}
+	// Otherwise just bump to the previous one.
+	return bi - 1, nil
+}
+
 // Optimized way for getting all num pending matching a filter subject.
 // Lock should be held.
 func (fs *fileStore) numFilteredPending(filter string, ss *SimpleState) error {
@@ -10005,8 +10061,24 @@ func (fs *fileStore) LoadPrevMsg(filter string, wc bool, start uint64, smp *Stor
 				return sm, sm.seq, nil
 			} else if err != ErrStoreMsgNotFound {
 				return nil, 0, err
-			} else if expireOk {
-				mb.tryForceExpireCache()
+			} else {
+				if expireOk {
+					mb.tryForceExpireCache()
+				}
+				// Nothing found in this block. We missed, if first block (bi) check psim.
+				// We should not do this at all if we are already on the first block.
+				// Nor if the previous block is the first one, since we can simply skip to it.
+				if i == bi && i > 1 {
+					nbi, err := fs.checkSkipLastBlock(filter, wc, bi)
+					// Nothing available.
+					if err == ErrStoreEOF {
+						return nil, fs.state.FirstSeq, ErrStoreEOF
+					}
+					// See if we can jump back here.
+					if nbi < i {
+						i = nbi + 1 // Offset the loop's i--
+					}
+				}
 			}
 		}
 	}
@@ -10051,8 +10123,24 @@ func (fs *fileStore) loadPrevMsgMultiLocked(sl *gsl.SimpleSublist, start uint64,
 				return sm, sm.seq, nil
 			} else if err != ErrStoreMsgNotFound {
 				return nil, 0, err
-			} else if expireOk {
-				mb.tryForceExpireCache()
+			} else {
+				if expireOk {
+					mb.tryForceExpireCache()
+				}
+				// Nothing found in this block. We missed, if first block (bi) check psim.
+				// We should not do this at all if we are already on the first block.
+				// Nor if the previous block is the first one, since we can simply skip to it.
+				if i == bi && i > 1 {
+					nbi, err := fs.checkSkipLastBlockMulti(sl, bi)
+					// Nothing available.
+					if err == ErrStoreEOF {
+						return nil, fs.state.FirstSeq, ErrStoreEOF
+					}
+					// See if we can jump back here.
+					if nbi < i {
+						i = nbi + 1 // Offset the loop's i--
+					}
+				}
 			}
 		}
 	}
