@@ -1079,7 +1079,11 @@ func (js *jetStream) isStreamHealthy(acc *Account, sa *streamAssignment) error {
 	streamWerr := mset.getWriteErr()
 	switch {
 	case replicas <= 1:
-		return nil // No further checks for R=1 streams
+		// No further checks for R=1 streams, other than a write error.
+		if streamWerr != nil {
+			return fmt.Errorf("stream write error: %v", streamWerr)
+		}
+		return nil
 
 	case starting && (node == nil || msetNode == nil):
 		// Nodes not set up yet, but should be soon.
