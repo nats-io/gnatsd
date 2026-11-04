@@ -29,6 +29,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -318,34 +319,44 @@ func (p *parser) processItem(it item, fp string) error {
 		// Process a suffix
 		suffix := strings.ToLower(strings.TrimSpace(it.val[lastDigit:]))
 
+		var multiplier int64
 		switch suffix {
 		case "":
-			setValue(it, num)
+			multiplier = 1
 		case "k":
-			setValue(it, num*1000)
+			multiplier = 1000
 		case "kb", "ki", "kib":
-			setValue(it, num*1024)
+			multiplier = 1024
 		case "m":
-			setValue(it, num*1000*1000)
+			multiplier = 1000 * 1000
 		case "mb", "mi", "mib":
-			setValue(it, num*1024*1024)
+			multiplier = 1024 * 1024
 		case "g":
-			setValue(it, num*1000*1000*1000)
+			multiplier = 1000 * 1000 * 1000
 		case "gb", "gi", "gib":
-			setValue(it, num*1024*1024*1024)
+			multiplier = 1024 * 1024 * 1024
 		case "t":
-			setValue(it, num*1000*1000*1000*1000)
+			multiplier = 1000 * 1000 * 1000 * 1000
 		case "tb", "ti", "tib":
-			setValue(it, num*1024*1024*1024*1024)
+			multiplier = 1024 * 1024 * 1024 * 1024
 		case "p":
-			setValue(it, num*1000*1000*1000*1000*1000)
+			multiplier = 1000 * 1000 * 1000 * 1000 * 1000
 		case "pb", "pi", "pib":
-			setValue(it, num*1024*1024*1024*1024*1024)
+			multiplier = 1024 * 1024 * 1024 * 1024 * 1024
 		case "e":
-			setValue(it, num*1000*1000*1000*1000*1000*1000)
+			multiplier = 1000 * 1000 * 1000 * 1000 * 1000 * 1000
 		case "eb", "ei", "eib":
-			setValue(it, num*1024*1024*1024*1024*1024*1024)
+			multiplier = 1024 * 1024 * 1024 * 1024 * 1024 * 1024
+		default:
+			// Not a known suffix (e.g. "1kbb"), so this isn't a convenient
+			// number after all. Like lexConvenientNumber, treat it as a string.
+			setValue(it, it.val)
+			return nil
 		}
+		if num > math.MaxInt64/multiplier || num < math.MinInt64/multiplier {
+			return fmt.Errorf("integer '%s' is out of the range", it.val)
+		}
+		setValue(it, num*multiplier)
 	case itemFloat:
 		num, err := strconv.ParseFloat(it.val, 64)
 		if err != nil {

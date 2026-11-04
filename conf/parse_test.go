@@ -178,7 +178,7 @@ func TestBcryptVariable(t *testing.T) {
 // not convenient numbers and must be parsed as plain strings rather than
 // failing to parse. See #5186, #5189 and #6891.
 func TestUnquotedStringStartingWithNumberAndSuffix(t *testing.T) {
-	for _, val := range []string{"0K1abc", "8m4dwr", "5e7bcd-abc10", "4e2abc", "-1k2abc"} {
+	for _, val := range []string{"0K1abc", "8m4dwr", "5e7bcd-abc10", "4e2abc", "-1k2abc", "1kbb", "4ebb", "2Mbi", "-1kbb"} {
 		ex := map[string]any{"password": val}
 		test(t, fmt.Sprintf("password: %s", val), ex)
 	}
@@ -197,6 +197,20 @@ func TestUnquotedStringStartingWithNumberAndSuffix(t *testing.T) {
 		},
 	}
 	test(t, "authorization { user: foo, password: 4e2abc }", ex)
+
+	ex = map[string]any{
+		"authorization": map[string]any{
+			"user":     "foo",
+			"password": "4ebb",
+		},
+		"port": int64(4222),
+	}
+	test(t, "authorization { user: foo, password: 4ebb }\nport: 4222", ex)
+
+	ex = map[string]any{
+		"passwords": []any{"4ebb", "1kbb"},
+	}
+	test(t, "passwords: [4ebb, 1kbb]", ex)
 }
 
 var easynum = `
@@ -242,6 +256,23 @@ func TestConvenientNumbers(t *testing.T) {
 		"pib": int64(22 * 1024 * 1024 * 1024 * 1024 * 1024),
 	}
 	test(t, easynum, ex)
+}
+
+func TestConvenientNumbersLimits(t *testing.T) {
+	ex := map[string]any{
+		"a": int64(9 * 1000 * 1000 * 1000 * 1000 * 1000 * 1000),
+		"b": int64(-9 * 1000 * 1000 * 1000 * 1000 * 1000 * 1000),
+		"c": int64(7 * 1024 * 1024 * 1024 * 1024 * 1024 * 1024),
+		"d": int64(-8 * 1024 * 1024 * 1024 * 1024 * 1024 * 1024),
+	}
+	test(t, "a = 9e\nb = -9e\nc = 7eb\nd = -8eb", ex)
+
+	for _, val := range []string{"10e", "-10e", "8eb", "-9eb", "9223372036854775807k", "-9223372036854775808Ki"} {
+		_, err := Parse(fmt.Sprintf("a = %s", val))
+		if err == nil || !strings.Contains(err.Error(), "out of the range") {
+			t.Fatalf("Expected out of the range error for %q, got %v", val, err)
+		}
+	}
 }
 
 func TestParseFileWithChecksDigestPreservesConfigKeyUsedAsVariable(t *testing.T) {
