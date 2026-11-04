@@ -2244,10 +2244,6 @@ func TestConfigReloadMaxPayload(t *testing.T) {
 		t.Fatalf("Error creating client: %v", err)
 	}
 	defer nc.Close()
-	closed := make(chan struct{})
-	nc.SetDisconnectHandler(func(*nats.Conn) {
-		closed <- struct{}{}
-	})
 
 	conn, err := nats.Connect(addr)
 	if err != nil {
@@ -2276,21 +2272,49 @@ func TestConfigReloadMaxPayload(t *testing.T) {
 		t.Fatalf("Error reloading config: %v", err)
 	}
 
-	// Ensure oversized messages don't get delivered and the client is
-	// disconnected.
-	if err := nc.Publish("foo", []byte("hello")); err != nil {
-		t.Fatalf("Error publishing: %v", err)
+	// Wait for the client to receive the updated max payload via async INFO.
+	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+		if nc.MaxPayload() != 1 {
+			return fmt.Errorf("expected max payload 1, got %d", nc.MaxPayload())
+		}
+		return nil
+	})
+
+	// Ensure oversized messages are rejected client-side now that the client knows the new limit.
+	if err := nc.Publish("foo", []byte("hello")); err != nats.ErrMaxPayload {
+		t.Fatalf("Expected ErrMaxPayload, got: %v", err)
 	}
-	nc.Flush()
+
+	// Ensure that if an oversized message is sent by a client (e.g. bypassing
+	// client-side validation), the server enforces the limit and disconnects the client.
+	raw, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", opts.Host, server.Addr().(*net.TCPAddr).Port), 2*time.Second)
+	if err != nil {
+		t.Fatalf("Error connecting raw client: %v", err)
+	}
+	defer raw.Close()
+	raw.Write([]byte("CONNECT {}\r\nPUB foo 5\r\nhello\r\n"))
+	raw.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var out []byte
+	buf := make([]byte, 512)
+	for {
+		n, err := raw.Read(buf)
+		if n > 0 {
+			out = append(out, buf[:n]...)
+			if strings.Contains(string(out), "Maximum Payload Violation") {
+				break
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	if !strings.Contains(string(out), "Maximum Payload Violation") {
+		t.Fatalf("Expected Maximum Payload Violation, got %q", string(out))
+	}
+
 	_, err = sub.NextMsg(20 * time.Millisecond)
 	if err != nats.ErrTimeout {
 		t.Fatalf("Expected ErrTimeout, got: %v", err)
-	}
-
-	select {
-	case <-closed:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Expected to be disconnected")
 	}
 }
 
