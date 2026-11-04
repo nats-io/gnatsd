@@ -19,7 +19,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -1348,16 +1347,10 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits, tq c
 				buf = nbuf
 			}
 
-			var cfg FileConsumerInfo
-			decoder := json.NewDecoder(bytes.NewReader(buf))
-			decoder.DisallowUnknownFields()
-			strictErr := decoder.Decode(&cfg)
-			if strictErr != nil {
-				cfg = FileConsumerInfo{}
-				if err := json.Unmarshal(buf, &cfg); err != nil {
-					s.Warnf("    Error unmarshalling consumer metafile %q: %v", metafile, err)
-					continue
-				}
+			cfg, strictErr, err := decodeConfig[FileConsumerInfo](buf)
+			if err != nil {
+				s.Warnf("    Error unmarshalling consumer metafile %q: %v", metafile, err)
+				continue
 			}
 			if supported := supportsRequiredApiLevel(cfg.Metadata); !supported || strictErr != nil {
 				var offlineReason string
@@ -1498,17 +1491,13 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits, tq c
 			plaintext = false
 		}
 
-		var cfg FileStreamInfo
-		decoder := json.NewDecoder(bytes.NewReader(buf))
-		decoder.DisallowUnknownFields()
-		strictErr := decoder.Decode(&cfg)
-		if strictErr != nil {
-			cfg = FileStreamInfo{}
-			if err := json.Unmarshal(buf, &cfg); err != nil {
-				s.Warnf("  Error unmarshalling stream metafile %q: %v", metafile, err)
-				return nil
-			}
+		cfg, strictErr, err := decodeConfig[FileStreamInfo](buf)
+		if err != nil {
+			s.Warnf("  Error unmarshalling stream metafile %q: %v", metafile, err)
+			return nil
 		}
+		// An unsupported stream also needs a storage type.
+		fixCfgUnsetStorage(&cfg.StreamConfig)
 		if supported := supportsRequiredApiLevel(cfg.Metadata); !supported || strictErr != nil {
 			var offlineReason string
 			if !supported {
@@ -3010,6 +2999,15 @@ func fixCfgMirrorWithDedupWindow(cfg *StreamConfig) {
 	}
 	if cfg.Duplicates != 0 {
 		cfg.Duplicates = 0
+	}
+}
+
+// fixCfgUnsetStorage defaults an unset storage type to file storage, like checkStreamCfg does.
+// Decoding leaves an unknown storage type of an unsupported stream unset.
+// The config can't be marshaled without a storage type.
+func fixCfgUnsetStorage(cfg *StreamConfig) {
+	if cfg != nil && cfg.Storage == 0 {
+		cfg.Storage = FileStorage
 	}
 }
 

@@ -548,7 +548,7 @@ type unsupportedStreamAssignment struct {
 func newUnsupportedStreamAssignment(s *Server, sa *streamAssignment, err error) *unsupportedStreamAssignment {
 	reason := "stopped"
 	if err != nil {
-		if errstr := err.Error(); strings.HasPrefix(errstr, "json:") {
+		if errstr := err.Error(); strings.HasPrefix(errstr, "json:") || errors.Is(err, errInvalidConfigValue) {
 			reason = fmt.Sprintf("unsupported - config error: %s", strings.TrimPrefix(err.Error(), "json: "))
 		} else {
 			reason = fmt.Sprintf("stopped - %s", errstr)
@@ -682,7 +682,7 @@ type unsupportedConsumerAssignment struct {
 func newUnsupportedConsumerAssignment(ca *consumerAssignment, err error) *unsupportedConsumerAssignment {
 	reason := "stopped"
 	if err != nil {
-		if errstr := err.Error(); strings.HasPrefix(errstr, "json:") {
+		if errstr := err.Error(); strings.HasPrefix(errstr, "json:") || errors.Is(err, errInvalidConfigValue) {
 			reason = fmt.Sprintf("unsupported - config error: %s", strings.TrimPrefix(err.Error(), "json: "))
 		} else {
 			reason = fmt.Sprintf("stopped - %s", errstr)
@@ -11111,6 +11111,12 @@ func (s *Server) jsClusteredStreamRequest(ci *ClientInfo, acc *Account, subject,
 
 	// Capture if we have existing/inflight assignment first.
 	if osa := js.streamAssignmentOrInflight(acc.Name, cfg.Name); osa != nil {
+		// The config of an unsupported stream may only be partially decoded.
+		if osa.unsupported != nil {
+			resp.Error = NewJSStreamOfflineReasonError(errors.New(osa.unsupported.reason))
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
+			return
+		}
 		copyStreamMetadata(cfg, osa.Config)
 		// Set the index name on both to ensure the DeepEqual works
 		matchSourceIndexNames(cfg, osa.Config)
@@ -11304,6 +11310,13 @@ func (s *Server) jsClusteredStreamUpdateRequestLocked(ci *ClientInfo, acc *Accou
 	osa := js.streamAssignmentOrInflight(acc.Name, cfg.Name)
 	if osa == nil {
 		resp.Error = NewJSStreamNotFoundError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
+		return
+	}
+
+	// The config of an unsupported stream may only be partially decoded.
+	if osa.unsupported != nil {
+		resp.Error = NewJSStreamOfflineReasonError(errors.New(osa.unsupported.reason))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
 		return
 	}
@@ -12331,10 +12344,21 @@ func (s *Server) jsClusteredMsgDeleteRequest(ci *ClientInfo, acc *Account, mset 
 	s.sendAPIResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(resp))
 }
 
+// proposalConfigJSON returns the stream config to include in a proposal.
+// The config of an unsupported stream may only be partially decoded.
+// Its original JSON is kept instead.
+func (sa *streamAssignment) proposalConfigJSON() json.RawMessage {
+	if sa.unsupported != nil {
+		return sa.ConfigJSON
+	}
+	cfg, _ := json.Marshal(sa.Config)
+	return cfg
+}
+
 func encodeAddStreamAssignment(sa *streamAssignment) []byte {
 	csa := sa.clone()
 	csa.Client = csa.Client.forProposal()
-	csa.ConfigJSON, _ = json.Marshal(sa.Config)
+	csa.ConfigJSON = sa.proposalConfigJSON()
 	var bb bytes.Buffer
 	bb.WriteByte(byte(assignStreamOp))
 	json.NewEncoder(&bb).Encode(csa)
@@ -12344,7 +12368,7 @@ func encodeAddStreamAssignment(sa *streamAssignment) []byte {
 func encodeUpdateStreamAssignment(sa *streamAssignment) []byte {
 	csa := sa.clone()
 	csa.Client = csa.Client.forProposal()
-	csa.ConfigJSON, _ = json.Marshal(sa.Config)
+	csa.ConfigJSON = sa.proposalConfigJSON()
 	var bb bytes.Buffer
 	bb.WriteByte(byte(updateStreamOp))
 	json.NewEncoder(&bb).Encode(csa)
@@ -12354,7 +12378,7 @@ func encodeUpdateStreamAssignment(sa *streamAssignment) []byte {
 func encodeDeleteStreamAssignment(sa *streamAssignment) []byte {
 	csa := sa.clone()
 	csa.Client = csa.Client.forProposal()
-	csa.ConfigJSON, _ = json.Marshal(sa.Config)
+	csa.ConfigJSON = sa.proposalConfigJSON()
 	var bb bytes.Buffer
 	bb.WriteByte(byte(removeStreamOp))
 	json.NewEncoder(&bb).Encode(csa)
@@ -12373,23 +12397,16 @@ func decodeStreamAssignment(s *Server, buf []byte) (*streamAssignment, error) {
 }
 
 func decodeStreamAssignmentConfig(s *Server, sa *streamAssignment) error {
-	var unsupported bool
-	var cfg StreamConfig
-	var err error
-	decoder := json.NewDecoder(bytes.NewReader(sa.ConfigJSON))
-	decoder.DisallowUnknownFields()
-	if err = decoder.Decode(&cfg); err != nil {
-		unsupported = true
-		cfg = StreamConfig{}
-		if err2 := json.Unmarshal(sa.ConfigJSON, &cfg); err2 != nil {
-			return err2
-		}
+	cfg, strictErr, err := decodeConfig[StreamConfig](sa.ConfigJSON)
+	if err != nil {
+		return err
 	}
 	sa.Config = &cfg
 	fixCfgMirrorWithDedupWindow(sa.Config)
+	fixCfgUnsetStorage(sa.Config)
 
-	if unsupported || (sa.Config != nil && !supportsRequiredApiLevel(sa.Config.Metadata)) {
-		sa.unsupported = newUnsupportedStreamAssignment(s, sa, err)
+	if strictErr != nil || !supportsRequiredApiLevel(sa.Config.Metadata) {
+		sa.unsupported = newUnsupportedStreamAssignment(s, sa, strictErr)
 	}
 	return nil
 }
@@ -12525,6 +12542,13 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 		return
 	}
 
+	// The config of an unsupported stream may only be partially decoded.
+	if sa.unsupported != nil {
+		resp.Error = NewJSStreamOfflineReasonError(errors.New(sa.unsupported.reason))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+
 	// If the user provided an expected stream identity, reject the request on a mismatch.
 	var streamIdentity string
 	if req.Config.Direct || req.Config.Sourcing {
@@ -12619,6 +12643,12 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 	// if name was set by the user.
 	if oname != _EMPTY_ {
 		if ca = js.consumerAssignmentOrInflight(acc.Name, stream, oname); ca != nil {
+			// The config of an unsupported consumer may only be partially decoded.
+			if ca.unsupported != nil {
+				resp.Error = NewJSConsumerOfflineReasonError(errors.New(ca.unsupported.reason))
+				s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+				return
+			}
 			// Provided config might miss metadata, copy from existing config.
 			copyConsumerMetadata(cfg, ca.Config)
 
@@ -12834,10 +12864,21 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 	cc.trackInflightConsumerProposal(acc.Name, stream, ca, false)
 }
 
+// proposalConfigJSON returns the consumer config to include in a proposal.
+// The config of an unsupported consumer may only be partially decoded.
+// Its original JSON is kept instead.
+func (ca *consumerAssignment) proposalConfigJSON() json.RawMessage {
+	if ca.unsupported != nil {
+		return ca.ConfigJSON
+	}
+	cfg, _ := json.Marshal(ca.Config)
+	return cfg
+}
+
 func encodeAddConsumerAssignment(ca *consumerAssignment) []byte {
 	cca := ca.clone()
 	cca.Client = cca.Client.forProposal()
-	cca.ConfigJSON, _ = json.Marshal(ca.Config)
+	cca.ConfigJSON = ca.proposalConfigJSON()
 	var bb bytes.Buffer
 	bb.WriteByte(byte(assignConsumerOp))
 	json.NewEncoder(&bb).Encode(cca)
@@ -12847,7 +12888,7 @@ func encodeAddConsumerAssignment(ca *consumerAssignment) []byte {
 func encodeDeleteConsumerAssignment(ca *consumerAssignment) []byte {
 	cca := ca.clone()
 	cca.Client = cca.Client.forProposal()
-	cca.ConfigJSON, _ = json.Marshal(ca.Config)
+	cca.ConfigJSON = ca.proposalConfigJSON()
 	var bb bytes.Buffer
 	bb.WriteByte(byte(removeConsumerOp))
 	json.NewEncoder(&bb).Encode(cca)
@@ -12866,21 +12907,13 @@ func decodeConsumerAssignment(buf []byte) (*consumerAssignment, error) {
 }
 
 func decodeConsumerAssignmentConfig(ca *consumerAssignment) error {
-	var unsupported bool
-	var cfg ConsumerConfig
-	var err error
-	decoder := json.NewDecoder(bytes.NewReader(ca.ConfigJSON))
-	decoder.DisallowUnknownFields()
-	if err = decoder.Decode(&cfg); err != nil {
-		unsupported = true
-		cfg = ConsumerConfig{}
-		if err2 := json.Unmarshal(ca.ConfigJSON, &cfg); err2 != nil {
-			return err2
-		}
+	cfg, strictErr, err := decodeConfig[ConsumerConfig](ca.ConfigJSON)
+	if err != nil {
+		return err
 	}
 	ca.Config = &cfg
-	if unsupported || (ca.Config != nil && !supportsRequiredApiLevel(ca.Config.Metadata)) {
-		ca.unsupported = newUnsupportedConsumerAssignment(ca, err)
+	if strictErr != nil || !supportsRequiredApiLevel(ca.Config.Metadata) {
+		ca.unsupported = newUnsupportedConsumerAssignment(ca, strictErr)
 	}
 	return nil
 }
@@ -12888,7 +12921,7 @@ func decodeConsumerAssignmentConfig(ca *consumerAssignment) error {
 func encodeAddConsumerAssignmentCompressed(ca *consumerAssignment) []byte {
 	cca := ca.clone()
 	cca.Client = cca.Client.forProposal()
-	cca.ConfigJSON, _ = json.Marshal(ca.Config)
+	cca.ConfigJSON = ca.proposalConfigJSON()
 	var bb bytes.Buffer
 	bb.WriteByte(byte(assignCompressedConsumerOp))
 	s2e := s2.NewWriter(&bb)
