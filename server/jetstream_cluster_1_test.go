@@ -16320,6 +16320,119 @@ func TestJetStreamClusterMalformedConsumerEntrySetsWriteErr(t *testing.T) {
 	require_True(t, cl.Running())
 }
 
+func TestJetStreamClusterStreamWriteErrFencesConsumerLeadership(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:      "TEST",
+		Subjects:  []string{"foo"},
+		Replicas:  3,
+		Retention: nats.WorkQueuePolicy,
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:   "CONS",
+		AckPolicy: nats.AckExplicitPolicy,
+		Replicas:  3,
+	})
+	require_NoError(t, err)
+
+	sub, err := js.PullSubscribe("foo", "CONS")
+	require_NoError(t, err)
+
+	// Verify end-to-end flow first.
+	_, err = js.Publish("foo", []byte("ok"))
+	require_NoError(t, err)
+	msgs, err := sub.Fetch(1)
+	require_NoError(t, err)
+	require_Len(t, len(msgs), 1)
+	require_NoError(t, msgs[0].AckSync())
+
+	// Mirror a replica broken on restart: a stream follower that holds
+	// consumer leadership. Move the leaders apart if they coincide.
+	c.waitOnStreamLeader(globalAccountName, "TEST")
+	c.waitOnConsumerLeader(globalAccountName, "TEST", "CONS")
+	for c.consumerLeader(globalAccountName, "TEST", "CONS") == c.streamLeader(globalAccountName, "TEST") {
+		_, err = nc.Request(fmt.Sprintf(JSApiConsumerLeaderStepDownT, "TEST", "CONS"), nil, 5*time.Second)
+		require_NoError(t, err)
+		c.waitOnConsumerLeader(globalAccountName, "TEST", "CONS")
+	}
+	cl := c.consumerLeader(globalAccountName, "TEST", "CONS")
+
+	// Inject a store write failure on the consumer leader, like a torn write
+	// after an ungraceful kill. The next replicated message fails to store
+	// there, which must set the stream's critical write error and freeze
+	// this server's copy of the stream.
+	mset, err := cl.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	fs, ok := mset.store.(*fileStore)
+	require_True(t, ok)
+	fs.mu.Lock()
+	fs.werr = ErrSequenceMismatch
+	fs.mu.Unlock()
+
+	// Publishes keep succeeding through the healthy quorum.
+	for i := 0; i < 5; i++ {
+		_, err = js.Publish("foo", []byte("payload"))
+		require_NoError(t, err)
+	}
+
+	checkFor(t, 5*time.Second, 50*time.Millisecond, func() error {
+		if mset.getWriteErr() == nil {
+			return fmt.Errorf("stream write error not set yet")
+		}
+		return nil
+	})
+
+	// The broken server must give up consumer leadership, otherwise the
+	// consumer reads from the frozen copy and silently delivers nothing.
+	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+		ncl := c.consumerLeader(globalAccountName, "TEST", "CONS")
+		if ncl == nil {
+			return fmt.Errorf("no consumer leader")
+		}
+		if ncl == cl {
+			return fmt.Errorf("consumer leadership still on the server with the broken stream")
+		}
+		return nil
+	})
+
+	// And it must not win leadership back: its consumer node is an observer.
+	o := mset.lookupConsumer("CONS")
+	require_True(t, o != nil)
+	onode := o.raftNode()
+	require_True(t, onode != nil)
+	require_True(t, onode.IsObserver())
+
+	// Healthz on the broken server must report the consumer as unhealthy.
+	cjs := cl.getJetStream()
+	require_Error(t, cjs.isConsumerHealthy(mset, nil, "CONS", o.consumerAssignment()))
+
+	// Delivery must continue for clients via the new consumer leader.
+	received := 0
+	checkFor(t, 15*time.Second, 200*time.Millisecond, func() error {
+		msgs, err := sub.Fetch(1, nats.MaxWait(time.Second))
+		if err != nil {
+			return err
+		}
+		for _, m := range msgs {
+			if err := m.AckSync(); err != nil {
+				return err
+			}
+		}
+		received += len(msgs)
+		if received < 5 {
+			return fmt.Errorf("received %d of 5 messages", received)
+		}
+		return nil
+	})
+}
+
 func TestJetStreamClusterMalformedMetaEntrySetsWriteErr(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()

@@ -1166,6 +1166,10 @@ func (js *jetStream) isConsumerHealthy(mset *stream, sa *streamAssignment, consu
 		nrgWerr = node.GetWriteErr()
 	}
 	consumerWerr := o.getWriteErr()
+	// A consumer on this server reads from this server's copy of the stream,
+	// so a critical stream write error makes the consumer unhealthy here even
+	// though its own Raft group is fine.
+	streamWerr := mset.getWriteErr()
 	switch {
 	case rc <= 1:
 		return nil // No further checks for R=1 consumers
@@ -1199,6 +1203,9 @@ func (js *jetStream) isConsumerHealthy(mset *stream, sa *streamAssignment, consu
 
 	case consumerWerr != nil:
 		return fmt.Errorf("consumer write error: %v", consumerWerr)
+
+	case streamWerr != nil:
+		return fmt.Errorf("stream write error: %v", streamWerr)
 
 	case starting && !hasApplied(node):
 		// A new group that hasn't applied anything has nothing to catch up on yet.

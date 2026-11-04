@@ -1777,6 +1777,25 @@ func (o *consumer) setLeader(isLeader bool, term uint64) error {
 			return nil
 		}
 
+		// Refuse leadership if our local copy of the parent stream failed with a
+		// critical write error. The copy is frozen, so we would deliver nothing
+		// while reporting no pending messages. Step down and become an observer
+		// so a peer with a healthy stream replica takes over.
+		if werr := mset.getWriteErr(); werr != nil {
+			o.mu.Lock()
+			s, acc, stream, name := o.srv, o.acc, o.stream, o.name
+			o.leader.Store(false)
+			node := o.node
+			o.mu.Unlock()
+			s.Warnf("JetStream consumer '%s > %s > %s' stepping down as leader, stream has critical write error: %v",
+				acc.Name, stream, name, werr)
+			if node != nil {
+				node.StepDown()
+				node.SetObserver(true)
+			}
+			return werr
+		}
+
 		if needsSelect {
 			o.mu.Lock()
 			if err := o.selectStartingSeqNo(); err != nil {

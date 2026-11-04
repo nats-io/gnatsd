@@ -9793,6 +9793,21 @@ func (mset *stream) setWriteErrLocked(err error) {
 		node.StepDown()
 		node.SetObserver(true)
 	}
+
+	// Our copy of the stream is now frozen, but the Raft groups of its consumers
+	// are independent and stay healthy. A consumer leader on this server would
+	// keep reading from the frozen copy and silently stop delivering, reporting
+	// zero pending. Step those consumers down and make them observers so
+	// leadership moves to a peer with a healthy stream replica.
+	// Do this outside the stream lock.
+	go func() {
+		for _, o := range mset.getConsumers() {
+			if node := o.raftNode(); node != nil {
+				node.StepDown()
+				node.SetObserver(true)
+			}
+		}
+	}()
 }
 
 // getWriteErr returns the write error stored in the stream (if any).
