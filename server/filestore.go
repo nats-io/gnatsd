@@ -194,6 +194,7 @@ type fileStore struct {
 	fcfg        FileStoreConfig
 	syncAlways  atomic.Bool // Effective SyncAlways behavior for lock-free reads.
 	syncOnFlush atomic.Bool // Effective sync on flush behavior. True only if SyncAlways and replicas > 1.
+	logBacked   bool        // Writes are backed by the stream's Raft log, which relaxes SyncAlways and allows async flush.
 	prf         keyGen
 	oldprf      keyGen
 	aek         cipher.AEAD
@@ -467,6 +468,8 @@ func newFileStoreWithCreatedAndMode(fcfg FileStoreConfig, cfg StreamConfig, crea
 	}
 	fs.syncAlways.Store(fcfg.SyncAlways && !fcfg.SyncOnFlush)
 	fs.syncOnFlush.Store(fcfg.SyncOnFlush)
+	// A replicated stream is created clustered, the stream updates it when its write mode changes.
+	fs.logBacked = cfg.Replicas > 1
 
 	// Register with access time service.
 	ats.Register()
@@ -683,6 +686,14 @@ func (fs *fileStore) setCreatedTime(created time.Time) {
 	fs.mu.Unlock()
 }
 
+// setLogBackedLocked sets whether writes are backed by a Raft log.
+// Lock should be held.
+func (fs *fileStore) setLogBackedLocked(logBacked bool) error {
+	fs.logBacked = logBacked
+	fs.resetDurabilitySettingsLocked()
+	return fs.updateAsyncFlushLocked()
+}
+
 func (fs *fileStore) updateDurabilitySettingsLocked(syncOnFlush bool) {
 	if !fs.fcfg.SyncAlways {
 		return
@@ -701,10 +712,11 @@ func (fs *fileStore) updateDurabilitySettingsLocked(syncOnFlush bool) {
 }
 
 func (fs *fileStore) resetDurabilitySettingsLocked() {
-	fs.updateDurabilitySettingsLocked(fs.cfg.Replicas > 1)
+	fs.updateDurabilitySettingsLocked(fs.logBacked)
 }
 
-// updateAsyncFlushLocked enables or disables async flush based on replication and persist mode.
+// updateAsyncFlushLocked enables or disables async flush based on whether
+// writes are backed by a Raft log and the persist mode.
 // Lock should be held.
 func (fs *fileStore) updateAsyncFlushLocked() error {
 	lmb := fs.lmb
@@ -712,7 +724,7 @@ func (fs *fileStore) updateAsyncFlushLocked() error {
 		return nil
 	}
 	// Enable/disable async flush depending on if it's supported and already initialized.
-	supportsAsyncFlush := !fs.fcfg.SyncAlways && fs.cfg.Replicas > 1
+	supportsAsyncFlush := !fs.fcfg.SyncAlways && fs.logBacked
 
 	// Async persist mode opts in to async flushing,
 	// sync always would also be disabled if it was configured.
@@ -733,6 +745,8 @@ func (fs *fileStore) updateAsyncFlushLocked() error {
 			close(lmb.qch)
 			lmb.qch = nil
 		}
+		// A new flush loop can spin up before the old one exits.
+		lmb.fch, lmb.flusher = nil, false
 		_, err := lmb.flushPendingMsgsLocked()
 		lmb.mu.Unlock()
 		if err != nil {
@@ -6786,14 +6800,13 @@ func (mb *msgBlock) kickFlusher() {
 	kickFlusher(mb.fch)
 }
 
-func (mb *msgBlock) setInFlusher() {
+func (mb *msgBlock) clearInFlusher(fch chan struct{}) {
 	mb.mu.Lock()
-	mb.flusher = true
-	mb.mu.Unlock()
-}
-
-func (mb *msgBlock) clearInFlusher() {
-	mb.mu.Lock()
+	// A newer flush loop took over after ours was stopped.
+	if mb.fch != fch {
+		mb.mu.Unlock()
+		return
+	}
 	mb.flusher = false
 	if mb.qch != nil {
 		close(mb.qch)
@@ -6808,8 +6821,7 @@ func (mb *msgBlock) clearInFlusher() {
 
 // flushLoop watches for messages, index info, or recently closed msg block updates.
 func (mb *msgBlock) flushLoop(fch, qch chan struct{}) {
-	mb.setInFlusher()
-	defer mb.clearInFlusher()
+	defer mb.clearInFlusher(fch)
 
 	for {
 		select {

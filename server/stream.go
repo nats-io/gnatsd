@@ -564,6 +564,10 @@ type stream struct {
 	// observe a prefix of an inflight batch.
 	isolateMu sync.RWMutex
 
+	// Held for reading while a write decides between storing locally and proposing, the migration holds it to switch.
+	writeMu sync.RWMutex
+	local   bool // Writes go to the store directly, even though we have a node. The migration switches it holding both writeMu and mu.
+
 	// The current last subscription ID for the subscriptions through `client`.
 	// Those subscriptions are for the subjects filters being listened to and captured by the stream.
 	sid atomic.Uint64
@@ -1326,6 +1330,11 @@ func (mset *stream) setStreamAssignment(sa *streamAssignment) {
 
 	// Set our node.
 	mset.node = node
+	// Without a node, writes are always local.
+	if node == nil {
+		mset.local = false
+	}
+	mset.syncStoreWriteModeLocked()
 
 	// Stop catching up peers if they're no longer part of the group.
 	for peer := range mset.catchups {
@@ -3494,6 +3503,9 @@ func (si *sourceInfo) isCurrentSub(cname string) bool {
 
 // processInboundMirrorMsg handles processing messages bound for a stream.
 func (mset *stream) processInboundMirrorMsg(m *inMsg) bool {
+	// Keep the write mode until the message is stored or proposed.
+	mset.writeMu.RLock()
+	defer mset.writeMu.RUnlock()
 	mset.mu.Lock()
 	if mset.mirror == nil {
 		mset.mu.Unlock()
@@ -4018,9 +4030,19 @@ func (mset *stream) setupMirrorConsumer() error {
 		mset.mu.Unlock()
 		wg.Wait()
 
+		var writeHeld bool
+		defer func() {
+			if writeHeld {
+				mset.writeMu.RUnlock()
+			}
+		}()
+
 	SELECT:
 		select {
 		case ccr := <-respCh:
+			// Keep the write mode while skipping messages below.
+			mset.writeMu.RLock()
+			writeHeld = true
 			mset.mu.Lock()
 			// Mirror config has been removed.
 			if mset.mirror == nil {
@@ -4053,6 +4075,9 @@ func (mset *stream) setupMirrorConsumer() error {
 					}
 					mset.outq.send(newJSPubMsg(subject, _EMPTY_, reply, nil, b, nil, 0))
 					mset.mu.Unlock()
+					// Don't hold writes while waiting for the response.
+					mset.writeMu.RUnlock()
+					writeHeld = false
 					goto SELECT
 				}
 				mset.unsubscribe(crSub)
@@ -4854,6 +4879,9 @@ func (mset *stream) clearStalledFlowControl(si *sourceInfo) {
 
 // processInboundSourceMsg handles processing other stream messages bound for this stream.
 func (mset *stream) processInboundSourceMsg(si *sourceInfo, m *inMsg) bool {
+	// Keep the write mode until the message is stored or proposed.
+	mset.writeMu.RLock()
+	defer mset.writeMu.RUnlock()
 	mset.mu.Lock()
 	// If we are no longer the leader cancel this subscriber.
 	if !mset.isLeader() {
@@ -5536,6 +5564,9 @@ func (mset *stream) setupStore(fsCfg *FileStoreConfig, recovering bool) error {
 	// This will fire the callback but we do not require the lock since md will be 0 here.
 	mset.store.RegisterStorageUpdates(mset.storeUpdates)
 	mset.store.RegisterStorageRemoveMsg(func(seq uint64) {
+		// Keep the write mode until the message is removed or its removal proposed.
+		mset.writeMu.RLock()
+		defer mset.writeMu.RUnlock()
 		if mset.IsClustered() {
 			mset.mu.RLock()
 			if mset.isLeader() {
@@ -5548,6 +5579,9 @@ func (mset *stream) setupStore(fsCfg *FileStoreConfig, recovering bool) error {
 		}
 	})
 	mset.store.RegisterProcessJetStreamMsg(func(im *inMsg) {
+		// Keep the write mode until the message is stored or proposed.
+		mset.writeMu.RLock()
+		defer mset.writeMu.RUnlock()
 		if mset.IsClustered() {
 			if mset.IsLeader() {
 				mset.processClusteredInboundMsg(im.subj, im.rply, im.hdr, im.msg, im.mt, true)
@@ -6030,7 +6064,34 @@ func (mset *stream) IsClustered() bool {
 
 // Lock should be held.
 func (mset *stream) isClustered() bool {
-	return mset.node != nil
+	return mset.node != nil && !mset.local
+}
+
+// clusteredNode returns the node writes are proposed to, or nil if writes are stored locally.
+// Lock should be held.
+func (mset *stream) clusteredNode() RaftNode {
+	if mset.local {
+		return nil
+	}
+	return mset.node
+}
+
+// setLocalLocked sets whether writes go to the store directly, even though we have a node.
+// Lock should be held.
+func (mset *stream) setLocalLocked(local bool) {
+	mset.local = local
+	mset.syncStoreWriteModeLocked()
+}
+
+// syncStoreWriteModeLocked tells the store whether writes are backed by the Raft log, which it relies on for durability.
+// Lock should be held.
+func (mset *stream) syncStoreWriteModeLocked() {
+	if fs, ok := mset.store.(*fileStore); ok {
+		fs.mu.Lock()
+		// A flush error is kept as the block's write error, and returned on the next write.
+		_ = fs.setLogBackedLocked(mset.isClustered())
+		fs.mu.Unlock()
+	}
 }
 
 // Used if we have to queue things internally to avoid the route/gw path.
@@ -7230,7 +7291,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			outq.sendMsg(reply, response)
 		}
 		// Stepdown regardless.
-		if node := mset.node; node != nil {
+		if node := mset.clusteredNode(); node != nil {
 			node.StepDown()
 		}
 		return NewJSInsufficientResourcesError()
@@ -7580,7 +7641,10 @@ func (mset *stream) processJetStreamAtomicBatchMsg(batchId, subject, reply strin
 	if js.limitsExceeded(stype) {
 		s.resourcesExceededError(stype)
 		// Stepdown regardless.
-		if node := mset.raftNode(); node != nil {
+		mset.mu.RLock()
+		node := mset.clusteredNode()
+		mset.mu.RUnlock()
+		if node != nil {
 			node.StepDown()
 		}
 		return respondError(NewJSInsufficientResourcesError())
@@ -8078,7 +8142,10 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 	if js.limitsExceeded(stype) {
 		s.resourcesExceededError(stype)
 		// Stepdown regardless.
-		if node := mset.raftNode(); node != nil {
+		mset.mu.RLock()
+		node := mset.clusteredNode()
+		mset.mu.RUnlock()
+		if node != nil {
 			node.StepDown()
 		}
 		return respondError(NewJSInsufficientResourcesError())
@@ -8652,9 +8719,10 @@ func (mset *stream) internalLoop() {
 			c.flushClients(0)
 			outq.recycle(&pms)
 		case <-msgs.ch:
-			// This can possibly change now so needs to be checked here.
-			isClustered := mset.IsClustered()
 			ims := msgs.pop()
+			// Keep the write mode until the messages are stored or proposed.
+			mset.writeMu.RLock()
+			isClustered := mset.IsClustered()
 			for _, im := range ims {
 				// If we are clustered we need to propose this message to the underlying raft group.
 				if batch, err := getFastBatch(im.rply, im.hdr); batch != nil || err {
@@ -8669,6 +8737,7 @@ func (mset *stream) internalLoop() {
 				}
 				im.returnToPool()
 			}
+			mset.writeMu.RUnlock()
 			msgs.recycle(&ims)
 		case <-gets.ch:
 			dgs := gets.pop()
@@ -9360,6 +9429,10 @@ func (mset *stream) ackMsg(o *consumer, seq uint64) bool {
 		return false
 	}
 
+	// Keep the write mode until the message is removed or its removal proposed.
+	mset.writeMu.RLock()
+	defer mset.writeMu.RUnlock()
+
 	// Don't make this RLock(). We need to have only 1 running at a time to gauge interest across all consumers.
 	mset.mu.Lock()
 	if mset.closed.Load() || mset.cfg.Retention == LimitsPolicy {
@@ -9789,7 +9862,7 @@ func (mset *stream) setWriteErrLocked(err error) {
 	})
 
 	// If stream is replicated, put it in observer mode to make sure another server can pick it up.
-	if node := mset.node; node != nil {
+	if node := mset.clusteredNode(); node != nil {
 		node.StepDown()
 		node.SetObserver(true)
 	}

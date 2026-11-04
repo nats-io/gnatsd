@@ -43,7 +43,8 @@ type RaftNode interface {
 	LoadLastSnapshot() (uint64, []byte, error)
 	InstallSnapshot(snap []byte, force bool) error
 	CreateSnapshotCheckpoint(force bool) (RaftNodeCheckpoint, error)
-	SendSnapshot(snap []byte) error
+	SendSnapshot(term uint64, snap []byte) error
+	LegacySendSnapshot(snap []byte) error
 	NeedSnapshot() bool
 	SnapshotInCurrentTerm() bool
 	SendHeartbeat()
@@ -52,6 +53,7 @@ type RaftNode interface {
 	State() RaftState
 	Size() (entries, bytes uint64)
 	Progress() (index, commit, applied uint64)
+	LogDrained(term uint64) (bool, error)
 	Leader() bool
 	LeaderSince() *time.Time
 	Quorum() bool
@@ -211,7 +213,7 @@ type raft struct {
 	processed uint64 // Index of the most recently processed commit
 	applied   uint64 // Index of the most recently applied commit
 	papplied  uint64 // First sequence of our log, matches when we last installed a snapshot.
-	sterm     uint64 // Term in which we last installed a snapshot
+	sterm     uint64 // Term in which we last installed or sent a snapshot
 
 	membChange *membChange // Uncommitted membership change entry at a specific log index.
 
@@ -1684,10 +1686,30 @@ func (n *raft) encodeSnapshot(snap *snapshot) []byte {
 	return buf[:wi]
 }
 
-// SendSnapshot will send the latest snapshot as a normal AE.
+// SendSnapshot will send the latest snapshot as a normal AE, if we're leader in the given term.
 // Should only be used when the upper layers know this is most recent.
-// Used when restoring streams, moving a stream from R1 to R>1, etc.
-func (n *raft) SendSnapshot(data []byte) error {
+// Used when restoring streams, and switching from local to replicated writes.
+func (n *raft) SendSnapshot(term uint64, data []byte) error {
+	n.Lock()
+	defer n.Unlock()
+	if state := n.State(); state != Leader || term != n.term {
+		n.debug("Snapshot not sent, not leader (state: %v, cterm: %d, term: %d)", state, n.term, term)
+		return errNotLeader
+	}
+	if werr := n.werr; werr != nil {
+		return werr
+	}
+	if err := n.sendAppendEntryLocked([]*Entry{{EntrySnapshot, data}}, false); err != nil {
+		return err
+	}
+	// Our state is snapshotted in the log in this term.
+	n.sterm = n.term
+	return nil
+}
+
+// LegacySendSnapshot will send the latest snapshot as a normal AE, without checking whether we're leader.
+// Only used for legacy scale ups without desired state, where a new node sends before it becomes leader.
+func (n *raft) LegacySendSnapshot(data []byte) error {
 	n.Lock()
 	defer n.Unlock()
 	// Don't check if we're leader before sending and storing, this is used on scaleup.
@@ -2006,11 +2028,11 @@ func (n *raft) NeedSnapshot() bool {
 	return n.snapfile == _EMPTY_ && n.applied > 0
 }
 
-// SnapshotInCurrentTerm returns whether we installed a snapshot in the current term since starting.
+// SnapshotInCurrentTerm returns whether we installed or sent a snapshot in the current term since starting.
 func (n *raft) SnapshotInCurrentTerm() bool {
 	n.RLock()
 	defer n.RUnlock()
-	return n.snapfile != _EMPTY_ && n.sterm == n.term
+	return n.sterm > 0 && n.sterm == n.term
 }
 
 const (
@@ -2575,6 +2597,22 @@ func (n *raft) Progress() (index, commit, applied uint64) {
 	n.RLock()
 	defer n.RUnlock()
 	return n.pindex, n.commit, n.applied
+}
+
+// LogDrained returns whether everything proposed was committed and processed.
+// It errors if we're no longer the leader in the given term.
+func (n *raft) LogDrained(term uint64) (bool, error) {
+	n.RLock()
+	defer n.RUnlock()
+	// A follower can't tell whether proposals made as leader are still to be committed.
+	if n.State() != Leader || n.term != term {
+		return false, errNotLeader
+	}
+	if n.processed < n.commit {
+		return false, nil
+	}
+	// Popping moves proposals to in progress under the queue's lock, so check the queue first.
+	return n.prop.len() == 0 && n.prop.inProgress() == 0 && n.commit >= n.pindex, nil
 }
 
 // Size returns number of entries and total bytes for our WAL.

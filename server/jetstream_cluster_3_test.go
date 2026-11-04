@@ -10085,7 +10085,7 @@ func TestJetStreamClusterStreamLeaderStepsDownIfSnapshotCatchupRequired(t *testi
 	require_NoError(t, mset.store.Truncate(0))
 	// Send the snapshot containing the message. Even though we're Raft leader, we must
 	// still check we're up-to-date and if not: step down and catch up.
-	require_NoError(t, rn.SendSnapshot(snap))
+	require_NoError(t, rn.SendSnapshot(rn.Term(), snap))
 	checkFor(t, 10*time.Second, 200*time.Millisecond, func() error {
 		return checkState(t, c, globalAccountName, "TEST")
 	})
@@ -15585,12 +15585,12 @@ func TestJetStreamClusterNoResetClusteredStateAfterStreamRemap(t *testing.T) {
 	n := mset.raftNode()
 	require_NotNil(t, n)
 
-	t.Run("NodeRemoved", func(t *testing.T) {
-		// Simulate processClusterUpdateStream detecting a stream remap: the node is removed
+	t.Run("NodeDeleted", func(t *testing.T) {
+		// Simulate processClusterUpdateStream detecting a stream remap: the node is deleted
 		// and the monitor is torn down, both while the monitor is parked in catchup.
-		mset.removeNode()
-		mset.stopMonitoring()
-		require_True(t, mset.raftNode() == nil)
+		mset.deleteNode(true)
+		require_True(t, mset.raftNode() == n)
+		require_True(t, n.IsDeleted())
 
 		// This is what the parked monitor does once its catchup finally aborts.
 		require_True(t, mset.resetClusteredState(n, errCatchupAbortedNoLeader))
