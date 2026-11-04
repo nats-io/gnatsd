@@ -7666,6 +7666,22 @@ func TestNRGDontSwitchToCandidateWithInflightSelfMembershipChange(t *testing.T) 
 	// Now that we're a settled member again, we can campaign.
 	n.switchToCandidate()
 	require_Equal(t, n.State(), Candidate)
+
+	// A new leader sends our removal again, and this time it commits.
+	require_Equal(t, n.term, 2)
+	aeRemoveSelf = encode(t, &appendEntry{leader: nats0, term: 2, commit: 1, pterm: 1, pindex: 1, entries: []*Entry{newEntry(EntryRemovePeer, []byte(n.id))}})
+	aeHeartbeat := encode(t, &appendEntry{leader: nats0, term: 2, commit: 2, pterm: 2, pindex: 2, entries: nil})
+	n.processAppendEntry(aeRemoveSelf, n.aesub)
+	n.processAppendEntry(aeHeartbeat, n.aesub)
+	require_Equal(t, n.State(), Follower)
+	require_Equal(t, n.commit, 2)
+	n.Applied(2)
+	require_True(t, n.membChange == nil)
+	require_Equal(t, n.csz, 2)
+
+	// We were removed, so we must not campaign, or we'd re-add ourselves as leader.
+	n.switchToCandidate()
+	require_Equal(t, n.State(), Follower)
 }
 
 func TestNRGDontSwitchToCandidateAsManagedNodeOutsidePeerSet(t *testing.T) {
@@ -7700,12 +7716,21 @@ func TestNRGDontSwitchToCandidateAsManagedNodeOutsidePeerSet(t *testing.T) {
 	n.switchToCandidate()
 	require_Equal(t, n.State(), Candidate)
 
-	// An unmanaged group doesn't have meta-assigned members, a node outside
-	// the peer set must still be able to campaign there.
+	// An unmanaged group whose peer set is complete without us means we were removed.
 	n.switchToFollower(noLeader)
 	n.Lock()
 	n.managed = false
 	n.processPeerState(&peerState{[]string{nats0}, 1, n.extSt})
+	n.Unlock()
+	_, ok = n.peers[n.id]
+	require_False(t, ok)
+	n.switchToCandidate()
+	require_Equal(t, n.State(), Follower)
+
+	// An unmanaged group can bootstrap with fewer known peers than its cluster size.
+	// We may be missing from it, but must still be able to campaign.
+	n.Lock()
+	n.processPeerState(&peerState{[]string{nats0}, 2, n.extSt})
 	n.Unlock()
 	_, ok = n.peers[n.id]
 	require_False(t, ok)
