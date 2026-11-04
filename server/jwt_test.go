@@ -4870,8 +4870,14 @@ func TestJWTActivationRevocation(t *testing.T) {
 			Type:     jwt.Stream,
 			TokenReq: true,
 		})
+		// Revoke an account that doesn't import, which must not affect the importer.
+		_, otherPub := createKey(t)
+		aExpClaim.Exports[0].RevokeAt(otherPub, time.Now())
 		aExp1Jwt := encodeClaim(t, aExpClaim, aExpPub)
 		aExpCreds := newUser(t, aExpKp)
+
+		aExpClaim.Tags.Add("unrelated")
+		aExp2Jwt := encodeClaim(t, aExpClaim, aExpPub)
 
 		aImpKp, aImpPub := createKey(t)
 
@@ -4888,10 +4894,10 @@ func TestJWTActivationRevocation(t *testing.T) {
 		}
 
 		aExpClaim.Exports[0].RevokeAt(revPubKey, time.Now())
-		aExp2Jwt := encodeClaim(t, aExpClaim, aExpPub)
+		aExp3Jwt := encodeClaim(t, aExpClaim, aExpPub)
 
 		aExpClaim.Exports[0].ClearRevocation(revPubKey)
-		aExp3Jwt := encodeClaim(t, aExpClaim, aExpPub)
+		aExp4Jwt := encodeClaim(t, aExpClaim, aExpPub)
 
 		aImpClaim := jwt.NewAccountClaims(aImpPub)
 		aImpClaim.Name = "Import"
@@ -4921,7 +4927,7 @@ func TestJWTActivationRevocation(t *testing.T) {
 			defer removeDir(t, dirSrv) // clean jwt directory
 
 			updateJwt(t, srv.ClientURL(), sysCreds, sysJwt, 1)   // update system account jwt
-			updateJwt(t, srv.ClientURL(), sysCreds, aExp2Jwt, 1) // set account jwt without revocation
+			updateJwt(t, srv.ClientURL(), sysCreds, aExp3Jwt, 1) // set account jwt with revocation
 			updateJwt(t, srv.ClientURL(), sysCreds, aImpJwt, 1)
 
 			ncExp1 := natsConnect(t, srv.ClientURL(), nats.UserCredentials(aExpCreds))
@@ -4945,7 +4951,7 @@ func TestJWTActivationRevocation(t *testing.T) {
 			defer removeDir(t, dirSrv) // clean jwt directory
 
 			updateJwt(t, srv.ClientURL(), sysCreds, sysJwt, 1)   // update system account jwt
-			updateJwt(t, srv.ClientURL(), sysCreds, aExp1Jwt, 1) // set account jwt without revocation
+			updateJwt(t, srv.ClientURL(), sysCreds, aExp1Jwt, 1) // set account jwt with unrelated revocation
 			updateJwt(t, srv.ClientURL(), sysCreds, aImpJwt, 1)
 
 			ncExp1 := natsConnect(t, srv.ClientURL(), nats.UserCredentials(aExpCreds))
@@ -4962,19 +4968,37 @@ func TestJWTActivationRevocation(t *testing.T) {
 			require_NoError(t, err)
 			require_Equal(t, string(m1.Data), "1")
 
-			updateJwt(t, srv.ClientURL(), sysCreds, aExp2Jwt, 1) // set account jwt with revocation
+			// The import adds a shadow subscription to the exporting account.
+			aExp, err := srv.LookupAccount(aExpPub)
+			require_NoError(t, err)
+			r := aExp.sl.Match("foo")
+			require_Len(t, len(r.psubs), 1)
+			shadow := r.psubs[0]
+
+			updateJwt(t, srv.ClientURL(), sysCreds, aExp2Jwt, 1) // set account jwt with unchanged revocations
 
 			require_NoError(t, ncExp1.Publish("foo", []byte("2")))
+			m2, err := sub.NextMsg(time.Second)
+			require_NoError(t, err)
+			require_Equal(t, string(m2.Data), "2")
+			// Re-checking the import would have replaced the shadow subscription.
+			r = aExp.sl.Match("foo")
+			require_Len(t, len(r.psubs), 1)
+			require_Equal(t, r.psubs[0], shadow)
+
+			updateJwt(t, srv.ClientURL(), sysCreds, aExp3Jwt, 1) // set account jwt with revocation
+
+			require_NoError(t, ncExp1.Publish("foo", []byte("3")))
 			_, err = sub.NextMsg(time.Second)
 			require_Error(t, err)
 			require_Equal(t, err.Error(), "nats: timeout")
 
-			updateJwt(t, srv.ClientURL(), sysCreds, aExp3Jwt, 1) // set account with revocation cleared
+			updateJwt(t, srv.ClientURL(), sysCreds, aExp4Jwt, 1) // set account with revocation cleared
 
-			require_NoError(t, ncExp1.Publish("foo", []byte("3")))
-			m2, err := sub.NextMsg(time.Second)
+			require_NoError(t, ncExp1.Publish("foo", []byte("4")))
+			m3, err := sub.NextMsg(time.Second)
 			require_NoError(t, err)
-			require_Equal(t, string(m2.Data), "3")
+			require_Equal(t, string(m3.Data), "4")
 		})
 	}
 	t.Run("specific-key", func(t *testing.T) {
