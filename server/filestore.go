@@ -9794,6 +9794,10 @@ func (fs *fileStore) LoadNextMsgMulti(sl *gsl.SimpleSublist, start uint64, smp *
 			} else if err != ErrStoreMsgNotFound {
 				return nil, 0, err
 			} else {
+				// Check if we can expire.
+				if expireOk {
+					mb.tryForceExpireCache()
+				}
 				// Nothing found in this block. We missed, if first block (bi) check psim.
 				// Similar to above if start <= first seq.
 				// TODO(dlc) - For v2 track these by filter subject since they will represent filtered consumers.
@@ -9809,12 +9813,8 @@ func (fs *fileStore) LoadNextMsgMulti(sl *gsl.SimpleSublist, start uint64, smp *
 					// Right now we can only spin on first, so if we have interior sparseness need to favor checking per block fss if loaded.
 					// For v2 will track all blocks that have matches for psim.
 					if nbi > i {
-						i = nbi - 1 // For the iterator condition i++
+						i = nbi - 1 // Offset the loop's i++
 					}
-				}
-				// Check if we can expire.
-				if expireOk {
-					mb.tryForceExpireCache()
 				}
 			}
 		}
@@ -9867,6 +9867,10 @@ func (fs *fileStore) LoadNextMsg(filter string, wc bool, start uint64, sm *Store
 			} else if err != ErrStoreMsgNotFound {
 				return nil, 0, err
 			} else {
+				// Check if we can expire.
+				if expireOk {
+					mb.tryForceExpireCache()
+				}
 				// Nothing found in this block. We missed, if first block (bi) check psim.
 				// Similar to above if start <= first seq.
 				// TODO(dlc) - For v2 track these by filter subject since they will represent filtered consumers.
@@ -9884,12 +9888,8 @@ func (fs *fileStore) LoadNextMsg(filter string, wc bool, start uint64, sm *Store
 					// Right now we can only spin on first, so if we have interior sparseness need to favor checking per block fss if loaded.
 					// For v2 will track all blocks that have matches for psim.
 					if nbi > i {
-						i = nbi - 1 // For the iterator condition i++
+						i = nbi - 1 // Offset the loop's i++
 					}
-				}
-				// Check if we can expire.
-				if expireOk {
-					mb.tryForceExpireCache()
 				}
 			}
 		}
