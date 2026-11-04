@@ -676,7 +676,7 @@ func (m *maxPayloadOption) Apply(server *Server) {
 		client.mu.Lock()
 		oldMpay := atomic.LoadInt32(&client.mpay)
 		if client.acc != nil {
-			client.applyAccountPayloadLimit()
+			client.applyAccountLimits()
 		} else {
 			atomic.StoreInt32(&client.mpay, m.newValue)
 		}

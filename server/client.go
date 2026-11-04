@@ -949,20 +949,25 @@ func minLimit(value *int32, limit int32) bool {
 	return false
 }
 
-// Apply account payload limit.
+// Apply account limits
 // Lock is held on entry.
-func (c *client) applyAccountPayloadLimit() {
+// FIXME(dlc) - Should server be able to override here?
+func (c *client) applyAccountLimits() {
 	if c.acc == nil || (c.kind != CLIENT && c.kind != LEAF) {
 		return
 	}
 	atomic.StoreInt32(&c.mpay, jwt.NoLimit)
+	c.msubs = jwt.NoLimit
 	if c.opts.JWT != _EMPTY_ { // user jwt implies account
 		if uc, _ := jwt.DecodeUserClaims(c.opts.JWT); uc != nil {
 			atomic.StoreInt32(&c.mpay, clampInt64ToInt32(uc.Limits.Payload))
+			c.msubs = clampInt64ToInt32(uc.Limits.Subs)
 			if uc.IssuerAccount != _EMPTY_ && uc.IssuerAccount != uc.Issuer {
 				if scope, ok := c.acc.hasIssuer(uc.Issuer); ok {
 					if userScope, ok := scope.(*jwt.UserScope); ok {
+						// if signing key disappeared or changed and we don't get here, the client will be disconnected
 						atomic.StoreInt32(&c.mpay, clampInt64ToInt32(userScope.Template.Limits.Payload))
+						c.msubs = clampInt64ToInt32(userScope.Template.Limits.Subs)
 					}
 				}
 			}
@@ -971,6 +976,7 @@ func (c *client) applyAccountPayloadLimit() {
 
 	c.acc.mu.RLock()
 	minLimit(&c.mpay, c.acc.mpay)
+	minLimit(&c.msubs, c.acc.msubs)
 	c.acc.mu.RUnlock()
 
 	s := c.srv
@@ -980,50 +986,19 @@ func (c *client) applyAccountPayloadLimit() {
 	if mPay == 0 {
 		mPay = jwt.NoLimit
 	}
-	wasUnlimited := atomic.LoadInt32(&c.mpay) == jwt.NoLimit
-	if minLimit(&c.mpay, mPay) && !wasUnlimited {
-		c.Debugf("Max Payload set to %d from server overrides account or user config", opts.MaxPayload)
-	}
-}
-
-// Apply account limits
-// Lock is held on entry.
-// FIXME(dlc) - Should server be able to override here?
-func (c *client) applyAccountLimits() {
-	if c.acc == nil || (c.kind != CLIENT && c.kind != LEAF) {
-		return
-	}
-	c.applyAccountPayloadLimit()
-	c.msubs = jwt.NoLimit
-	if c.opts.JWT != _EMPTY_ { // user jwt implies account
-		if uc, _ := jwt.DecodeUserClaims(c.opts.JWT); uc != nil {
-			c.msubs = clampInt64ToInt32(uc.Limits.Subs)
-			if uc.IssuerAccount != _EMPTY_ && uc.IssuerAccount != uc.Issuer {
-				if scope, ok := c.acc.hasIssuer(uc.Issuer); ok {
-					if userScope, ok := scope.(*jwt.UserScope); ok {
-						// if signing key disappeared or changed and we don't get here, the client will be disconnected
-						c.msubs = clampInt64ToInt32(userScope.Template.Limits.Subs)
-					}
-				}
-			}
-		}
-	}
-
-	c.acc.mu.RLock()
-	minLimit(&c.msubs, c.acc.msubs)
-	c.acc.mu.RUnlock()
-
-	s := c.srv
-	opts := s.getOpts()
 	mSubs := int32(opts.MaxSubs)
 	if mSubs == 0 {
 		mSubs = jwt.NoLimit
 	}
-	wasUnlimited := c.msubs == jwt.NoLimit
+	wasUnlimited := atomic.LoadInt32(&c.mpay) == jwt.NoLimit
+	if minLimit(&c.mpay, mPay) && !wasUnlimited {
+		c.Debugf("Max Payload set to %d from server overrides account or user config", opts.MaxPayload)
+	}
+	wasUnlimited = c.msubs == jwt.NoLimit
 	if minLimit(&c.msubs, mSubs) && !wasUnlimited {
 		c.Debugf("Max Subscriptions set to %d from server overrides account or user config", opts.MaxSubs)
 	}
-	if c.subsAtLimit() {
+	if c.msubs != jwt.NoLimit && len(c.subs) > int(c.msubs) {
 		go func() {
 			c.maxSubsExceeded()
 			time.Sleep(20 * time.Millisecond)

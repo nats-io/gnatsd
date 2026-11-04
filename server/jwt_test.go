@@ -8624,3 +8624,58 @@ func TestReloadMaxPayloadAccountLimitsAndAsyncInfo(t *testing.T) {
 		t.Fatalf("Client B expected MaxPayload 250 in async INFO, got %d", parsedInfoB.MaxPayload)
 	}
 }
+
+func TestApplyAccountLimitsDoesNotDisconnectAtExactSubsLimit(t *testing.T) {
+	s := opTrustBasicSetup()
+	defer s.Shutdown()
+	buildMemAccResolver(s)
+
+	okp, _ := nkeys.FromSeed(oSeed)
+
+	fooKP, _ := nkeys.CreateAccount()
+	fooPub, _ := fooKP.PublicKey()
+	fooAC := jwt.NewAccountClaims(fooPub)
+	fooAC.Limits.Subs = 1
+	fooJWT, err := fooAC.Encode(okp)
+	require_NoError(t, err)
+	addAccountToMemResolver(s, fooPub, fooJWT)
+
+	nkp, _ := nkeys.CreateUser()
+	pub, _ := nkp.PublicKey()
+	nuc := jwt.NewUserClaims(pub)
+	uJWT, err := nuc.Encode(fooKP)
+	require_NoError(t, err)
+
+	c, cr, l := newClientForServer(s)
+	defer c.close()
+	var info nonceInfo
+	require_NoError(t, json.Unmarshal([]byte(l[5:]), &info))
+	sigraw, _ := nkp.Sign([]byte(info.Nonce))
+	sig := base64.RawURLEncoding.EncodeToString(sigraw)
+
+	cs := fmt.Sprintf("CONNECT {\"jwt\":%q,\"sig\":%q,\"protocol\":1}\r\nPING\r\n", uJWT, sig)
+	c.parseAsync(cs)
+	pong, err := cr.ReadString('\n')
+	require_NoError(t, err)
+	if !strings.HasPrefix(pong, "PONG") {
+		t.Fatalf("Expected PONG, got %q", pong)
+	}
+	connectInfo, err := cr.ReadString('\n')
+	require_NoError(t, err)
+	if !strings.HasPrefix(connectInfo, "INFO ") {
+		t.Fatalf("Expected initial connect INFO, got %q", connectInfo)
+	}
+
+	c.parseAsync("SUB foo 1\r\n")
+
+	c.mu.Lock()
+	c.applyAccountLimits()
+	c.mu.Unlock()
+
+	time.Sleep(50 * time.Millisecond)
+
+	c.mu.Lock()
+	closed := c.isClosed()
+	c.mu.Unlock()
+	require_False(t, closed)
+}
