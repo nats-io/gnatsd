@@ -17342,3 +17342,83 @@ func TestFileStoreCompactionPreservesRedelivery(t *testing.T) {
 		return nil
 	})
 }
+
+func TestFileStoreLogBackedFollowsWriteMode(t *testing.T) {
+	setLogBacked := func(fs *fileStore, logBacked bool) {
+		t.Helper()
+		fs.mu.Lock()
+		err := fs.setLogBackedLocked(logBacked)
+		fs.mu.Unlock()
+		require_NoError(t, err)
+	}
+	cfg := StreamConfig{Name: "zzz", Subjects: []string{"foo"}, Storage: FileStorage, Replicas: 3}
+
+	t.Run("SyncAlways", func(t *testing.T) {
+		fs, err := newFileStore(FileStoreConfig{StoreDir: t.TempDir(), SyncAlways: true, SyncOnFlush: true}, cfg)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		requireMode := func(syncAlways bool) {
+			t.Helper()
+			require_Equal(t, fs.syncAlways.Load(), syncAlways)
+			require_Equal(t, fs.syncOnFlush.Load(), !syncAlways)
+		}
+		// Backed by a Raft log, SyncAlways is relaxed.
+		requireMode(false)
+
+		// Local writes aren't in the log, every write is synced.
+		setLogBacked(fs, false)
+		requireMode(true)
+
+		// A config update for a replicated stream doesn't relax it while writes are local.
+		require_NoError(t, fs.UpdateConfig(&cfg))
+		requireMode(true)
+
+		// Back to writes through the log.
+		setLogBacked(fs, true)
+		requireMode(false)
+	})
+
+	t.Run("AsyncFlush", func(t *testing.T) {
+		fs, err := newFileStore(FileStoreConfig{StoreDir: t.TempDir(), AsyncFlush: true}, cfg)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		requireAsyncFlush := func(asyncFlush bool) {
+			t.Helper()
+			fs.mu.RLock()
+			defer fs.mu.RUnlock()
+			require_Equal(t, fs.fcfg.AsyncFlush, asyncFlush)
+			require_Equal(t, fs.fip, !asyncFlush)
+		}
+		// Backed by a Raft log, writes are flushed asynchronously.
+		requireAsyncFlush(true)
+
+		// Local writes aren't in the log, they're flushed in place.
+		setLogBacked(fs, false)
+		requireAsyncFlush(false)
+
+		// A config update for a replicated stream doesn't flush asynchronously while writes are local.
+		require_NoError(t, fs.UpdateConfig(&cfg))
+		requireAsyncFlush(false)
+
+		// Back to writes through the log.
+		setLogBacked(fs, true)
+		requireAsyncFlush(true)
+
+		// Switching back right away, before the old flush loop exits, still flushes asynchronously.
+		setLogBacked(fs, false)
+		setLogBacked(fs, true)
+		_, _, err = fs.StoreMsg("foo", nil, []byte("msg"), 0)
+		require_NoError(t, err)
+		fs.mu.RLock()
+		lmb := fs.lmb
+		fs.mu.RUnlock()
+		checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+			if pending := lmb.pendingWriteSize(); pending > 0 {
+				return fmt.Errorf("%d bytes not flushed", pending)
+			}
+			return nil
+		})
+	})
+}
