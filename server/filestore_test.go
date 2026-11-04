@@ -12465,6 +12465,68 @@ func TestFileStoreSourcesRecoveredOneMessageAfterFlush(t *testing.T) {
 	require_Equal(t, fs.SourcesState()["ORIGIN > >"].Seq, last)
 }
 
+func TestFileStorePerMessageStateIndexWrittenWithoutNewMessages(t *testing.T) {
+	tests := []struct {
+		title  string
+		file   string
+		enable func(cfg *StreamConfig)
+	}{
+		{
+			title:  "Sources",
+			file:   sourcesStreamStateFile,
+			enable: func(cfg *StreamConfig) { cfg.Sources = []*StreamSource{{Name: "ORIGIN"}} },
+		},
+		{
+			title:  "TTL",
+			file:   filepath.Join(msgDir, ttlStreamStateFile),
+			enable: func(cfg *StreamConfig) { cfg.AllowMsgTTL = true },
+		},
+		{
+			title:  "Schedules",
+			file:   filepath.Join(msgDir, msgSchedulingStreamStateFile),
+			enable: func(cfg *StreamConfig) { cfg.AllowMsgSchedules = true },
+		},
+	}
+	for _, test := range tests {
+		for _, restart := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/Restart=%v", test.title, restart), func(t *testing.T) {
+				dir := t.TempDir()
+				fcfg := FileStoreConfig{StoreDir: dir}
+				cfg := StreamConfig{Name: "zzz", Subjects: []string{"foo"}, Storage: FileStorage}
+
+				fs, err := newFileStore(fcfg, cfg)
+				require_NoError(t, err)
+				_, _, err = fs.StoreMsg("foo", nil, nil, 0)
+				require_NoError(t, err)
+				require_NoError(t, fs.forceWriteFullState())
+
+				test.enable(&cfg)
+				if restart {
+					require_NoError(t, fs.Stop())
+					fs, err = newFileStore(fcfg, cfg)
+					require_NoError(t, err)
+				} else {
+					require_NoError(t, fs.UpdateConfig(&cfg))
+				}
+				// Nothing else is stored before stopping.
+				require_NoError(t, fs.Stop())
+
+				_, err = os.Stat(filepath.Join(dir, test.file))
+				require_NoError(t, err)
+
+				// The index is current, so the next start has nothing to scan or write.
+				fs, err = newFileStore(fcfg, cfg)
+				require_NoError(t, err)
+				defer fs.Stop()
+				fs.mu.RLock()
+				dirty := fs.dirty
+				fs.mu.RUnlock()
+				require_Equal(t, dirty, 0)
+			})
+		}
+	}
+}
+
 func TestFileStoreSourcesRecoveredFromPre210Header(t *testing.T) {
 	dir := t.TempDir()
 	fcfg := FileStoreConfig{StoreDir: dir}

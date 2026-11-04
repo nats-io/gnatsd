@@ -2382,6 +2382,8 @@ func (fs *fileStore) recoverPerMessageState() error {
 			if err := fs.recoverSourcesBackwardScan(sourcesSeq, sourcesScan); err != nil {
 				return err
 			}
+			// Persist the recovered state, so the next start doesn't scan again.
+			fs.dirty++
 		}
 		return nil
 	}
@@ -2487,6 +2489,8 @@ func (fs *fileStore) recoverPerMessageState() error {
 			mb.finishedWithCache()
 			mb.mu.Unlock()
 		}
+		// Persist the recovered state, so the next start doesn't scan again.
+		fs.dirty++
 	}
 	return nil
 }
