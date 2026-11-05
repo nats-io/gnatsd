@@ -9246,7 +9246,15 @@ func Benchmark_FileStoreCreateConsumerStores(b *testing.B) {
 	}
 }
 
+func BenchmarkFileStoreLoadMsgRejectedMessages(b *testing.B) {
+	benchmarkFileStoreLoadMsgRejectedMessages(b, false)
+}
+
 func BenchmarkFileStoreLoadMsgMultiRejectedMessages(b *testing.B) {
+	benchmarkFileStoreLoadMsgRejectedMessages(b, true)
+}
+
+func benchmarkFileStoreLoadMsgRejectedMessages(b *testing.B, multi bool) {
 	for _, test := range []struct {
 		name string
 		msgs int
@@ -9275,7 +9283,9 @@ func BenchmarkFileStoreLoadMsgMultiRejectedMessages(b *testing.B) {
 
 			sl := gsl.NewSimpleSublist()
 			require_NoError(b, sl.Insert("data.match", struct{}{}))
-			require_NoError(b, sl.Insert("data.absent", struct{}{}))
+			if multi {
+				require_NoError(b, sl.Insert("data.absent", struct{}{}))
+			}
 			for _, reverse := range []bool{false, true} {
 				name, loadMsg := "Next", fs.LoadNextMsgMulti
 				start, want := uint64(2), last
