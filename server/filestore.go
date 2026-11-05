@@ -3131,6 +3131,7 @@ func (mb *msgBlock) firstMatchingMulti(sl *gsl.SimpleSublist, start uint64, sm *
 		sm = new(StoreMsg)
 	}
 
+	var scanMsg StoreMsg
 	for seq := fseq; seq <= lseq; seq++ {
 		if mb.dmap.Exists(seq) {
 			// Optimisation to avoid calling cacheLookup which hits time.Now().
@@ -3139,14 +3140,15 @@ func (mb *msgBlock) firstMatchingMulti(sl *gsl.SimpleSublist, start uint64, sm *
 			continue
 		}
 		llseq := mb.llseq
-		fsm, err := mb.cacheLookup(seq, sm)
+		fsm, err := mb.cacheLookupNoCopy(seq, &scanMsg)
 		if err != nil {
 			continue
 		}
 		expireOk := !useIndex && seq == lseq && mb.llseq != llseq && mb.llseq == seq
 		updateLLTS = false // cacheLookup already updated it.
 		if sl.HasInterest(fsm.subj) {
-			return fsm, expireOk, nil
+			fsm.deepCopy(sm)
+			return sm, expireOk, nil
 		}
 		// If we are here we did not match, so put the llseq back.
 		mb.llseq = llseq
@@ -3380,6 +3382,7 @@ func (mb *msgBlock) prevMatchingMulti(sl *gsl.SimpleSublist, start uint64, sm *S
 		sm = new(StoreMsg)
 	}
 
+	var scanMsg StoreMsg
 	for seq := end; seq >= lseq; seq-- {
 		if mb.dmap.Exists(seq) {
 			// Optimisation to avoid calling cacheLookup which hits time.Now().
@@ -3388,14 +3391,15 @@ func (mb *msgBlock) prevMatchingMulti(sl *gsl.SimpleSublist, start uint64, sm *S
 			continue
 		}
 		llseq := mb.llseq
-		fsm, err := mb.cacheLookup(seq, sm)
+		fsm, err := mb.cacheLookupNoCopy(seq, &scanMsg)
 		if err != nil {
 			continue
 		}
 		expireOk := !useIndex && seq == lseq && mb.llseq != llseq && mb.llseq == seq
 		updateLLTS = false // cacheLookup already updated it.
 		if sl.HasInterest(fsm.subj) {
-			return fsm, expireOk, nil
+			fsm.deepCopy(sm)
+			return sm, expireOk, nil
 		}
 		// If we are here we did not match, so put the llseq back.
 		mb.llseq = llseq
