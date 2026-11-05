@@ -941,7 +941,7 @@ func (ms *memStore) multiLastSeqsLocked(filters []string, maxSeq uint64, maxAllo
 			} else if ss.Msgs > 1 {
 				// The last is greater than maxSeq.
 				s := bytesToString(subj)
-				for seq := maxSeq; seq > 0; seq-- {
+				for seq := maxSeq; seq >= ss.First; seq-- {
 					if sm, ok := ms.msgs[seq]; ok && sm.subj == s {
 						addIfNotDupe(seq)
 						break
@@ -1620,7 +1620,7 @@ func (ms *memStore) PurgeEx(subject string, sequence, keep uint64) (purged uint6
 	// sequence filter; sequence >= 1 clamps the upper bound to sequence-1
 	// (so sequence == 1 purges nothing).
 	last := ss.Last
-	if sequence >= 1 {
+	if sequence >= 1 && sequence <= last {
 		last = sequence - 1
 	}
 	var bytes, lowSeq uint64
@@ -2974,8 +2974,12 @@ func (o *consumerMemStore) UpdateAcks(dseq, sseq uint64, explicit bool) error {
 	// We do this regardless.
 	delete(o.state.Redelivered, sseq)
 
+	// Check for AckAll (or AckFlowControl which functions like AckAll).
+	ackAll := o.cfg.AckPolicy == AckAll || o.cfg.AckPolicy == AckFlowControl
+
 	// On restarts the old leader may get a replay from the raft logs that are old.
-	if dseq <= o.state.AckFloor.Consumer {
+	// AckAll checks the stream sequence, since older servers could set the delivery floor above pending messages.
+	if (ackAll && sseq <= o.state.AckFloor.Stream) || (!ackAll && dseq <= o.state.AckFloor.Consumer) {
 		return nil
 	}
 
@@ -2986,7 +2990,11 @@ func (o *consumerMemStore) UpdateAcks(dseq, sseq uint64, explicit bool) error {
 	// Check for AckAll here (or AckFlowControl which functions like AckAll).
 	// An explicit ack is scoped to this message only, so it falls through to
 	// the per-message path even under AckAll.
-	if !explicit && (o.cfg.AckPolicy == AckAll || o.cfg.AckPolicy == AckFlowControl) {
+	if !explicit && ackAll {
+		// Use the original delivery sequence.
+		if p := o.state.Pending[sseq]; dseq > p.Sequence && p.Sequence > 0 {
+			dseq = p.Sequence
+		}
 		sgap := sseq - o.state.AckFloor.Stream
 		o.state.AckFloor.Consumer = dseq
 		o.state.AckFloor.Stream = sseq
@@ -3002,6 +3010,11 @@ func (o *consumerMemStore) UpdateAcks(dseq, sseq uint64, explicit bool) error {
 				delete(o.state.Pending, seq)
 				delete(o.state.Redelivered, seq)
 			}
+		}
+		// Nothing pending, so move the floor up to the last delivered message.
+		if len(o.state.Pending) == 0 {
+			o.state.AckFloor.Consumer = o.state.Delivered.Consumer
+			o.state.AckFloor.Stream = o.state.Delivered.Stream
 		}
 		return nil
 	}

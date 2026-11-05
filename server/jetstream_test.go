@@ -13149,6 +13149,110 @@ func TestJetStreamMemoryCorruption(t *testing.T) {
 	}
 }
 
+func TestJetStreamRecoverStreamErrorPreservesData(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+	acc := s.GlobalAccount()
+	storeDir := filepath.Join(s.JetStreamConfig().StoreDir, globalAccountName, streamsDir, "TEST")
+	cfg := StreamConfig{Name: "TEST", Storage: FileStorage, Subjects: []string{"foo"}, MaxBytes: 1024}
+	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: 64}, cfg)
+	require_NoError(t, err)
+	defer fs.Stop()
+	for seq := uint64(1); seq <= 2; seq++ {
+		require_NoError(t, fs.StoreRawMsg("foo", nil, bytes.Repeat([]byte("A"), 64), seq, time.Now().Add(-time.Hour).UnixNano(), 0, false))
+	}
+	require_Equal(t, fs.numMsgBlocks(), 2)
+	blockPath := fs.getFirstBlock().mfn
+	lastBlockPath := fs.lmb.mfn
+	require_NoError(t, fs.Stop())
+
+	original, err := os.ReadFile(blockPath)
+	require_NoError(t, err)
+	lastBlock, err := os.ReadFile(lastBlockPath)
+	require_NoError(t, err)
+	meta := CompressionInfo{Algorithm: S2Compression, OriginalSize: uint64(len(original))}
+	corrupt := meta.MarshalMetadata()
+	require_NoError(t, os.WriteFile(blockPath, corrupt, defaultFilePerms))
+
+	cfg.MaxAge = time.Minute
+	for _, test := range []struct {
+		name string
+		add  func(*StreamConfig) (*stream, error)
+	}{
+		{"Recover", acc.recoverStream},
+		{"Create", acc.addStream},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mset, err := test.add(&cfg)
+			require_Error(t, err, errors.New("compressed buffer is too short"))
+			require_True(t, mset == nil)
+			for path, expected := range map[string][]byte{blockPath: corrupt, lastBlockPath: lastBlock} {
+				actual, err := os.ReadFile(path)
+				require_NoError(t, err)
+				require_True(t, bytes.Equal(actual, expected))
+			}
+			_, reserved, err := s.JetStreamReservedResources()
+			require_NoError(t, err)
+			require_Equal(t, reserved, 0)
+			_, err = acc.lookupStream("TEST")
+			require_Error(t, err)
+			_, registered := s.ipQueues.Load("[ACC:$G] stream 'TEST' messages")
+			require_False(t, registered)
+		})
+	}
+
+	require_NoError(t, os.WriteFile(blockPath, original, defaultFilePerms))
+	cfg.MaxAge = 0
+	mset, err := acc.recoverStream(&cfg)
+	require_NoError(t, err)
+	require_Equal(t, mset.state().Msgs, 2)
+	require_NoError(t, mset.delete())
+	_, err = os.Stat(storeDir)
+	require_True(t, os.IsNotExist(err))
+}
+
+func TestJetStreamCreateStreamStoreErrorCleanup(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("Existing=%t", existing), func(t *testing.T) {
+			opts := DefaultTestOptions
+			opts.Port = -1
+			opts.JetStream = true
+			opts.StoreDir = t.TempDir()
+			// Fail encryption setup after the file store creates its directories.
+			opts.JetStreamKey = "test-key"
+			opts.JetStreamCipher = NoCipher
+			s := RunServer(&opts)
+			defer s.Shutdown()
+
+			storeDir := filepath.Join(s.JetStreamConfig().StoreDir, globalAccountName, streamsDir, "TEST")
+			marker := filepath.Join(storeDir, "existing")
+			if existing {
+				require_NoError(t, os.MkdirAll(storeDir, defaultDirPerms))
+				require_NoError(t, os.WriteFile(marker, []byte("keep"), defaultFilePerms))
+			}
+			acc := s.GlobalAccount()
+			mset, err := acc.addStream(&StreamConfig{Name: "TEST", Storage: FileStorage, MaxBytes: 1024})
+			require_Error(t, err, errUnknownCipher)
+			require_True(t, mset == nil)
+			if existing {
+				data, err := os.ReadFile(marker)
+				require_NoError(t, err)
+				require_Equal(t, string(data), "keep")
+			} else {
+				_, err := os.Stat(storeDir)
+				require_True(t, os.IsNotExist(err))
+			}
+			_, reserved, err := s.JetStreamReservedResources()
+			require_NoError(t, err)
+			require_Equal(t, reserved, 0)
+			_, err = acc.lookupStream("TEST")
+			require_Error(t, err)
+			_, registered := s.ipQueues.Load("[ACC:$G] stream 'TEST' messages")
+			require_False(t, registered)
+		})
+	}
+}
+
 func TestJetStreamRecoverBadStreamSubjects(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	sd := s.JetStreamConfig().StoreDir
@@ -24253,6 +24357,42 @@ func TestJetStreamOfflineStreamAndConsumerAfterDowngrade(t *testing.T) {
 	require_Equal(t, cl.Missing[0], "DowngradeConsumerTest")
 	require_Len(t, len(cl.Offline), 1)
 	require_Equal(t, cl.Offline["DowngradeConsumerTest"], offlineReason)
+}
+
+func TestJetStreamOfflineConsumerWithUnknownEnumAfterDowngrade(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+	port := s.getOpts().Port
+	sd := s.JetStreamConfig().StoreDir
+
+	mset, err := s.globalAccount().addStream(&StreamConfig{Name: "TEST", Storage: FileStorage})
+	require_NoError(t, err)
+	_, err = mset.addConsumer(&ConsumerConfig{
+		Durable:   "CONSUMER",
+		AckPolicy: AckExplicit,
+		Metadata:  map[string]string{"_nats.req.level": strconv.Itoa(math.MaxInt)},
+	})
+	require_NoError(t, err)
+	s.Shutdown()
+
+	metafile := filepath.Join(sd, globalAccountName, streamsDir, "TEST", consumerDir, "CONSUMER", JetStreamMetaFile)
+	buf, err := os.ReadFile(metafile)
+	require_NoError(t, err)
+	nbuf := bytes.Replace(buf, []byte(`"ack_policy":"explicit"`), []byte(`"ack_policy":"unknown"`), 1)
+	require_False(t, bytes.Equal(buf, nbuf))
+	require_NoError(t, os.WriteFile(metafile, nbuf, defaultFilePerms))
+
+	s = RunJetStreamServerOnPort(port, sd)
+	defer s.Shutdown()
+
+	mset, err = s.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	require_True(t, mset.closed.Load())
+	obs := mset.getPublicConsumers()
+	require_Len(t, len(obs), 1)
+	require_True(t, obs[0].isClosed())
+	require_Equal(t, obs[0].name, "CONSUMER")
+	require_Equal(t, obs[0].offlineReason, `unsupported - config error: invalid value "unknown" for field "ack_policy"`)
 }
 
 func TestJetStreamPersistModeAsync(t *testing.T) {

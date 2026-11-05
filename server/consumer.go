@@ -544,9 +544,12 @@ type consumer struct {
 	inMonitor bool
 
 	// R>1 proposals
-	pch   chan struct{}
-	phead *proposal
-	ptail *proposal
+	pch        chan struct{}
+	phead      *proposal
+	ptail      *proposal
+	local      bool // Updates go to the store directly, even though we have a node.
+	switching  bool // Proposals stay queued while switching to a local R1, the switch applies them.
+	forwarding int  // Number of forwarders that took proposals from the queue and are proposing them.
 
 	// Ack queue
 	ackMsgs *ipQueue[*jsAckMsg]
@@ -1578,6 +1581,10 @@ func (o *consumer) setConsumerAssignment(ca *consumerAssignment) {
 	}
 	// Set our node.
 	o.node = ca.Group.node
+	// Without a node, updates are always local.
+	if o.node == nil {
+		o.local = false
+	}
 
 	// Trigger update chan.
 	select {
@@ -1637,13 +1644,18 @@ func (o *consumer) checkQueueInterest() {
 	}
 }
 
-// clears our node if we have one. When we scale down to 1.
-func (o *consumer) clearNode() {
+// deleteNode deletes our node and stops monitoring, when we scale down to 1 or our group is remapped.
+// The node stays set until replaced, so updates don't turn local meanwhile.
+// If our leadership is void, we step down and the next election starts us again.
+func (o *consumer) deleteNode(stepDown bool) {
 	o.mu.Lock()
-	defer o.mu.Unlock()
-	if o.node != nil {
-		o.node.Delete()
-		o.node = nil
+	if n := o.node; n != nil && !n.IsDeleted() {
+		n.Delete()
+	}
+	o.mu.Unlock()
+	o.stopMonitoring()
+	if stepDown {
+		o.setLeader(false, 0)
 	}
 }
 
@@ -2693,22 +2705,6 @@ func (o *consumer) updateConfig(cfg *ConsumerConfig) error {
 			o.dtmr = time.AfterFunc(o.dthresh, o.deleteNotActive)
 		}
 	}
-	// Check whether the pause has changed
-	{
-		var old, new time.Time
-		if o.cfg.PauseUntil != nil {
-			old = *o.cfg.PauseUntil
-		}
-		if cfg.PauseUntil != nil {
-			new = *cfg.PauseUntil
-		}
-		if !old.Equal(new) {
-			o.updatePauseState(cfg)
-			if o.isLeader() {
-				o.sendPauseAdvisoryLocked(cfg)
-			}
-		}
-	}
 
 	// Check for Subject Filters update.
 	newSubjects := gatherSubjectFilters(cfg.FilterSubject, cfg.FilterSubjects)
@@ -2744,6 +2740,27 @@ func (o *consumer) updateConfig(cfg *ConsumerConfig) error {
 				for _, filter := range o.subjf {
 					o.filters.Insert(filter.subject, struct{}{})
 				}
+			}
+		}
+	}
+
+	// Check whether the pause has changed
+	{
+		var old, new time.Time
+		if o.cfg.PauseUntil != nil {
+			old = *o.cfg.PauseUntil
+		}
+		if cfg.PauseUntil != nil {
+			new = *cfg.PauseUntil
+		}
+		if !old.Equal(new) {
+			o.updatePauseState(cfg)
+			// A resume has no timer to wake the delivery loop, unlike a
+			// pause that runs out, so waiting pulls and pending messages
+			// would otherwise wait for the next message or pull.
+			o.signalNewMessages()
+			if o.isLeader() {
+				o.sendPauseAdvisoryLocked(cfg)
 			}
 		}
 	}
@@ -3042,9 +3059,29 @@ func (o *consumer) loopAndForwardProposals(node RaftNode, qch, pch chan struct{}
 			o.mu.Unlock()
 			return errors.New("no longer leader")
 		}
+		// Only the forwarder for the current node and channel may take proposals.
+		// A stale one would propose them to a replaced node or term.
+		if node != o.node || pch != o.pch {
+			o.mu.Unlock()
+			return errors.New("replaced forwarder")
+		}
+		if o.switching {
+			o.mu.Unlock()
+			return nil
+		}
 		proposal := o.phead
+		if proposal == nil {
+			o.mu.Unlock()
+			return nil
+		}
 		o.phead, o.ptail = nil, nil
+		o.forwarding++
 		o.mu.Unlock()
+		defer func() {
+			o.mu.Lock()
+			o.forwarding--
+			o.mu.Unlock()
+		}()
 		// 256k max for now per batch.
 		const maxBatch = 256 * 1024
 		var entries []*Entry
@@ -3065,7 +3102,9 @@ func (o *consumer) loopAndForwardProposals(node RaftNode, qch, pch chan struct{}
 	}
 
 	// In case we have anything pending on entry.
-	forwardProposals()
+	if err := forwardProposals(); err != nil {
+		return
+	}
 
 	for {
 		select {
@@ -3873,6 +3912,10 @@ func (o *consumer) processAckMsgLocked(sseq, dseq, dc uint64, reply string, doSa
 		if o.maxp > 0 && len(o.pending) >= o.maxp {
 			needSignal = true
 		}
+		// Use the original deliver sequence from our pending record.
+		if p, ok := o.pending[sseq]; ok {
+			dseq = p.Sequence
+		}
 		sgap := sseq - o.asflr
 		o.adflr, o.asflr = dseq, sseq
 
@@ -3904,6 +3947,10 @@ func (o *consumer) processAckMsgLocked(sseq, dseq, dc uint64, reply string, doSa
 			for seq := sseq; seq > sseq-sgap && len(o.pending) > 0; seq-- {
 				remove(seq)
 			}
+		}
+		// Nothing pending, so move the floor up to the last delivered message.
+		if len(o.pending) == 0 {
+			o.adflr, o.asflr = o.dseq-1, o.sseq-1
 		}
 	case AckNone:
 		// FIXME(dlc) - This is error but do we care?
@@ -5997,7 +6044,7 @@ func (o *consumer) IsClustered() bool {
 
 // Lock should be held.
 func (o *consumer) isClustered() bool {
-	return o.node != nil
+	return o.node != nil && !o.local
 }
 
 func (o *consumer) needFlowControl(sz int) bool {

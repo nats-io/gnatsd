@@ -1683,3 +1683,44 @@ func TestStoreSourcesOnlyTracksConfiguredSources(t *testing.T) {
 		},
 	)
 }
+
+func TestStoreConsumerAckAllWithRedeliveredDeliverySequence(t *testing.T) {
+	testAllStoreAllPermutations(
+		t, false,
+		StreamConfig{Name: "zzz", Subjects: []string{"foo"}},
+		func(t *testing.T, fs StreamStore) {
+			o, err := fs.ConsumerStore("o", time.Time{}, &ConsumerConfig{AckPolicy: AckAll})
+			require_NoError(t, err)
+			defer o.Stop()
+
+			// Deliver 1-3, then redeliver 1 at delivery sequence 4.
+			ts := time.Now().UnixNano()
+			for seq := uint64(1); seq <= 3; seq++ {
+				require_NoError(t, o.UpdateDelivered(seq, seq, 1, ts))
+			}
+			require_NoError(t, o.UpdateDelivered(4, 1, 2, ts))
+
+			// An older leader acks with the redelivered delivery sequence.
+			// The floor must use the original, staying below the other pending messages.
+			require_NoError(t, o.UpdateAcks(4, 1, false))
+			state, err := o.State()
+			require_NoError(t, err)
+			require_Equal(t, state.AckFloor, SequencePair{Consumer: 1, Stream: 1})
+			require_Len(t, len(state.Pending), 2)
+
+			// An older server could have stored a delivery floor above pending messages.
+			require_NoError(t, o.Update(&ConsumerState{
+				Delivered: SequencePair{Consumer: 4, Stream: 3},
+				AckFloor:  SequencePair{Consumer: 4, Stream: 1},
+				Pending:   map[uint64]*Pending{2: {2, ts}, 3: {3, ts}},
+			}))
+
+			// Acking the last one must still ack all, and move the floor up to the last delivered.
+			require_NoError(t, o.UpdateAcks(3, 3, false))
+			state, err = o.State()
+			require_NoError(t, err)
+			require_Equal(t, state.AckFloor, SequencePair{Consumer: 4, Stream: 3})
+			require_Len(t, len(state.Pending), 0)
+		},
+	)
+}

@@ -8406,6 +8406,84 @@ func TestJetStreamConsumerNakThenAckFloorMove(t *testing.T) {
 	require_Equal(t, ci.NumAckPending, 0)
 }
 
+func TestJetStreamConsumerAckAllNakThenAckFloorMove(t *testing.T) {
+	test := func(t *testing.T, replicas int, storage nats.StorageType) {
+		c := createJetStreamClusterExplicit(t, "R3S", 3)
+		defer c.shutdown()
+
+		nc, js := jsClientConnect(t, c.randomServer())
+		defer nc.Close()
+
+		_, err := js.AddStream(&nats.StreamConfig{
+			Name:     "TEST",
+			Subjects: []string{"foo"},
+			Storage:  storage,
+			Replicas: replicas,
+		})
+		require_NoError(t, err)
+
+		for range 3 {
+			js.Publish("foo", []byte("OK"))
+		}
+
+		sub, err := js.PullSubscribe("foo", "CONSUMER", nats.AckAll(), nats.AckWait(time.Second))
+		require_NoError(t, err)
+		defer sub.Drain()
+
+		msgs, err := sub.Fetch(3)
+		require_NoError(t, err)
+		require_Len(t, len(msgs), 3)
+
+		// Nak first one, then grab it again and ack this time.
+		require_NoError(t, msgs[0].Nak())
+		rmsgs, err := sub.Fetch(1)
+		require_NoError(t, err)
+		require_NoError(t, rmsgs[0].AckSync())
+
+		// The floor must stay below the other pending messages.
+		ci, err := sub.ConsumerInfo()
+		require_NoError(t, err)
+		require_Equal(t, ci.Delivered.Consumer, 4)
+		require_Equal(t, ci.Delivered.Stream, 3)
+		require_Equal(t, ci.AckFloor.Consumer, 1)
+		require_Equal(t, ci.AckFloor.Stream, 1)
+		require_Equal(t, ci.NumAckPending, 2)
+
+		// Acking the last one through its first delivery acks all, and collapses
+		// the AckFloor.Consumer with the higher delivered due to re-deliveries.
+		require_NoError(t, msgs[2].AckSync())
+		checkAckFloor := func() {
+			t.Helper()
+			ci, err = sub.ConsumerInfo()
+			require_NoError(t, err)
+			require_Equal(t, ci.AckFloor.Consumer, 4)
+			require_Equal(t, ci.AckFloor.Stream, 3)
+			require_Equal(t, ci.NumAckPending, 0)
+		}
+		checkAckFloor()
+
+		// The new leader must have the same floor in its store.
+		if replicas > 1 {
+			cl := c.consumerLeader(globalAccountName, "TEST", "CONSUMER")
+			require_NoError(t, cl.JetStreamStepdownConsumer(globalAccountName, "TEST", "CONSUMER"))
+			c.waitOnConsumerLeader(globalAccountName, "TEST", "CONSUMER")
+			checkAckFloor()
+		}
+
+		// Nothing must be redelivered.
+		_, err = sub.Fetch(1, nats.MaxWait(1500*time.Millisecond))
+		require_Error(t, err, nats.ErrTimeout)
+	}
+
+	for _, replicas := range []int{1, 3} {
+		for _, storage := range []nats.StorageType{nats.FileStorage, nats.MemoryStorage} {
+			t.Run(fmt.Sprintf("R%d/%s", replicas, storage), func(t *testing.T) {
+				test(t, replicas, storage)
+			})
+		}
+	}
+}
+
 func TestJetStreamConsumerPauseViaConfig(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
@@ -8628,6 +8706,49 @@ func TestJetStreamConsumerPauseResumeViaEndpoint(t *testing.T) {
 
 	// Ensure the consumer reflects being resumed
 	require_False(t, getConsumerInfo().Paused)
+}
+
+func TestJetStreamConsumerPauseResumeDelivers(t *testing.T) {
+	for _, push := range []bool{false, true} {
+		t.Run(map[bool]string{false: "pull", true: "push"}[push], func(t *testing.T) {
+			s := RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+
+			nc, js := jsClientConnect(t, s)
+			defer nc.Close()
+
+			_, err := js.AddStream(&nats.StreamConfig{
+				Name:     "TEST",
+				Subjects: []string{"foo"},
+			})
+			require_NoError(t, err)
+			_, err = js.Publish("foo", nil)
+			require_NoError(t, err)
+
+			sub, err := nc.SubscribeSync(nats.NewInbox())
+			require_NoError(t, err)
+			deadline := time.Now().Add(time.Hour)
+			cc := ConsumerConfig{Name: "CONSUMER", AckPolicy: AckExplicit, PauseUntil: &deadline}
+			if push {
+				cc.DeliverSubject = sub.Subject
+			}
+			jsTestPause_CreateOrUpdateConsumer(t, nc, ActionCreate, "TEST", cc)
+			if !push {
+				req, err := json.Marshal(&JSApiConsumerGetNextRequest{Batch: 1, Expires: 10 * time.Second})
+				require_NoError(t, err)
+				require_NoError(t, nc.PublishRequest(fmt.Sprintf(JSApiRequestNextT, "TEST", "CONSUMER"), sub.Subject, req))
+			}
+			_, err = sub.NextMsg(250 * time.Millisecond)
+			require_Error(t, err, nats.ErrTimeout)
+
+			// Nothing is published after the resume, so only the resume
+			// itself can get the pending message delivered.
+			jsTestPause_PauseConsumer(t, nc, "TEST", "CONSUMER", time.Time{})
+			msg, err := sub.NextMsg(2 * time.Second)
+			require_NoError(t, err)
+			require_Equal(t, msg.Header.Get("Status"), "")
+		})
+	}
 }
 
 func TestJetStreamConsumerPauseMetadataRace(t *testing.T) {
