@@ -2584,8 +2584,14 @@ func (s *Server) checkInternalSyncConsumers(acc *Account) {
 	}
 }
 
-// Returns the remote cluster name. This is set only once so does not require a lock.
+// Returns the remote cluster name.
+// The field is written during CONNECT and INFO processing under c.mu, and
+// can be read concurrently on the close path (for instance when the leaf
+// auth timer fires while CONNECT is still being processed), so the read
+// needs the client lock as well.
 func (c *client) remoteCluster() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	if c.leaf == nil {
 		return _EMPTY_
 	}
@@ -2871,7 +2877,9 @@ func (acc *Account) updateLeafNodesEx(sub *subscription, delta int32, hubOnly bo
 		// Check to make sure this sub does not have an origin cluster that matches the leafnode.
 		// If skipped, make sure that we still let go the "$LDS." subscription that allows
 		// the detection of loops as long as different cluster.
-		clusterDifferent := cluster != ln.remoteCluster()
+		// Read the field directly: ln.mu is already held for reading here,
+		// and remoteCluster() would take it again.
+		clusterDifferent := cluster != ln.leaf.remoteCluster
 		update := (isLDS && clusterDifferent) ||
 			((cluster == _EMPTY_ || clusterDifferent) && (delta <= 0 || ln.canSubscribeInternal(subject)))
 		ln.mu.RUnlock()
@@ -3192,7 +3200,9 @@ func (c *client) processLeafSub(argo []byte) (err error) {
 	}
 
 	// If we have an origin cluster associated mark that in the sub.
-	if rc := c.remoteCluster(); rc != _EMPTY_ {
+	// c.mu is held here, so read the field directly instead of
+	// calling remoteCluster().
+	if rc := c.leaf.remoteCluster; rc != _EMPTY_ {
 		sub.origin = []byte(rc)
 	}
 
