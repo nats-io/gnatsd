@@ -782,6 +782,12 @@ func (smo *StoreMsg) copy(sm *StoreMsg) {
 	sm.subj, sm.seq, sm.ts = smo.subj, smo.seq, smo.ts
 }
 
+// Copy all fields, cloning the subject string.
+func (smo *StoreMsg) deepCopy(sm *StoreMsg) {
+	smo.copy(sm)
+	sm.subj = strings.Clone(smo.subj)
+}
+
 // Clear all fields except underlying buffer but reset that if present to [:0].
 func (sm *StoreMsg) clear() {
 	if sm == nil {

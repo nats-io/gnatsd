@@ -9129,6 +9129,65 @@ func Benchmark_FileStoreCreateConsumerStores(b *testing.B) {
 	}
 }
 
+func BenchmarkFileStoreLoadMsgMultiRejectedMessages(b *testing.B) {
+	for _, test := range []struct {
+		name string
+		msgs int
+		size int
+	}{
+		{"ManySmall", 65536, 16},
+		{"Large", 64, 64 * 1024},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			fs, err := newFileStore(
+				FileStoreConfig{StoreDir: b.TempDir(), BlockSize: 8 * 1024 * 1024},
+				StreamConfig{Name: "bench", Subjects: []string{"data.>"}, Storage: FileStorage})
+			require_NoError(b, err)
+			defer fs.Stop()
+
+			_, _, err = fs.StoreMsg("data.match", nil, []byte("match"), 0)
+			require_NoError(b, err)
+			payload := bytes.Repeat([]byte("x"), test.size)
+			for range test.msgs {
+				_, _, err = fs.StoreMsg("data.other", nil, payload, 0)
+				require_NoError(b, err)
+			}
+			last, _, err := fs.StoreMsg("data.match", nil, []byte("match"), 0)
+			require_NoError(b, err)
+			require_Equal(b, fs.numMsgBlocks(), 1)
+
+			sl := gsl.NewSimpleSublist()
+			require_NoError(b, sl.Insert("data.match", struct{}{}))
+			require_NoError(b, sl.Insert("data.absent", struct{}{}))
+			for _, reverse := range []bool{false, true} {
+				name, loadMsg := "Next", fs.LoadNextMsgMulti
+				start, want := uint64(2), last
+				if reverse {
+					name, loadMsg = "Prev", fs.LoadPrevMsgMulti
+					start, want = last-1, 1
+				}
+				b.Run(name, func(b *testing.B) {
+					var smv StoreMsg
+					// Warm the cache and start inside the matching subject's bounds.
+					sm, seq, err := loadMsg(sl, start, &smv)
+					require_NoError(b, err)
+					require_Equal(b, seq, want)
+					require_Equal(b, sm.seq, want)
+					b.ReportAllocs()
+					b.ResetTimer()
+					for range b.N {
+						sm, seq, err := loadMsg(sl, start, &smv)
+						if err != nil || seq != want || sm == nil || sm.seq != want {
+							b.Fatalf("Expected sequence %d, got %d: %v", want, seq, err)
+						}
+					}
+					b.StopTimer()
+				})
+			}
+		})
+	}
+}
+
 func BenchmarkFileStoreLoadNextMsgMultiRepeatedSubjects(b *testing.B) {
 	benchmarkFileStoreLoadMsgMulti(b, false)
 }
