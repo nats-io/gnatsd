@@ -3124,6 +3124,10 @@ func (mb *msgBlock) firstMatching(filter string, wc bool, start uint64, sm *Stor
 		sm = new(StoreMsg)
 	}
 
+	fsm := sm
+	if !isAll {
+		fsm = &StoreMsg{}
+	}
 	for seq := fseq; seq <= lseq; seq++ {
 		if mb.dmap.Exists(seq) {
 			// Optimisation to avoid calling cacheLookup which hits time.Now().
@@ -3132,7 +3136,7 @@ func (mb *msgBlock) firstMatching(filter string, wc bool, start uint64, sm *Stor
 			continue
 		}
 		llseq := mb.llseq
-		fsm, err := mb.cacheLookup(seq, sm)
+		_, err := mb.cacheLookupEx(seq, fsm, isAll)
 		if err != nil {
 			if err == errPartialCache || err == errNoCache {
 				return nil, false, err
@@ -3142,12 +3146,11 @@ func (mb *msgBlock) firstMatching(filter string, wc bool, start uint64, sm *Stor
 		updateLLTS = false // cacheLookup already updated it.
 		expireOk := seq == lseq && mb.llseq != llseq && mb.llseq == seq
 		if isAll {
-			return fsm, expireOk, nil
+			return sm, expireOk, nil
 		}
-		if wc && isMatch(sm.subj) {
-			return fsm, expireOk, nil
-		} else if !wc && fsm.subj == filter {
-			return fsm, expireOk, nil
+		if (wc && isMatch(fsm.subj)) || (!wc && fsm.subj == filter) {
+			fsm.deepCopy(sm)
+			return sm, expireOk, nil
 		}
 		// If we are here we did not match, so put the llseq back.
 		mb.llseq = llseq
@@ -9799,13 +9802,17 @@ func (mb *msgBlock) prevMatching(filter string, wc bool, start uint64, sm *Store
 		sm = new(StoreMsg)
 	}
 
+	fsm := sm
+	if !isAll {
+		fsm = &StoreMsg{}
+	}
 	for seq := end; seq >= lseq; seq-- {
 		if mb.dmap.Exists(seq) {
 			updateLLTS = true
 			continue
 		}
 		llseq := mb.llseq
-		fsm, err := mb.cacheLookup(seq, sm)
+		_, err := mb.cacheLookupEx(seq, fsm, isAll)
 		if err != nil {
 			if err == errPartialCache || err == errNoCache {
 				return nil, false, err
@@ -9815,12 +9822,11 @@ func (mb *msgBlock) prevMatching(filter string, wc bool, start uint64, sm *Store
 		updateLLTS = false
 		expireOk := seq == lseq && mb.llseq != llseq && mb.llseq == seq
 		if isAll {
-			return fsm, expireOk, nil
+			return sm, expireOk, nil
 		}
-		if wc && isMatch(sm.subj) {
-			return fsm, expireOk, nil
-		} else if !wc && fsm.subj == filter {
-			return fsm, expireOk, nil
+		if (wc && isMatch(fsm.subj)) || (!wc && fsm.subj == filter) {
+			fsm.deepCopy(sm)
+			return sm, expireOk, nil
 		}
 		mb.llseq = llseq
 	}
