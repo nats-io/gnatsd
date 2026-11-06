@@ -3430,6 +3430,10 @@ func TestGetStorageSize(t *testing.T) {
 		{"1L", 0, true},
 		{"TT", 0, true},
 		{"", 0, false},
+		{"8388607T", 8388607 << 40, false},
+		{"-8388608T", -8388608 << 40, false},
+		{"8388608T", 0, true},
+		{"-8388609T", 0, true},
 	}
 
 	for _, v := range tt {

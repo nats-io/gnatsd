@@ -2550,6 +2550,9 @@ func getStorageSize(v any) (int64, error) {
 	if !ok {
 		return 0, fmt.Errorf("sizes defined as strings must end in K, M, G, T")
 	}
+	if num > math.MaxInt64>>mult || num < math.MinInt64>>mult {
+		return 0, fmt.Errorf("size %q is out of range", s)
+	}
 	num *= 1 << mult
 
 	return num, nil
