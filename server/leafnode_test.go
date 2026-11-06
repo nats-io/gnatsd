@@ -2270,6 +2270,77 @@ func TestLeafNodeOriginClusterInfo(t *testing.T) {
 	}
 }
 
+func TestLeafNodeRemoteClusterRace(t *testing.T) {
+	// Regression test for #8826: the leaf auth timer can fire while the
+	// server is still processing the leaf's CONNECT, so the read of
+	// c.leaf.remoteCluster on the close path (removeClient) raced with
+	// the write in processLeafNodeConnect. Race the real close path
+	// against the same write processLeafNodeConnect performs, under c.mu.
+	hopts := DefaultOptions()
+	hopts.ServerName = "hub"
+	hopts.LeafNode.Port = -1
+
+	hub := RunServer(hopts)
+	defer hub.Shutdown()
+
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+		port: -1
+		leaf {
+			remotes [ { url: "nats://127.0.0.1:%d" } ]
+		}
+		cluster {
+			name: "xyz"
+			listen: "127.0.0.1:-1"
+		}
+	`, hopts.LeafNode.Port)))
+
+	opts, err := ProcessConfigFile(conf)
+	if err != nil {
+		t.Fatalf("Error processing config file: %v", err)
+	}
+	opts.NoLog, opts.NoSigs = true, true
+
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	checkLeafNodeConnected(t, s)
+	checkLeafNodeConnected(t, hub)
+
+	// Grab the leaf connection on the hub side.
+	var l *client
+	hub.mu.Lock()
+	for _, l = range hub.leafs {
+		break
+	}
+	hub.mu.Unlock()
+	if l == nil {
+		t.Fatalf("Did not find leaf connection on hub")
+	}
+	if rc := l.remoteCluster(); rc != "xyz" {
+		t.Fatalf("Expected a remote cluster name of \"xyz\", got %q", rc)
+	}
+	acc := l.acc
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 500; i++ {
+			// Same write processLeafNodeConnect performs, under c.mu.
+			l.mu.Lock()
+			l.leaf.remoteCluster = "xyz"
+			l.mu.Unlock()
+		}
+	}()
+	for i := 0; i < 500; i++ {
+		acc.addClient(l)
+		acc.removeClient(l)
+		if rc := l.remoteCluster(); rc != "xyz" {
+			t.Fatalf("Expected a remote cluster name of \"xyz\", got %q", rc)
+		}
+	}
+	<-done
+}
+
 type proxyAcceptDetectFailureLate struct {
 	sync.Mutex
 	wg         sync.WaitGroup

@@ -1162,6 +1162,22 @@ func (a *Account) removeLeafNode(c *client) {
 
 // removeClient keeps our accounting of local active clients updated.
 func (a *Account) removeClient(c *client) int {
+	// Capture the leaf's remote cluster (and whether this is a hub leaf)
+	// before taking the account lock. remoteCluster is written during
+	// CONNECT processing under c.mu, and this can run concurrently with
+	// it on the close path, for instance when the leaf auth timer fires
+	// while CONNECT is still being processed. The lock order is client
+	// -> account, so c.mu must not be taken while a.mu is held.
+	var cluster string
+	isHub := false
+	if c.kind == LEAF {
+		c.mu.RLock()
+		if c.leaf != nil && !c.leaf.isSpoke {
+			isHub = true
+			cluster = c.leaf.remoteCluster
+		}
+		c.mu.RUnlock()
+	}
 	a.mu.Lock()
 	n := len(a.clients)
 	delete(a.clients, c)
@@ -1176,8 +1192,7 @@ func (a *Account) removeClient(c *client) int {
 		a.nleafs--
 		// Need to do cluster accounting here.
 		// Do cluster accounting if we are a hub.
-		if c.isHubLeafNode() {
-			cluster := c.remoteCluster()
+		if isHub {
 			if count := a.leafClusters[cluster]; count > 1 {
 				a.leafClusters[cluster]--
 			} else if count == 1 {
