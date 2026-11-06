@@ -9315,6 +9315,49 @@ func benchmarkFileStoreLoadMsgRejectedMessages(b *testing.B, multi bool) {
 	}
 }
 
+func BenchmarkFileStoreLoadNextMsgMultiSparseHistory(b *testing.B) {
+	const keys = 100000
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: b.TempDir(), BlockSize: 8 * 1024 * 1024},
+		StreamConfig{Name: "KV_bench", Subjects: []string{"$KV.bench.>"}, Storage: FileStorage, MaxMsgsPer: 1})
+	require_NoError(b, err)
+	defer fs.Stop()
+	// Insert 100K messages
+	for key := range keys {
+		subj := fmt.Sprintf("$KV.bench.%c.k%d", "ab"[key%2], key)
+		_, _, err := fs.StoreMsg(subj, nil, []byte("value"), 0)
+		require_NoError(b, err)
+
+	}
+	// Remove 80% of the messages
+	for seq := uint64(1); seq <= keys; seq++ {
+		if seq%5 != 0 {
+			_, err := fs.RemoveMsg(seq)
+			require_NoError(b, err)
+		}
+	}
+	// Create a multi filter matching all messages, and measure
+	// the time it takes to load them using the filter.
+	sl := gsl.NewSimpleSublist()
+	require_NoError(b, sl.Insert("$KV.bench.a.>", struct{}{}))
+	require_NoError(b, sl.Insert("$KV.bench.b.>", struct{}{}))
+	var smv StoreMsg
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		start := uint64(1)
+		for {
+			_, seq, err := fs.LoadNextMsgMulti(sl, start, &smv)
+			if err != nil {
+				require_Error(b, err, ErrStoreEOF)
+				break
+			}
+			start = seq + 1
+		}
+	}
+	b.StopTimer()
+}
+
 func BenchmarkFileStoreLoadNextMsgMultiRepeatedSubjects(b *testing.B) {
 	benchmarkFileStoreLoadMsgMulti(b, false)
 }
