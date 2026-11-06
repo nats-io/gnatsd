@@ -5635,187 +5635,221 @@ func (c *client) processMsgResults(acc *Account, r *SublistResult, msg, deliver,
 			nw = r.qwn[i]
 		}
 
+		// The name of this queue group, used if the membership has to be
+		// looked up again after all known members failed delivery.
+		var qname []byte
+		if len(qsubs) > 0 {
+			qname = qsubs[0].queue
+		}
+
 		src := c.kind
-		// If we just came from a route we want to prefer local subs.
-		// So only select from local subs but remember the first rsub
-		// in case all else fails.
-		if src == ROUTER {
-			ql := _ql[:0]
-			// Total queue weight of the rsub candidates seen so far.
-			var lw uint64
-			for i := 0; i < len(qsubs); i++ {
-				sub = qsubs[i]
-				if dst := sub.client.kind; dst == LEAF || dst == ROUTER {
-					// If the destination is a LEAF, we first need to make sure
-					// that we would not pick one that was the origin of this
-					// message.
-					if dst == LEAF && c.isLeafEcho(sub, leafOrigin, importedFromService) {
-						continue
-					}
-					// If we have assigned a ROUTER rsub already, replace if
-					// the destination is a LEAF since we want to favor that.
-					if rsub == nil || (rsub.client.kind == ROUTER && dst == LEAF) {
-						rsub, lw = sub, qsubWeight(sub)
-					} else if dst == LEAF {
-						// We already have a LEAF and this is another one.
-						// Swap it with a chance relative to its queue weight.
-						// See https://github.com/nats-io/nats-server/issues/6040
-						w := qsubWeight(sub)
-						lw += w
-						if rand.Uint64N(lw) < w {
-							rsub = sub
+
+		// Attempt to deliver the message to one member of this queue group.
+		// If all members in the match result fail to take the delivery (for
+		// instance a member that unsubscribed while the message was in
+		// flight), the match result may predate a new member's subscription,
+		// so match the subject once more and try the group's current
+		// membership before giving up on it.
+		for rematched := false; ; {
+			// If we just came from a route we want to prefer local subs.
+			// So only select from local subs but remember the first rsub
+			// in case all else fails.
+			if src == ROUTER {
+				ql := _ql[:0]
+				// Total queue weight of the rsub candidates seen so far.
+				var lw uint64
+				for i := 0; i < len(qsubs); i++ {
+					sub = qsubs[i]
+					if dst := sub.client.kind; dst == LEAF || dst == ROUTER {
+						// If the destination is a LEAF, we first need to make sure
+						// that we would not pick one that was the origin of this
+						// message.
+						if dst == LEAF && c.isLeafEcho(sub, leafOrigin, importedFromService) {
+							continue
 						}
+						// If we have assigned a ROUTER rsub already, replace if
+						// the destination is a LEAF since we want to favor that.
+						if rsub == nil || (rsub.client.kind == ROUTER && dst == LEAF) {
+							rsub, lw = sub, qsubWeight(sub)
+						} else if dst == LEAF {
+							// We already have a LEAF and this is another one.
+							// Swap it with a chance relative to its queue weight.
+							// See https://github.com/nats-io/nats-server/issues/6040
+							w := qsubWeight(sub)
+							lw += w
+							if rand.Uint64N(lw) < w {
+								rsub = sub
+							}
+						}
+					} else {
+						ql = append(ql, sub)
 					}
-				} else {
-					ql = append(ql, sub)
 				}
-			}
-			// Only local subs remain, which all have weight 1.
-			qsubs, nw = ql, 0
-		}
-
-		sindex := 0
-		lqs := len(qsubs)
-		if lqs > 1 {
-			sindex = weightedQSubIndex(qsubs, nw)
-		}
-
-		// Find a subscription that is able to deliver this message starting at a random index.
-		// Note that if the message came from a ROUTER, we will only have CLIENT or LEAF
-		// queue subs here, otherwise we can have all types.
-		for i := 0; i < lqs; i++ {
-			if sindex+i < lqs {
-				sub = qsubs[sindex+i]
-			} else {
-				sub = qsubs[(sindex+i)%lqs]
-			}
-			if sub == nil {
-				continue
+				// Only local subs remain, which all have weight 1.
+				qsubs, nw = ql, 0
 			}
 
-			// If we are a spoke leaf node make sure to not forward across routes.
-			// This mimics same behavior for normal subs above.
-			if c.kind == LEAF && c.isSpokeLeafNode() && sub.client.kind == ROUTER {
-				continue
+			sindex := 0
+			lqs := len(qsubs)
+			if lqs > 1 {
+				sindex = weightedQSubIndex(qsubs, nw)
 			}
 
-			// We have taken care of preferring local subs for a message from a route above.
-			// Here we just care about a client or leaf and skipping a leaf and preferring locals.
-			if dst := sub.client.kind; dst == ROUTER || dst == LEAF {
-				if (src == LEAF || src == CLIENT) && dst == LEAF {
-					// If we come from a LEAF and are about to pick a LEAF connection,
-					// make sure this is not the same leaf cluster.
-					if src == LEAF && c.isLeafEcho(sub, leafOrigin, importedFromService) {
-						continue
-					}
-					// Remember that leaf in case we don't find any other candidate.
-					// We already start randomly in lqs slice, so we don't need
-					// to do a random swap if we already have an rsub like we do
-					// when src == ROUTER above.
-					if rsub == nil {
-						rsub = sub
-					}
-					continue
+			var delivered, attempted bool
+			// Find a subscription that is able to deliver this message starting at a random index.
+			// Note that if the message came from a ROUTER, we will only have CLIENT or LEAF
+			// queue subs here, otherwise we can have all types.
+			for i := 0; i < lqs; i++ {
+				if sindex+i < lqs {
+					sub = qsubs[sindex+i]
 				} else {
-					// We want to favor qsubs in our own cluster. If the routed
-					// qsub is on behalf of a leaf, we need to treat it differently.
-					if sub.leaf {
-						// If we already have an rsub, nothing to do. Also, do
-						// not pick a routed qsub for a LEAF origin cluster
-						// that is the same than where the message comes from.
-						if rsub == nil && (leafOrigin == _EMPTY_ || leafOrigin != bytesToString(sub.origin)) {
+					sub = qsubs[(sindex+i)%lqs]
+				}
+				if sub == nil {
+					continue
+				}
+
+				// If we are a spoke leaf node make sure to not forward across routes.
+				// This mimics same behavior for normal subs above.
+				if c.kind == LEAF && c.isSpokeLeafNode() && sub.client.kind == ROUTER {
+					continue
+				}
+
+				// We have taken care of preferring local subs for a message from a route above.
+				// Here we just care about a client or leaf and skipping a leaf and preferring locals.
+				if dst := sub.client.kind; dst == ROUTER || dst == LEAF {
+					if (src == LEAF || src == CLIENT) && dst == LEAF {
+						// If we come from a LEAF and are about to pick a LEAF connection,
+						// make sure this is not the same leaf cluster.
+						if src == LEAF && c.isLeafEcho(sub, leafOrigin, importedFromService) {
+							continue
+						}
+						// Remember that leaf in case we don't find any other candidate.
+						// We already start randomly in lqs slice, so we don't need
+						// to do a random swap if we already have an rsub like we do
+						// when src == ROUTER above.
+						if rsub == nil {
 							rsub = sub
 						}
 						continue
+					} else {
+						// We want to favor qsubs in our own cluster. If the routed
+						// qsub is on behalf of a leaf, we need to treat it differently.
+						if sub.leaf {
+							// If we already have an rsub, nothing to do. Also, do
+							// not pick a routed qsub for a LEAF origin cluster
+							// that is the same than where the message comes from.
+							if rsub == nil && (leafOrigin == _EMPTY_ || leafOrigin != bytesToString(sub.origin)) {
+								rsub = sub
+							}
+							continue
+						}
+						// This is a qsub that is local on the remote server (or
+						// we are connected to an older server and we don't know).
+						// Pick this one and be done.
+						rsub = sub
+						break
 					}
-					// This is a qsub that is local on the remote server (or
-					// we are connected to an older server and we don't know).
-					// Pick this one and be done.
-					rsub = sub
+				}
+
+				// Assume delivery subject is normal subject to this point.
+				dsubj = subj
+
+				// We may need to disable tracing, by setting c.pa.trace to `nil`
+				// before the call to deliverMsg, if so, this will indicate that
+				// we need to put it back.
+				var restorePaTrace bool
+				var skipDelivery bool
+
+				// Check for stream import mapped subs. These apply to local subs only.
+				if sub.im != nil {
+					// If this message was a service import do not re-export to an exported stream.
+					if importedFromService {
+						continue
+					}
+					if sub.im.tr != nil {
+						to := sub.im.tr.TransformSubject(bytesToString(subject))
+						dsubj = append(_dsubj[:0], to...)
+					} else if sub.im.usePub {
+						dsubj = append(_dsubj[:0], subj...)
+					} else {
+						dsubj = append(_dsubj[:0], sub.im.to...)
+					}
+
+					if mt != nil {
+						mt.addStreamExportEvent(sub.client, dsubj)
+						// If allow_trace is false...
+						if !sub.im.atrc {
+							// If we are doing only message tracing, we are done
+							// with this queue group.
+							if traceOnly {
+								skipDelivery = true
+							} else {
+								// If we are delivering, we need to disable tracing
+								// before the call to deliverMsg()
+								c.pa.trace, restorePaTrace = nil, true
+							}
+						}
+					}
+
+					// Make sure deliver is set if inbound from a route.
+					if remapped && (c.kind == GATEWAY || c.kind == ROUTER || c.kind == LEAF) {
+						deliver = subj
+					}
+					// If we are mapping for a deliver subject we will reverse roles.
+					// The original subj we set from above is correct for the msg header,
+					// but we need to transform the deliver subject to properly route.
+					if len(deliver) > 0 {
+						dsubj, subj = subj, dsubj
+					}
+				}
+
+				if !skipDelivery {
+					mh := c.msgHeader(dsubj, creply, sub)
+					attempted = true
+					delivered = c.deliverMsg(prodIsMQTT, sub, acc, dsubj, creply, mh, msg, rplyHasGWPrefix)
+					if restorePaTrace {
+						c.pa.trace = mt
+					}
+				}
+				if skipDelivery || delivered {
+					// Update only if not skipped.
+					if !skipDelivery && sub.icb == nil {
+						dlvMsgs++
+						switch sub.client.kind {
+						case ROUTER:
+							dlvRouteMsgs++
+						case LEAF:
+							dlvLeafMsgs++
+						case CLIENT:
+							dlvClientMsgs++
+						}
+					}
+					// Do the rest even when message delivery was skipped.
+					didDeliver = true
+					// Clear rsub
+					rsub = nil
+					if flags&pmrCollectQueueNames != 0 {
+						queues = append(queues, sub.queue)
+					}
 					break
 				}
 			}
 
-			// Assume delivery subject is normal subject to this point.
-			dsubj = subj
-
-			// We may need to disable tracing, by setting c.pa.trace to `nil`
-			// before the call to deliverMsg, if so, this will indicate that
-			// we need to put it back.
-			var restorePaTrace bool
-			var skipDelivery bool
-
-			// Check for stream import mapped subs. These apply to local subs only.
-			if sub.im != nil {
-				// If this message was a service import do not re-export to an exported stream.
-				if importedFromService {
-					continue
-				}
-				if sub.im.tr != nil {
-					to := sub.im.tr.TransformSubject(bytesToString(subject))
-					dsubj = append(_dsubj[:0], to...)
-				} else if sub.im.usePub {
-					dsubj = append(_dsubj[:0], subj...)
-				} else {
-					dsubj = append(_dsubj[:0], sub.im.to...)
-				}
-
-				if mt != nil {
-					mt.addStreamExportEvent(sub.client, dsubj)
-					// If allow_trace is false...
-					if !sub.im.atrc {
-						// If we are doing only message tracing, we are done
-						// with this queue group.
-						if traceOnly {
-							skipDelivery = true
-						} else {
-							// If we are delivering, we need to disable tracing
-							// before the call to deliverMsg()
-							c.pa.trace, restorePaTrace = nil, true
-						}
-					}
-				}
-
-				// Make sure deliver is set if inbound from a route.
-				if remapped && (c.kind == GATEWAY || c.kind == ROUTER || c.kind == LEAF) {
-					deliver = subj
-				}
-				// If we are mapping for a deliver subject we will reverse roles.
-				// The original subj we set from above is correct for the msg header,
-				// but we need to transform the deliver subject to properly route.
-				if len(deliver) > 0 {
-					dsubj, subj = subj, dsubj
-				}
+			if delivered || rsub != nil || !attempted || rematched || acc.sl == nil {
+				break
 			}
 
-			var delivered bool
-			if !skipDelivery {
-				mh := c.msgHeader(dsubj, creply, sub)
-				delivered = c.deliverMsg(prodIsMQTT, sub, acc, dsubj, creply, mh, msg, rplyHasGWPrefix)
-				if restorePaTrace {
-					c.pa.trace = mt
+			// Re-match the subject to pick up the group's current membership.
+			rematched = true
+			rsub = nil
+			nr := acc.sl.MatchBytes(subject)
+			if j := findQSlot(qname, nr.qsubs); j >= 0 {
+				qsubs, nw = nr.qsubs[j], 0
+				if j < len(nr.qwn) {
+					nw = nr.qwn[j]
 				}
-			}
-			if skipDelivery || delivered {
-				// Update only if not skipped.
-				if !skipDelivery && sub.icb == nil {
-					dlvMsgs++
-					switch sub.client.kind {
-					case ROUTER:
-						dlvRouteMsgs++
-					case LEAF:
-						dlvLeafMsgs++
-					case CLIENT:
-						dlvClientMsgs++
-					}
-				}
-				// Do the rest even when message delivery was skipped.
-				didDeliver = true
-				// Clear rsub
-				rsub = nil
-				if flags&pmrCollectQueueNames != 0 {
-					queues = append(queues, sub.queue)
-				}
+			} else {
 				break
 			}
 		}

@@ -809,6 +809,48 @@ func TestClientPubWithQueueSub(t *testing.T) {
 	}
 }
 
+func TestClientQueueSubHandoverRedelivery(t *testing.T) {
+	s, pub, _ := setupClient()
+	defer pub.close()
+
+	oldc, _, _ := newClientForServer(s)
+	defer oldc.close()
+	newc, newcr, _ := newClientForServer(s)
+	defer newc.close()
+
+	// The old member joins the queue group, and we snapshot the match
+	// result while it is the only member, as the publisher's L1 results
+	// cache would have produced it before the handover.
+	oldc.parse([]byte("SUB foo q1 1\r\n"))
+	acc := pub.acc
+	r := acc.sl.Match("foo")
+
+	// Handover: the new member joins the same group, then the old
+	// member unsubscribes.
+	newc.parse([]byte("SUB foo q1 2\r\n"))
+	oldc.parse([]byte("UNSUB 1\r\n"))
+
+	// Present the stale match result to the publisher, as if its read
+	// loop had matched the message just before the new member's SUB was
+	// processed. See https://github.com/nats-io/nats-server/issues/8816
+	pub.in.results = map[string]*SublistResult{"foo": r}
+	pub.in.genid = atomic.LoadUint64(&acc.sl.genid)
+
+	pub.parse([]byte("PUB foo 5\r\nhello\r\n"))
+
+	// The message must still be delivered to the remaining member.
+	l, err := newcr.ReadString('\n')
+	require_NoError(t, err)
+	matches := msgPat.FindAllStringSubmatch(l, -1)
+	if len(matches) == 0 {
+		t.Fatalf("Did not get a message: %q", l)
+	}
+	if matches[0][SID_INDEX] != "2" {
+		t.Fatalf("Expected message on sid 2, got: %q", l)
+	}
+	checkPayload(newcr, []byte("hello\r\n"), t)
+}
+
 func TestSplitSubjectQueue(t *testing.T) {
 	cases := []struct {
 		name        string
