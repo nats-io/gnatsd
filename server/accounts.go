@@ -2589,6 +2589,18 @@ func (se *serviceExport) clearResponseThresholdTimer() bool {
 	return stopped
 }
 
+// clearResponseThresholdTimers stops the response threshold timer of every
+// service export of the account.
+func (a *Account) clearResponseThresholdTimers() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, se := range a.exports.services {
+		if se != nil {
+			se.clearResponseThresholdTimer()
+		}
+	}
+}
+
 // checkExpiredResponses will check for any pending responses that need to
 // be cleaned up.
 func (se *serviceExport) checkExpiredResponses() {

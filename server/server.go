@@ -2787,6 +2787,14 @@ func (s *Server) Shutdown() {
 	// Wait for go routines to be done.
 	s.grWG.Wait()
 
+	// Stop the service exports' response threshold timers. A pending one
+	// keeps its account, and through it the whole server, reachable until
+	// it fires, two minutes later by default.
+	s.accounts.Range(func(_, v any) bool {
+		v.(*Account).clearResponseThresholdTimers()
+		return true
+	})
+
 	if opts.PortsFileDir != _EMPTY_ {
 		s.deletePortsFile(opts.PortsFileDir)
 	}

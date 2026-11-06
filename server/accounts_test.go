@@ -2054,6 +2054,43 @@ func TestAccountTrackLatencyRemoteLeaks(t *testing.T) {
 	})
 }
 
+func TestAccountServiceExportResponseThresholdTimerStoppedOnShutdown(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		accounts {
+			A { users = [{user: a, password: a}], exports = [{service: "svc"}] }
+			B { users = [{user: b, password: b}], imports = [{service: {account: A, subject: "svc"}}] }
+		}
+	`))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	ncA := natsConnect(t, s.ClientURL(), nats.UserInfo("a", "a"))
+	defer ncA.Close()
+	natsSub(t, ncA, "svc", func(m *nats.Msg) { m.Respond([]byte("ok")) })
+	natsFlush(t, ncA)
+
+	ncB := natsConnect(t, s.ClientURL(), nats.UserInfo("b", "b"))
+	defer ncB.Close()
+	_, err := ncB.Request("svc", nil, time.Second)
+	require_NoError(t, err)
+
+	acc, err := s.LookupAccount("A")
+	require_NoError(t, err)
+	rtmrSet := func() bool {
+		acc.mu.RLock()
+		defer acc.mu.RUnlock()
+		return acc.exports.services["svc"].rtmr != nil
+	}
+	// The request armed the timer, which runs for the response threshold.
+	require_True(t, rtmrSet())
+
+	// A timer left running holds the account, and through it the server,
+	// until it fires.
+	s.Shutdown()
+	require_False(t, rtmrSet())
+}
+
 func TestCrossAccountServiceResponseTypes(t *testing.T) {
 	s, fooAcc, barAcc := simpleAccountServer(t)
 	defer s.Shutdown()
