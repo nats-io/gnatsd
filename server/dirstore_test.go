@@ -401,6 +401,48 @@ func TestMergeOnlyOnNewer(t *testing.T) {
 	require_Equal(t, newerJWT, fromStore)
 }
 
+func TestDirStoreMergeTieBreak(t *testing.T) {
+	accKey, err := nkeys.CreateAccount()
+	require_NoError(t, err)
+	pubKey, err := accKey.PublicKey()
+	require_NoError(t, err)
+
+	// Two different JWTs issued in the same second.
+	var jwt1, jwt2 string
+	for {
+		claim := jwt.NewAccountClaims(pubKey)
+		jwt1, err = claim.Encode(accKey)
+		require_NoError(t, err)
+		claim.Tags.Add("other")
+		jwt2, err = claim.Encode(accKey)
+		require_NoError(t, err)
+		c1, err := jwt.DecodeGeneric(jwt1)
+		require_NoError(t, err)
+		c2, err := jwt.DecodeGeneric(jwt2)
+		require_NoError(t, err)
+		if c1.IssuedAt == c2.IssuedAt {
+			break
+		}
+	}
+
+	// Each store merges the other's JWT, both must keep the same one.
+	a, err := NewExpiringDirJWTStore(t.TempDir(), false, true, NoDelete, 0, 0, true, 0, nil)
+	require_NoError(t, err)
+	defer a.Close()
+	b, err := NewExpiringDirJWTStore(t.TempDir(), false, true, NoDelete, 0, 0, true, 0, nil)
+	require_NoError(t, err)
+	defer b.Close()
+	require_NoError(t, a.SaveAcc(pubKey, jwt1))
+	require_NoError(t, b.SaveAcc(pubKey, jwt2))
+	require_NoError(t, a.Merge(fmt.Sprintf("%s|%s", pubKey, jwt2)))
+	require_NoError(t, b.Merge(fmt.Sprintf("%s|%s", pubKey, jwt1)))
+	fromA, err := a.LoadAcc(pubKey)
+	require_NoError(t, err)
+	fromB, err := b.LoadAcc(pubKey)
+	require_NoError(t, err)
+	require_Equal(t, fromA, fromB)
+}
+
 func createTestAccount(t *testing.T, dirStore *DirJWTStore, expSec int, accKey nkeys.KeyPair) string {
 	t.Helper()
 	pubKey, err := accKey.PublicKey()

@@ -626,26 +626,34 @@ func (store *DirJWTStore) saveIfNewer(publicKey string, theJWT string) error {
 			return err
 		}
 	}
+	// Compare under the lock, so a concurrent save or delete can't be overwritten.
+	store.Lock()
 	if _, err := os.Stat(path); err == nil {
 		if newJWT, err := jwt.DecodeGeneric(theJWT); err != nil {
+			store.Unlock()
 			return err
 		} else if existing, err := os.ReadFile(path); err != nil {
+			store.Unlock()
 			return err
 		} else if existingJWT, err := jwt.DecodeGeneric(string(existing)); err != nil {
 			// skip if it can't be decoded
-		} else if existingJWT.ID == newJWT.ID {
-			return nil
 		} else if existingJWT.IssuedAt > newJWT.IssuedAt {
+			store.Unlock()
+			return nil
+		} else if existingJWT.IssuedAt == newJWT.IssuedAt && string(existing) >= theJWT {
+			// Keep the same JWT on all servers, if issued in the same second.
+			// The ID can't decide, it doesn't cover the account claims.
+			store.Unlock()
 			return nil
 		} else if newJWT.Subject != publicKey {
+			store.Unlock()
 			return fmt.Errorf("jwt subject nkey and provided nkey do not match")
 		} else if existingJWT.Subject != newJWT.Subject {
+			store.Unlock()
 			return fmt.Errorf("subject of existing and new jwt do not match")
 		}
 	}
-	store.Lock()
 	// Don't bring back an account that was deleted after this JWT was issued.
-	// Checked under the lock, so a concurrent delete can't be missed.
 	if deleted, err := store.isDeleted(path, decodeUnverified(theJWT).IssuedAt); err != nil || deleted {
 		store.Unlock()
 		return err
