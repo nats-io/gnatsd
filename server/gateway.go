@@ -2776,6 +2776,16 @@ func (c *client) sendAccountUnsubToGateway(accName []byte) {
 	// Check if we have sent the A- or not.
 	c.mu.Lock()
 	e, sent := c.gw.insim[string(accName)]
+	// Once the account has left optimistic mode (interest-only, or switching
+	// to it), an A- would replace the remote's entry with nil: it then drops
+	// our RS+ and the switch-complete command, and after the next A+ it never
+	// sends on this account again. In interest-only mode a message we have
+	// no interest in crossed our last RS-; while switching, the remote may
+	// still be sending optimistically. Either way, dropping it is enough.
+	if e != nil && e.mode != Optimistic {
+		c.mu.Unlock()
+		return
+	}
 	if e != nil || !sent {
 		// Add a nil value to indicate that we have sent an A-
 		// so that we know to send A+ when needed.

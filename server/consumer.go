@@ -3781,6 +3781,10 @@ func (o *consumer) processAckMsgLocked(sseq, dseq, dc uint64, reply string, doSa
 		if o.maxp > 0 && len(o.pending) >= o.maxp {
 			needSignal = true
 		}
+		// Use the original deliver sequence from our pending record.
+		if p, ok := o.pending[sseq]; ok {
+			dseq = p.Sequence
+		}
 		sgap := sseq - o.asflr
 		o.adflr, o.asflr = dseq, sseq
 
@@ -3812,6 +3816,10 @@ func (o *consumer) processAckMsgLocked(sseq, dseq, dc uint64, reply string, doSa
 			for seq := sseq; seq > sseq-sgap && len(o.pending) > 0; seq-- {
 				remove(seq)
 			}
+		}
+		// Nothing pending, so move the floor up to the last delivered message.
+		if len(o.pending) == 0 {
+			o.adflr, o.asflr = o.dseq-1, o.sseq-1
 		}
 	case AckNone:
 		// FIXME(dlc) - This is error but do we care?
@@ -6094,7 +6102,7 @@ func (o *consumer) getNextToRedeliver() uint64 {
 		o.rdq = nil
 		o.rdqi.Empty()
 	} else {
-		o.rdq = append(o.rdq[:0], o.rdq[1:]...)
+		o.rdq = o.rdq[1:]
 		o.rdqi.Delete(seq)
 	}
 	return seq

@@ -1062,8 +1062,18 @@ func (a *Account) addStreamWithAssignment(config *StreamConfig, fsConfig *FileSt
 		fsCfg.SyncAlways = false
 		fsCfg.AsyncFlush = true
 	}
+
+	var removeStoreDir bool
+	if cfg.Storage == FileStorage && !recovering {
+		_, err := os.Stat(storeDir)
+		removeStoreDir = os.IsNotExist(err)
+	}
 	if err := mset.setupStore(fsCfg); err != nil {
-		mset.stop(true, false)
+		// Resources have not been reserved, and an existing directory may contain recovery data.
+		mset.stop(false, false)
+		if removeStoreDir {
+			os.RemoveAll(storeDir)
+		}
 		return nil, NewJSStreamStoreFailedError(err)
 	}
 
@@ -8665,7 +8675,7 @@ func (mset *stream) stop(deleteFlag, advisory bool) error {
 	sysc := mset.sysc
 	mset.sysc = nil
 
-	if deleteFlag {
+	if deleteFlag || mset.store == nil {
 		// Unregistering ipQueues do not prevent them from push/pop
 		// just will remove them from the central monitoring map
 		mset.msgs.unregister()

@@ -1559,6 +1559,46 @@ func TestLeafNodeInfoPermissionUpdatesAllowedForSolicitedLeaf(t *testing.T) {
 	require_False(t, c.canSubscribe("other.foo"))
 }
 
+// https://github.com/nats-io/nats-server/issues/8827
+func TestLeafNodeAcceptSideClosedDuringConnectNotLeaked(t *testing.T) {
+	s := RunServer(DefaultOptions())
+	defer s.Shutdown()
+
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	acc := s.GlobalAccount()
+
+	c := &client{
+		kind: LEAF,
+		srv:  s,
+		nc:   serverConn,
+		acc:  acc,
+		leaf: &leaf{},
+	}
+	c.cid = 123456789
+
+	// Simulate that registerWithAccount() already added this client to the
+	// account (acc.addClient()) before the close was detected, as would
+	// happen on the accept side during authentication.
+	acc.addClient(c)
+	require_Equal(t, acc.NumLeafNodes(), 1)
+
+	// Simulate the connection having been closed concurrently with the
+	// CONNECT processing, before addLeafNodeConnection() runs (e.g. the
+	// leaf auth timer firing). The first closeConnection() call in that
+	// race finds nothing in s.leafs to remove yet.
+	c.mu.Lock()
+	c.flags.set(closeConnection)
+	c.mu.Unlock()
+
+	require_NoError(t, c.processLeafNodeConnect(s, []byte("{}"), _EMPTY_))
+
+	require_Equal(t, s.NumLeafNodes(), 0)
+	require_Equal(t, acc.NumLeafNodes(), 0)
+}
+
 func TestLeafNodePubAllowedPruning(t *testing.T) {
 	c := &client{}
 	c.setPermissions(&Permissions{Publish: &SubjectPermission{Allow: []string{"foo"}}})

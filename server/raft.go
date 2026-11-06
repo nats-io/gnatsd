@@ -240,6 +240,9 @@ type raft struct {
 	hcterm  uint64 // Term in which hcindex was recorded
 	hcindex uint64 // Leader's last index when we first heard from it in hcterm, must be processed to be healthy
 
+	snapsub *subscription // Receives a newer leader snapshot while paused
+	snapreq time.Time     // When we last requested a newer leader snapshot while paused
+
 	prop  *ipQueue[*proposedEntry]       // Proposals
 	entry *ipQueue[*appendEntry]         // Append entries
 	resp  *ipQueue[*appendEntryResponse] // Append entries responses
@@ -1199,8 +1202,33 @@ func (n *raft) ResumeApply() {
 
 	n.debug("Resuming our apply channel")
 
+	// Newer leader snapshots are only requested while paused.
+	if n.snapsub != nil {
+		n.unsubscribe(n.snapsub)
+		n.snapsub = nil
+	}
+
 	// Reset before we start.
 	n.resetElectionTimeout()
+
+	// A leader snapshot installed while paused is applied first, replays continue after it.
+	if n.papplied > n.commit {
+		snap, err := n.loadLastSnapshot()
+		if err == nil && snap.lastIndex != n.papplied {
+			err = fmt.Errorf("snapshot index mismatch: %d != %d", snap.lastIndex, n.papplied)
+		}
+		if err != nil {
+			// The log was compacted up to the snapshot, start over.
+			n.warn("Could not load leader snapshot installed while paused, resetting: %v", err)
+			n.resetWAL()
+			n.cancelCatchup()
+			// Nothing left to replay.
+			n.hcommit = 0
+		} else {
+			n.commit = snap.lastIndex
+			n.apply.push(newCommittedEntry(n.commit, []*Entry{{EntrySnapshot, snap.data}}))
+		}
+	}
 
 	// Run catchup..
 	if n.hcommit > n.commit {
@@ -3031,15 +3059,18 @@ var arPool = sync.Pool{
 const (
 	idLen                  = 8
 	appendEntryResponseLen = 24 + 1
+	// A snapshot request leaves out the success flag, so older servers drop it as malformed.
+	snapshotRequestLen = appendEntryResponseLen - 1
 )
 
 // appendEntryResponse is our response to a received appendEntry.
 type appendEntryResponse struct {
-	term    uint64
-	index   uint64
-	peer    string
-	reply   string // internal usage.
-	success bool
+	term     uint64
+	index    uint64
+	peer     string
+	reply    string // internal usage.
+	success  bool
+	snapshot bool // Requests a snapshot past index from the leader, sent to reply.
 }
 
 // Create a new appendEntryResponse.
@@ -3047,7 +3078,7 @@ func newAppendEntryResponse(term, index uint64, peer string, success bool) *appe
 	ar := arPool.Get().(*appendEntryResponse)
 	ar.term, ar.index, ar.peer, ar.success = term, index, peer, success
 	// Always empty out.
-	ar.reply = _EMPTY_
+	ar.reply, ar.snapshot = _EMPTY_, false
 	return ar
 }
 
@@ -3062,6 +3093,9 @@ func (ar *appendEntryResponse) encode(b []byte) []byte {
 	le.PutUint64(buf[0:], ar.term)
 	le.PutUint64(buf[8:], ar.index)
 	copy(buf[16:16+idLen], ar.peer)
+	if ar.snapshot {
+		return buf[:snapshotRequestLen]
+	}
 	if ar.success {
 		buf[24] = 1
 	} else {
@@ -3074,11 +3108,12 @@ func (ar *appendEntryResponse) encode(b []byte) []byte {
 var peers sync.Map
 
 func decodeAppendEntryResponse(msg []byte) *appendEntryResponse {
-	if len(msg) != appendEntryResponseLen {
+	if len(msg) != appendEntryResponseLen && len(msg) != snapshotRequestLen {
 		return nil
 	}
 	le := binary.LittleEndian
 	ar := arPool.Get().(*appendEntryResponse)
+	ar.snapshot = len(msg) == snapshotRequestLen
 	ar.term = le.Uint64(msg[0:])
 	ar.index = le.Uint64(msg[8:])
 
@@ -3089,7 +3124,7 @@ func decodeAppendEntryResponse(msg []byte) *appendEntryResponse {
 		peers.Store(peer, peer)
 	}
 	ar.peer = peer.(string)
-	ar.success = msg[24] == 1
+	ar.success = !ar.snapshot && msg[24] == 1
 	return ar
 }
 
@@ -4344,6 +4379,13 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 		return
 	}
 
+	// A newer leader snapshot we requested while paused.
+	if sub != nil && sub == n.snapsub {
+		n.processSnapshotResponseLocked(ae)
+		n.Unlock()
+		return
+	}
+
 	// Scratch buffer for responses.
 	var scratch [appendEntryResponseLen]byte
 	arbuf := scratch[:]
@@ -4517,13 +4559,18 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 	// This encourages the leader to sync us via a snapshot instead. We use max(applied, papplied) to avoid
 	// incorrectly triggering this pause immediately after receiving a snapshot.
 	applied := max(n.applied, n.papplied)
-	commit := max(n.commit, n.papplied)
+	// Commits held while applies are paused count too, they're replayed all at once on resume.
+	commit := max(n.commit, n.hcommit, n.papplied)
 	if sub != nil && (commit > applied || n.quorumPaused) {
 		diff := commit - applied
 		if n.quorumPaused {
 			if n.overrun(diff, paeWarnThreshold, paeWarnBytes) {
 				if catchingUp {
 					n.cancelCatchup()
+				}
+				// A newer snapshot lets us compact the held log and resume.
+				if isNew && n.paused {
+					n.requestSnapshotLocked(ae.reply)
 				}
 				n.Unlock()
 				return
@@ -4784,6 +4831,9 @@ CONTINUE:
 		if n.paused {
 			n.hcommit = aeCommit
 			n.debug("Paused, not applying %d", aeCommit)
+			if isNew && n.overrun(n.pindex-n.papplied, paeDropThreshold, paeDropBytes) {
+				n.requestSnapshotLocked(aeReply)
+			}
 		} else {
 			for index := n.commit + 1; index <= aeCommit; index++ {
 				if err := n.applyCommit(index); err != nil {
@@ -4868,6 +4918,13 @@ func (n *raft) processPeerState(ps *peerState) {
 func (n *raft) processAppendEntryResponse(ar *appendEntryResponse) {
 	n.trackPeer(ar.peer)
 
+	// A paused follower asks for a newer snapshot, this says nothing about its log.
+	if ar.snapshot {
+		n.processSnapshotRequest(ar)
+		arPool.Put(ar)
+		return
+	}
+
 	if ar.success {
 		// The remote node successfully committed the append entry.
 		// They agree with our leadership and are happy with the state of the log.
@@ -4917,6 +4974,119 @@ func (n *raft) processAppendEntryResponse(ar *appendEntryResponse) {
 		n.Unlock()
 		// Either way, return back to pool.
 		arPool.Put(ar)
+	}
+}
+
+// requestSnapshotLocked asks the leader for a newer snapshot, so we can compact the log we hold while paused.
+// Lock should be held.
+func (n *raft) requestSnapshotLocked(reply string) {
+	if reply == _EMPTY_ || time.Since(n.snapreq) < snapshotRequestInterval {
+		return
+	}
+	if n.snapsub == nil {
+		sub, err := n.subscribe(n.newInbox(), n.handleAppendEntry)
+		if err != nil {
+			return
+		}
+		n.snapsub = sub
+	}
+	n.snapreq = time.Now()
+	ar := newAppendEntryResponse(n.term, n.papplied, n.id, false)
+	ar.snapshot = true
+	n.sendRPC(reply, string(n.snapsub.subject), ar.encode(nil))
+	arPool.Put(ar)
+}
+
+// processSnapshotResponseLocked installs a newer leader snapshot while applies are paused.
+// It only compacts our log, the snapshot is applied once we resume.
+// Lock should be held.
+func (n *raft) processSnapshotResponseLocked(ae *appendEntry) {
+	if !n.paused || len(ae.entries) != 2 || ae.entries[0].Type != EntrySnapshot || ae.entries[1].Type != EntryPeerState {
+		return
+	}
+	// Only replace entries not yet applied.
+	if ae.pindex <= max(n.commit, n.papplied) {
+		return
+	}
+	if ae.pindex <= n.pindex {
+		eae, err := n.loadEntry(ae.pindex)
+		if err != nil {
+			return
+		}
+		term, pterm, pindex := eae.term, eae.pterm, eae.pindex
+		eae.returnToPool()
+		if term != ae.pterm {
+			// Our held commits match the leader, so they can only differ if Raft's guarantees were broken.
+			if ae.pindex <= n.hcommit {
+				assert.Unreachable("Leader snapshot mismatches paused follower commits", map[string]any{
+					"n.accName": n.accName,
+					"n.group":   n.group,
+					"n.id":      n.id,
+					"n.pindex":  n.pindex,
+					"n.commit":  n.commit,
+					"n.hcommit": n.hcommit,
+					"ae.pterm":  ae.pterm,
+					"ae.pindex": ae.pindex,
+					"term":      term,
+				})
+				n.warn("Leader snapshot [%d:%d] mismatches our log term %d, ignoring", ae.pterm, ae.pindex, term)
+				return
+			}
+			// Our log holds an uncommitted suffix from an older leader, the snapshot replaces it.
+			n.debug("Leader snapshot [%d:%d] mismatches our log term %d, truncating", ae.pterm, ae.pindex, term)
+			n.truncateWAL(pterm, pindex)
+			if n.werr != nil {
+				return
+			}
+		}
+	}
+	// A snapshot past our log covers all of it, our log restarts at the snapshot.
+	pastLog := ae.pindex > n.pindex
+	if pastLog {
+		ps, err := decodePeerState(ae.entries[1].Data)
+		if err != nil {
+			n.warn("Could not parse snapshot peerstate correctly")
+			return
+		}
+		// The snapshot's membership is newer than our log.
+		n.processPeerState(ps)
+	}
+	snap := &snapshot{
+		lastTerm:  ae.pterm,
+		lastIndex: ae.pindex,
+		peerstate: ae.entries[1].Data,
+		data:      ae.entries[0].Data,
+	}
+	if err := n.installSnapshot(snap); err != nil {
+		n.warn("Error installing leader snapshot while paused: %v", err)
+		return
+	}
+	if pastLog {
+		// The leader catches us up from the snapshot.
+		n.pindex, n.pterm = ae.pindex, ae.pterm
+		// Any membership change was in our log, so it's contained in the snapshot's peer state.
+		n.membChange = nil
+	}
+	n.debug("Installed leader snapshot [%d:%d] while paused", ae.pterm, ae.pindex)
+}
+
+// processSnapshotRequest sends our latest snapshot to a paused follower if it's past their snapshot.
+// They only compact their log with it, and apply it once they resume.
+func (n *raft) processSnapshotRequest(ar *appendEntryResponse) {
+	n.Lock()
+	defer n.Unlock()
+	// Only respond with a snapshot if we have a new one for them.
+	if n.State() != Leader || ar.term != n.term || ar.reply == _EMPTY_ || n.papplied <= ar.index {
+		return
+	}
+	snap, err := n.loadLastSnapshot()
+	if err != nil {
+		return
+	}
+	ae := n.buildAppendEntry([]*Entry{{EntrySnapshot, snap.data}, {EntryPeerState, snap.peerstate}})
+	ae.pterm, ae.pindex = snap.lastTerm, snap.lastIndex
+	if encoding, err := ae.encode(nil); err == nil {
+		n.sendRPC(ar.reply, _EMPTY_, encoding)
 	}
 }
 
@@ -4978,6 +5148,9 @@ func (n *raft) storeToWAL(ae *appendEntry) error {
 const (
 	pauseQuorumThreshold = 100_000
 	pauseQuorumBytes     = 1 * 1024 * 1024 * 1024 // 1GB
+
+	// snapshotRequestInterval is how often a paused follower may ask for a newer leader snapshot.
+	snapshotRequestInterval = 2 * time.Second
 
 	paeDropThreshold = 20_000
 	paeDropBytes     = 256 * 1024 * 1024 // 256MB

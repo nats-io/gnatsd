@@ -1252,6 +1252,122 @@ func TestFileStoreRemoveOutOfOrderRecovery(t *testing.T) {
 	})
 }
 
+func TestFileStoreRecoveryErrorDoesNotPanic(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		cfg      StreamConfig
+		wantMsgs uint64
+	}{
+		{name: "MaxAge", cfg: StreamConfig{MaxAge: time.Minute}},
+		{name: "MaxMsgs", cfg: StreamConfig{MaxMsgs: 1}, wantMsgs: 1},
+		{name: "MaxBytes", cfg: StreamConfig{MaxBytes: 1}},
+		{name: "MaxMsgsPerSubject", cfg: StreamConfig{MaxMsgsPer: 1}, wantMsgs: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fcfg := FileStoreConfig{StoreDir: t.TempDir(), BlockSize: 64}
+			cfg := StreamConfig{Name: "TEST", Storage: FileStorage}
+			fs, err := newFileStore(fcfg, cfg)
+			require_NoError(t, err)
+			defer fs.Stop()
+
+			ts := time.Now().Add(-time.Hour).UnixNano()
+			for seq := uint64(1); seq <= 2; seq++ {
+				require_NoError(t, fs.StoreRawMsg("foo", nil, bytes.Repeat([]byte("A"), 64), seq, ts, 0, false))
+			}
+			require_Equal(t, fs.numMsgBlocks(), 2)
+			blockPath := fs.getFirstBlock().mfn
+			require_NoError(t, fs.Stop())
+
+			original, err := os.ReadFile(blockPath)
+			require_NoError(t, err)
+			// Keep the stream index and last block intact so recovery reaches the unreadable block.
+			meta := CompressionInfo{Algorithm: S2Compression, OriginalSize: uint64(len(original))}
+			require_NoError(t, os.WriteFile(blockPath, meta.MarshalMetadata(), defaultFilePerms))
+
+			cfg = test.cfg
+			cfg.Name, cfg.Storage = "TEST", FileStorage
+			recovered, err := newFileStore(fcfg, cfg)
+			if recovered != nil {
+				defer recovered.Stop()
+			}
+			require_Error(t, err, errors.New("compressed buffer is too short"))
+			require_True(t, recovered == nil)
+
+			require_NoError(t, os.WriteFile(blockPath, original, defaultFilePerms))
+			recovered, err = newFileStore(fcfg, cfg)
+			require_NoError(t, err)
+			defer recovered.Stop()
+			require_Equal(t, recovered.State().Msgs, test.wantMsgs)
+		})
+	}
+}
+
+func TestFileStoreRecoveryErrorStopsAgeCheck(t *testing.T) {
+	fcfg := FileStoreConfig{StoreDir: t.TempDir(), BlockSize: 64}
+	cfg := StreamConfig{Name: "TEST", Storage: FileStorage}
+	fs, err := newFileStore(fcfg, cfg)
+	require_NoError(t, err)
+	defer fs.Stop()
+	for seq := uint64(1); seq <= 2; seq++ {
+		require_NoError(t, fs.StoreRawMsg("foo", nil, bytes.Repeat([]byte("A"), 64), seq, time.Now().UnixNano(), 0, false))
+	}
+	require_Equal(t, fs.numMsgBlocks(), 2)
+	blockPath, lastBlockPath := fs.getFirstBlock().mfn, fs.lmb.mfn
+	require_NoError(t, fs.Stop())
+	original := make(map[string][]byte)
+	for _, path := range []string{blockPath, lastBlockPath, filepath.Join(fcfg.StoreDir, msgDir, streamStreamStateFile)} {
+		data, err := os.ReadFile(path)
+		require_NoError(t, err)
+		original[path] = data
+	}
+	meta := CompressionInfo{Algorithm: S2Compression, OriginalSize: uint64(len(original[blockPath]))}
+	require_NoError(t, os.WriteFile(blockPath, meta.MarshalMetadata(), defaultFilePerms))
+
+	const maxAge = time.Second
+	cfg.MaxAge, cfg.MaxMsgsPer = maxAge, 1
+	recovered, err := newFileStore(fcfg, cfg)
+	require_Error(t, err, errors.New("compressed buffer is too short"))
+	require_True(t, recovered == nil)
+	indexPath := filepath.Join(fcfg.StoreDir, msgDir, streamStreamStateFile)
+	index, err := os.ReadFile(indexPath)
+	require_NoError(t, err)
+	require_True(t, bytes.Equal(index, original[indexPath]))
+
+	require_NoError(t, os.WriteFile(blockPath, original[blockPath], defaultFilePerms))
+	cfg.MaxAge, cfg.MaxMsgsPer = 0, 0
+	recovered, err = newFileStore(fcfg, cfg)
+	require_NoError(t, err)
+	defer recovered.Stop()
+	// Allow the failed store's age timer to fire after the repaired store is open.
+	time.Sleep(2 * maxAge)
+	for _, path := range []string{blockPath, lastBlockPath} {
+		data, err := os.ReadFile(path)
+		require_NoError(t, err)
+		require_True(t, bytes.Equal(data, original[path]))
+	}
+	require_Equal(t, recovered.State().Msgs, 2)
+}
+
+func TestFileStoreClosedAgeCheck(t *testing.T) {
+	fs, err := newFileStore(FileStoreConfig{StoreDir: t.TempDir()}, StreamConfig{
+		Name: "TEST", Storage: FileStorage, MaxAge: time.Hour,
+	})
+	require_NoError(t, err)
+	defer fs.Stop()
+	_, _, err = fs.StoreMsg("foo", nil, []byte("hello"), 0)
+	require_NoError(t, err)
+	require_NoError(t, fs.Stop())
+
+	// A timer callback may already be queued when Stop cancels the timer.
+	fs.expireMsgs()
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	defer fs.cancelAgeChk()
+	require_True(t, fs.ageChk == nil)
+	fs.resetAgeChk(0)
+	require_True(t, fs.ageChk == nil)
+}
+
 func TestFileStoreAgeLimitRecovery(t *testing.T) {
 	maxAge := 1 * time.Second
 
@@ -9012,6 +9128,75 @@ func Benchmark_FileStoreCreateConsumerStores(b *testing.B) {
 	}
 }
 
+func BenchmarkFileStoreLoadMsgRejectedMessages(b *testing.B) {
+	benchmarkFileStoreLoadMsgRejectedMessages(b, false)
+}
+
+func BenchmarkFileStoreLoadMsgMultiRejectedMessages(b *testing.B) {
+	benchmarkFileStoreLoadMsgRejectedMessages(b, true)
+}
+
+func benchmarkFileStoreLoadMsgRejectedMessages(b *testing.B, multi bool) {
+	for _, test := range []struct {
+		name string
+		msgs int
+		size int
+	}{
+		{"ManySmall", 65536, 16},
+		{"Large", 64, 64 * 1024},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			fs, err := newFileStore(
+				FileStoreConfig{StoreDir: b.TempDir(), BlockSize: 8 * 1024 * 1024},
+				StreamConfig{Name: "bench", Subjects: []string{"data.>"}, Storage: FileStorage})
+			require_NoError(b, err)
+			defer fs.Stop()
+
+			_, _, err = fs.StoreMsg("data.match", nil, []byte("match"), 0)
+			require_NoError(b, err)
+			payload := bytes.Repeat([]byte("x"), test.size)
+			for range test.msgs {
+				_, _, err = fs.StoreMsg("data.other", nil, payload, 0)
+				require_NoError(b, err)
+			}
+			last, _, err := fs.StoreMsg("data.match", nil, []byte("match"), 0)
+			require_NoError(b, err)
+			require_Equal(b, fs.numMsgBlocks(), 1)
+
+			sl := gsl.NewSimpleSublist()
+			require_NoError(b, sl.Insert("data.match", struct{}{}))
+			if multi {
+				require_NoError(b, sl.Insert("data.absent", struct{}{}))
+			}
+			for _, reverse := range []bool{false, true} {
+				name, loadMsg := "Next", fs.LoadNextMsgMulti
+				start, want := uint64(2), last
+				if reverse {
+					name, loadMsg = "Prev", fs.LoadPrevMsgMulti
+					start, want = last-1, 1
+				}
+				b.Run(name, func(b *testing.B) {
+					var smv StoreMsg
+					// Warm the cache and start inside the matching subject's bounds.
+					sm, seq, err := loadMsg(sl, start, &smv)
+					require_NoError(b, err)
+					require_Equal(b, seq, want)
+					require_Equal(b, sm.seq, want)
+					b.ReportAllocs()
+					b.ResetTimer()
+					for range b.N {
+						sm, seq, err := loadMsg(sl, start, &smv)
+						if err != nil || seq != want || sm == nil || sm.seq != want {
+							b.Fatalf("Expected sequence %d, got %d: %v", want, seq, err)
+						}
+					}
+					b.StopTimer()
+				})
+			}
+		})
+	}
+}
+
 func BenchmarkFileStoreLoadNextMsgMultiRepeatedSubjects(b *testing.B) {
 	benchmarkFileStoreLoadMsgMulti(b, false)
 }
@@ -11813,6 +11998,83 @@ func TestFileStoreMessageScheduleDecodeRejectsMalformed(t *testing.T) {
 			_, err := ms.decode(test.buf)
 			require_Error(t, err, test.err)
 		})
+	}
+}
+
+func TestFileStoreLoadPrevMsgSkipsBlocks(t *testing.T) {
+	run := func(t *testing.T, filters []string, removeLast bool) {
+		fcfg := FileStoreConfig{StoreDir: t.TempDir(), BlockSize: 256}
+		cfg := StreamConfig{Name: "zzz", Subjects: []string{"foo.*"}, Storage: FileStorage}
+		fs, err := newFileStore(fcfg, cfg)
+		require_NoError(t, err)
+		for i := range 100 {
+			subj := "foo.b"
+			if i == 30 || i == 60 {
+				subj = "foo.a"
+			}
+			_, _, err = fs.StoreMsg(subj, nil, nil, 0)
+			require_NoError(t, err)
+		}
+		require_True(t, fs.numMsgBlocks() >= 10)
+		// Leaves psim's last block for "foo.a" pointing past its last message.
+		if removeLast {
+			_, err = fs.RemoveMsg(61)
+			require_NoError(t, err)
+		}
+
+		// Restart, so the per-block subject state is no longer in memory.
+		require_NoError(t, fs.Stop())
+		fs, err = newFileStore(fcfg, cfg)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		// A single filter goes through LoadPrevMsg, multiple through loadPrevMsgMultiLocked.
+		sl := gsl.NewSimpleSublist()
+		for _, filter := range filters {
+			require_NoError(t, sl.Insert(filter, struct{}{}))
+		}
+		var smv StoreMsg
+		var got []uint64
+		for start := uint64(100); ; {
+			_, seq, err := fs.LoadPrevMsgMulti(sl, start, &smv)
+			if err == ErrStoreEOF {
+				break
+			}
+			require_NoError(t, err)
+			got = append(got, seq)
+			start = seq - 1
+		}
+		if removeLast {
+			require_True(t, slices.Equal(got, []uint64{31}))
+			return
+		}
+		require_True(t, slices.Equal(got, []uint64{61, 31}))
+
+		// The blocks between the last match and the last block were skipped.
+		fs.mu.RLock()
+		defer fs.mu.RUnlock()
+		bi, _ := fs.selectMsgBlockWithIndex(61)
+		require_True(t, bi < len(fs.blks)-2)
+		for _, mb := range fs.blks[bi+1 : len(fs.blks)-1] {
+			mb.mu.Lock()
+			notLoaded := mb.fssNotLoaded()
+			mb.mu.Unlock()
+			require_True(t, notLoaded)
+		}
+	}
+	for _, test := range []struct {
+		title   string
+		filters []string
+	}{
+		{title: "Literal", filters: []string{"foo.a"}},
+		{title: "Wildcard", filters: []string{"*.a"}},
+		{title: "Multi", filters: []string{"foo.a", "foo.c"}},
+	} {
+		for _, removeLast := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/RemoveLast=%v", test.title, removeLast), func(t *testing.T) {
+				run(t, test.filters, removeLast)
+			})
+		}
 	}
 }
 

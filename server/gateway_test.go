@@ -8078,3 +8078,99 @@ func TestGatewayLogsRemoteURL(t *testing.T) {
 	s1.Shutdown()
 	checkNoticeNotContains(t, l, remoteURLLogUser, remoteURLLogPassword)
 }
+
+// A message can still be in flight from the remote when the last subscription
+// on an interest-only account goes away. Its arrival must not produce an A-:
+// that would take the account out of interest-only mode on both sides, the
+// following A+ would leave the remote with no entry for the account, and an
+// interest-only remote then never sends on it again.
+func TestGatewayNoAccountUnsubInInterestOnlyMode(t *testing.T) {
+	ob := testDefaultOptionsForGateway("B")
+	sb := runGatewayServer(ob)
+	defer sb.Shutdown()
+
+	oa := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
+	sa := runGatewayServer(oa)
+	defer sa.Shutdown()
+
+	waitForOutboundGateways(t, sa, 1, time.Second)
+	waitForOutboundGateways(t, sb, 1, time.Second)
+	waitForInboundGateways(t, sa, 1, time.Second)
+	waitForInboundGateways(t, sb, 1, time.Second)
+
+	ncA := natsConnect(t, sa.ClientURL())
+	defer ncA.Close()
+	sub := natsSubSync(t, ncA, "foo")
+	natsFlush(t, ncA)
+	checkGWInterestOnlyModeInterestOn(t, sb, "A", globalAccountName, "foo")
+
+	natsUnsub(t, sub)
+	natsFlush(t, ncA)
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		c := sb.getOutboundGatewayConnection("A")
+		ei, _ := c.gw.outsim.Load(globalAccountName)
+		if ei == nil {
+			return fmt.Errorf("no entry for account %q", globalAccountName)
+		}
+		if r := ei.(*outsie).sl.Match("foo"); len(r.psubs) != 0 {
+			return fmt.Errorf("interest on %q still registered", "foo")
+		}
+		return nil
+	})
+
+	// Deliver, on A, a message from B that crossed the RS- for "foo": the
+	// account now has no subscriptions at all.
+	var gws []*client
+	sa.getInboundGatewayConnections(&gws)
+	require_Len(t, len(gws), 1)
+	acc := sa.globalAccount()
+	sa.gatewayHandleSubjectNoInterest(gws[0], acc, []byte(acc.Name), []byte("foo"))
+
+	sub = natsSubSync(t, ncA, "bar")
+	natsFlush(t, ncA)
+	checkGWInterestOnlyMode(t, sb, "A", globalAccountName)
+	checkGWInterestOnlyModeInterestOn(t, sb, "A", globalAccountName, "bar")
+
+	ncB := natsConnect(t, sb.ClientURL())
+	defer ncB.Close()
+	natsPub(t, ncB, "bar", []byte("hello"))
+	natsFlush(t, ncB)
+	natsNexMsg(t, sub, time.Second)
+}
+
+// Same as above, but the message arrives while the account is switching to
+// interest-only mode, before the switch completes.
+func TestGatewayNoAccountUnsubWhileSwitchingToInterestOnlyMode(t *testing.T) {
+	ob := testDefaultOptionsForGateway("B")
+	sb := runGatewayServer(ob)
+	defer sb.Shutdown()
+
+	oa := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
+	sa := runGatewayServer(oa)
+	defer sa.Shutdown()
+
+	waitForOutboundGateways(t, sa, 1, time.Second)
+	waitForOutboundGateways(t, sb, 1, time.Second)
+	waitForInboundGateways(t, sa, 1, time.Second)
+	waitForInboundGateways(t, sb, 1, time.Second)
+	checkGWInterestOnlyMode(t, sb, "A", globalAccountName)
+
+	var gws []*client
+	sa.getInboundGatewayConnections(&gws)
+	require_Len(t, len(gws), 1)
+	gwc := gws[0]
+	gwc.mu.Lock()
+	e := gwc.gw.insim[globalAccountName]
+	require_NotNil(t, e)
+	e.mode = Transitioning
+	gwc.mu.Unlock()
+
+	acc := sa.globalAccount()
+	sa.gatewayHandleSubjectNoInterest(gwc, acc, []byte(acc.Name), []byte("foo"))
+
+	gwc.mu.Lock()
+	e = gwc.gw.insim[globalAccountName]
+	gwc.mu.Unlock()
+	require_NotNil(t, e)
+	checkGWInterestOnlyMode(t, sb, "A", globalAccountName)
+}

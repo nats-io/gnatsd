@@ -730,3 +730,77 @@ func TestJetStreamApiErrorOnRequiredApiLevelPullConsumerNextMsg(t *testing.T) {
 	require_Equal(t, msg.Header.Get("Status"), "412")
 	require_Equal(t, msg.Header.Get("Description"), "Required Api Level")
 }
+
+func TestJetStreamUnsupportedAssignmentWithUnknownEnum(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	cbuf := []byte(`{"name":"C","stream":"S","consumer":{"durable_name":"C","ack_policy":"unknown","max_deliver":-1,"metadata":{"_nats.req.level":"1000"}},"group":{"name":"G","peers":["A"]}}`)
+	ca, err := decodeConsumerAssignment(cbuf)
+	require_NoError(t, err)
+	require_NotNil(t, ca.unsupported)
+	require_Equal(t, ca.unsupported.reason, `unsupported - config error: invalid value "unknown" for field "ack_policy"`)
+	require_Equal(t, ca.Config.Durable, "C")
+	require_Equal(t, ca.Config.MaxDeliver, -1)
+	require_Equal(t, getRequiredApiLevel(ca.Config.Metadata), "1000")
+
+	sbuf := []byte(`{"stream":{"name":"S","retention":"unknown","max_msgs":10,"metadata":{"_nats.req.level":"1000"}},"group":{"name":"G","peers":["A"]}}`)
+	sa, err := decodeStreamAssignment(s, sbuf)
+	require_NoError(t, err)
+	require_NotNil(t, sa.unsupported)
+	require_Equal(t, sa.unsupported.reason, `unsupported - config error: invalid value "unknown" for field "retention"`)
+	require_Equal(t, sa.Config.Name, "S")
+	require_Equal(t, sa.Config.MaxMsgs, 10)
+	require_Equal(t, getRequiredApiLevel(sa.Config.Metadata), "1000")
+
+	// A field that fails to decode is left unset, even if part of it decoded.
+	sbuf = []byte(`{"stream":{"name":"S","mirror":{"name":"M","opt_start_seq":"x"}},"group":{"name":"G","peers":["A"]}}`)
+	sa, err = decodeStreamAssignment(s, sbuf)
+	require_NoError(t, err)
+	require_NotNil(t, sa.unsupported)
+	require_Equal(t, sa.unsupported.reason, `unsupported - config error: invalid value for field "mirror"`)
+	require_Equal(t, sa.Config.Name, "S")
+	require_True(t, sa.Config.Mirror == nil)
+
+	// An unknown storage type falls back to file storage, so the config can still be marshaled.
+	sbuf = []byte(`{"stream":{"name":"S","storage":"unknown"},"group":{"name":"G","peers":["A"]}}`)
+	sa, err = decodeStreamAssignment(s, sbuf)
+	require_NoError(t, err)
+	require_NotNil(t, sa.unsupported)
+	require_Equal(t, sa.unsupported.reason, `unsupported - config error: invalid value "unknown" for field "storage"`)
+	require_Equal(t, sa.Config.Storage, FileStorage)
+	_, err = json.Marshal(sa.Config)
+	require_NoError(t, err)
+
+	// A config that isn't an object still fails to decode.
+	_, err = decodeConsumerAssignment([]byte(`{"name":"C","stream":"S","consumer":"invalid"}`))
+	require_Error(t, err)
+}
+
+func TestJetStreamUnsupportedAssignmentProposalKeepsConfig(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	scfg := `{"name":"S","storage":"unknown","unknown":true}`
+	sa, err := decodeStreamAssignment(s, fmt.Appendf(nil, `{"stream":%s,"group":{"name":"G","peers":["A"],"store":"file"}}`, scfg))
+	require_NoError(t, err)
+	require_NotNil(t, sa.unsupported)
+	for _, buf := range [][]byte{encodeAddStreamAssignment(sa), encodeUpdateStreamAssignment(sa), encodeDeleteStreamAssignment(sa)} {
+		nsa, err := decodeStreamAssignment(s, buf[1:])
+		require_NoError(t, err)
+		require_Equal(t, string(nsa.ConfigJSON), scfg)
+	}
+
+	ccfg := `{"durable_name":"C","ack_policy":"unknown","unknown":true}`
+	ca, err := decodeConsumerAssignment(fmt.Appendf(nil, `{"name":"C","stream":"S","consumer":%s,"group":{"name":"G","peers":["A"],"store":"file"}}`, ccfg))
+	require_NoError(t, err)
+	require_NotNil(t, ca.unsupported)
+	for _, buf := range [][]byte{encodeAddConsumerAssignment(ca), encodeDeleteConsumerAssignment(ca)} {
+		nca, err := decodeConsumerAssignment(buf[1:])
+		require_NoError(t, err)
+		require_Equal(t, string(nca.ConfigJSON), ccfg)
+	}
+	nca, err := decodeConsumerAssignmentCompressed(encodeAddConsumerAssignmentCompressed(ca)[1:])
+	require_NoError(t, err)
+	require_Equal(t, string(nca.ConfigJSON), ccfg)
+}

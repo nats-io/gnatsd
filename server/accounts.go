@@ -3643,9 +3643,6 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 
 	jsEnabled := s.JetStreamEnabled()
 
-	streamTokenExpirationChanged := false
-	serviceTokenExpirationChanged := false
-
 	for _, e := range ac.Exports {
 		// Account scoped mapping functions (e.g. {{account-hash()}}) are resolved into literals here, once.
 		subject, err := expandSubjectPlaceholders(string(e.Subject), pctx)
@@ -3697,41 +3694,22 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 			}
 		}
 
-		var revocationChanged *bool
 		var ea *exportAuth
 
 		a.mu.Lock()
 		switch e.Type {
 		case jwt.Stream:
-			revocationChanged = &streamTokenExpirationChanged
 			if se, ok := a.exports.streams[subject]; ok && se != nil {
 				ea = &se.exportAuth
 			}
 		case jwt.Service:
-			revocationChanged = &serviceTokenExpirationChanged
 			if se, ok := a.exports.services[subject]; ok && se != nil {
 				ea = &se.exportAuth
 			}
 		}
+		// Revocation changes are detected when comparing the exports against old below.
 		if ea != nil {
-			oldRevocations := ea.actsRevoked
-			if len(e.Revocations) == 0 {
-				// remove all, no need to evaluate existing imports
-				ea.actsRevoked = nil
-			} else if len(oldRevocations) == 0 {
-				// add all, existing imports need to be re evaluated
-				ea.actsRevoked = e.Revocations
-				*revocationChanged = true
-			} else {
-				ea.actsRevoked = e.Revocations
-				// diff, existing imports need to be conditionally re evaluated, depending on:
-				// if a key was added, or it's timestamp increased
-				for k, t := range e.Revocations {
-					if tOld, ok := oldRevocations[k]; !ok || tOld < t {
-						*revocationChanged = true
-					}
-				}
-			}
+			ea.actsRevoked = e.Revocations
 		}
 		a.mu.Unlock()
 	}
@@ -3797,7 +3775,7 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 		}
 	}
 	// Now check if stream exports have changed.
-	if !a.checkStreamExportsEqual(old) || signersChanged || streamTokenExpirationChanged {
+	if !a.checkStreamExportsEqual(old) || signersChanged {
 		clients := map[*client]struct{}{}
 		// We need to check all accounts that have an import claim from this account.
 		awcsti := map[string]struct{}{}
@@ -3832,7 +3810,7 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 		}
 	}
 	// Now check if service exports have changed.
-	if !a.checkServiceExportsEqual(old) || signersChanged || serviceTokenExpirationChanged {
+	if !a.checkServiceExportsEqual(old) || signersChanged {
 		// We must only allow one goroutine to go through here, otherwise we could deadlock
 		// due to locking two accounts in succession.
 		s.mu.Lock()

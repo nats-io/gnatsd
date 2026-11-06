@@ -13,7 +13,15 @@
 
 package server
 
-import "strconv"
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"maps"
+	"slices"
+	"strconv"
+)
 
 const (
 	// JSApiLevel is the maximum supported JetStream API level for this server.
@@ -39,6 +47,62 @@ func supportsRequiredApiLevel(metadata map[string]string) bool {
 		return err == nil && li <= JSApiLevel
 	}
 	return true
+}
+
+// errInvalidConfigValue is returned for a config value this server can't decode.
+// This can be an enum value added in a newer version.
+var errInvalidConfigValue = errors.New("invalid value")
+
+// decodeConfig strictly decodes an asset config, and leniently decodes it if that fails.
+// strictErr is set if the config holds fields or values this server doesn't support.
+// The asset should then be marked as unsupported.
+// err is only set if the config can't be decoded at all.
+func decodeConfig[T any](buf []byte) (cfg T, strictErr, err error) {
+	decoder := json.NewDecoder(bytes.NewReader(buf))
+	decoder.DisallowUnknownFields()
+	if strictErr = decoder.Decode(&cfg); strictErr == nil {
+		return cfg, nil, nil
+	}
+
+	// The strict decode may have partially filled the config.
+	var zero T
+	cfg = zero
+	if err = json.Unmarshal(buf, &cfg); err == nil {
+		return cfg, strictErr, nil
+	}
+
+	// Decode field by field, so a field this server can't decode doesn't fail the others.
+	var fields map[string]json.RawMessage
+	if err = json.Unmarshal(buf, &fields); err != nil {
+		return zero, strictErr, err
+	}
+	// The lenient decode may have partially filled the config.
+	cfg = zero
+	for _, k := range slices.Sorted(maps.Keys(fields)) {
+		b, err := json.Marshal(map[string]json.RawMessage{k: fields[k]})
+		if err != nil {
+			continue
+		}
+		// Check the field decodes fully first.
+		// A field that fails to decode must stay unset.
+		var tmp T
+		if err = json.Unmarshal(b, &tmp); err != nil {
+			// The decode error doesn't name the field.
+			// Report the first field that can't be decoded instead.
+			if !errors.Is(strictErr, errInvalidConfigValue) {
+				// Objects and arrays can be large.
+				// Only include plain values.
+				if v := fields[k]; len(v) > 0 && v[0] != '{' && v[0] != '[' {
+					strictErr = fmt.Errorf("%w %s for field %q", errInvalidConfigValue, v, k)
+				} else {
+					strictErr = fmt.Errorf("%w for field %q", errInvalidConfigValue, k)
+				}
+			}
+			continue
+		}
+		_ = json.Unmarshal(b, &cfg)
+	}
+	return cfg, strictErr, nil
 }
 
 // setStaticStreamMetadata sets JetStream stream metadata, like the server version and API level.
