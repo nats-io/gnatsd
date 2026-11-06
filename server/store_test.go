@@ -1702,7 +1702,7 @@ func TestStoreConsumerAckAllWithRedeliveredDeliverySequence(t *testing.T) {
 
 			// An older leader acks with the redelivered delivery sequence.
 			// The floor must use the original, staying below the other pending messages.
-			require_NoError(t, o.UpdateAcks(4, 1))
+			require_NoError(t, o.UpdateAcks(4, 1, false))
 			state, err := o.State()
 			require_NoError(t, err)
 			require_Equal(t, state.AckFloor, SequencePair{Consumer: 1, Stream: 1})
@@ -1716,7 +1716,7 @@ func TestStoreConsumerAckAllWithRedeliveredDeliverySequence(t *testing.T) {
 			}))
 
 			// Acking the last one must still ack all, and move the floor up to the last delivered.
-			require_NoError(t, o.UpdateAcks(3, 3))
+			require_NoError(t, o.UpdateAcks(3, 3, false))
 			state, err = o.State()
 			require_NoError(t, err)
 			require_Equal(t, state.AckFloor, SequencePair{Consumer: 4, Stream: 3})

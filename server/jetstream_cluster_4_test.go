@@ -9279,11 +9279,22 @@ func TestJetStreamClusterDecodeUpdatesRejectMalformed(t *testing.T) {
 	t.Run("AckUpdate", func(t *testing.T) {
 		valid := binary.AppendUvarint(nil, 10)
 		valid = binary.AppendUvarint(valid, 20)
-		if _, _, err := decodeAckUpdate(valid); err != nil {
+		if _, _, explicit, err := decodeAckUpdate(valid); err != nil {
 			t.Fatalf("expected valid ack update to decode, got %v", err)
+		} else if explicit {
+			t.Fatalf("expected explicit to default to false")
+		}
+		// An optional trailing byte marks the update as explicit.
+		marked := binary.AppendUvarint(nil, 10)
+		marked = binary.AppendUvarint(marked, 20)
+		marked = append(marked, 1)
+		if _, _, explicit, err := decodeAckUpdate(marked); err != nil {
+			t.Fatalf("expected valid explicit ack update to decode, got %v", err)
+		} else if !explicit {
+			t.Fatalf("expected trailing byte to decode as explicit")
 		}
 		for _, buf := range [][]byte{nil, valid[:1]} {
-			if _, _, err := decodeAckUpdate(buf); err != errBadAckUpdate {
+			if _, _, _, err := decodeAckUpdate(buf); err != errBadAckUpdate {
 				t.Fatalf("expected errBadAckUpdate for %v, got %v", buf, err)
 			}
 		}

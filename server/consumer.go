@@ -2909,7 +2909,7 @@ func (o *consumer) processAck(subject, reply string, hdr int, rmsg []byte) {
 		if buf := msg[len(AckTerm):]; len(buf) > 0 {
 			reason = string(bytes.TrimSpace(buf))
 		}
-		if !o.processTerm(sseq, dseq, dc, reason, reply) {
+		if !o.processTerm(sseq, dseq, dc, reason, reply, false) {
 			// We handle replies for acks in updateAcks
 			skipAckReply = true
 		}
@@ -3188,20 +3188,26 @@ func (o *consumer) addReplicatedQueuedMsg(pmsg *jsPubMsg) {
 }
 
 // Lock should be held.
-func (o *consumer) updateAcks(dseq, sseq uint64, reply string) {
+func (o *consumer) updateAcks(dseq, sseq uint64, reply string, explicit bool) {
 	if o.isClustered() {
 		// Inline for now, use variable compression.
-		var b [2*binary.MaxVarintLen64 + 1]byte
+		// A trailing byte marks the ack as explicit; older versions ignore it
+		// when decoding and apply regular ack semantics.
+		var b [2*binary.MaxVarintLen64 + 2]byte
 		b[0] = byte(updateAcksOp)
 		n := 1
 		n += binary.PutUvarint(b[n:], dseq)
 		n += binary.PutUvarint(b[n:], sseq)
+		if explicit {
+			b[n] = 1
+			n++
+		}
 		o.propose(b[:n])
 		if reply != _EMPTY_ {
 			o.addAckReply(sseq, reply)
 		}
 	} else if o.store != nil {
-		o.store.UpdateAcks(dseq, sseq)
+		o.store.UpdateAcks(dseq, sseq, explicit)
 		if reply != _EMPTY_ {
 			// Already locked so send direct.
 			o.outq.sendMsg(reply, nil)
@@ -3389,13 +3395,16 @@ func (o *consumer) processNak(sseq, dseq, dc uint64, nak []byte) {
 // Returns `true` if the ack was processed in place and the sender can now respond
 // to the client, or `false` if there was an error or the ack is replicated (in which
 // case the reply will be sent later).
-func (o *consumer) processTerm(sseq, dseq, dc uint64, reason, reply string) bool {
-	return o.processTermLocked(sseq, dseq, dc, reason, reply, true)
+// explicit reports that this term is scoped to sseq only, e.g. the message was
+// deleted from the stream. Under AckAll/AckFlowControl an explicit term must not
+// ack the messages below sseq like a client-initiated term would.
+func (o *consumer) processTerm(sseq, dseq, dc uint64, reason, reply string, explicit bool) bool {
+	return o.processTermLocked(sseq, dseq, dc, reason, reply, true, explicit)
 }
 
-func (o *consumer) processTermLocked(sseq, dseq, dc uint64, reason, reply string, needLock bool) bool {
+func (o *consumer) processTermLocked(sseq, dseq, dc uint64, reason, reply string, needLock, explicit bool) bool {
 	// Treat like an ack to suppress redelivery.
-	ackedInPlace := o.processAckMsgLocked(sseq, dseq, dc, reply, false, needLock)
+	ackedInPlace := o.processAckMsgLocked(sseq, dseq, dc, reply, false, needLock, explicit)
 
 	if needLock {
 		o.mu.Lock()
@@ -3801,10 +3810,10 @@ func (o *consumer) sampleAck(sseq, dseq, dc uint64) {
 // to the client, or `false` if there was an error or the ack is replicated (in which
 // case the reply will be sent later).
 func (o *consumer) processAckMsg(sseq, dseq, dc uint64, reply string, doSample bool) bool {
-	return o.processAckMsgLocked(sseq, dseq, dc, reply, doSample, true)
+	return o.processAckMsgLocked(sseq, dseq, dc, reply, doSample, true, false)
 }
 
-func (o *consumer) processAckMsgLocked(sseq, dseq, dc uint64, reply string, doSample bool, needLock bool) bool {
+func (o *consumer) processAckMsgLocked(sseq, dseq, dc uint64, reply string, doSample bool, needLock, explicit bool) bool {
 	lock := func() {
 		if needLock {
 			o.mu.Lock()
@@ -3876,6 +3885,24 @@ func (o *consumer) processAckMsgLocked(sseq, dseq, dc uint64, reply string, doSa
 		delete(o.rdc, sseq)
 		o.removeFromRedeliverQueue(sseq)
 	case AckAll, AckFlowControl:
+		if explicit {
+			// Server-side removal of a message that was deleted from the stream.
+			// Scoped to this message only, like an explicit ack: the pending
+			// entries below it are left alone, and the floor only moves across
+			// sequences that are already clear.
+			if p, ok := o.pending[sseq]; ok {
+				if o.maxp > 0 && len(o.pending) >= o.maxp {
+					needSignal = true
+				}
+				delete(o.pending, sseq)
+				// Use the original deliver sequence from our pending record.
+				dseq = p.Sequence
+				o.moveAckFloor(dseq, sseq)
+			}
+			delete(o.rdc, sseq)
+			o.removeFromRedeliverQueue(sseq)
+			break
+		}
 		// no-op
 		if dseq <= o.adflr || sseq <= o.asflr {
 			unlock()
@@ -3936,8 +3963,9 @@ func (o *consumer) processAckMsgLocked(sseq, dseq, dc uint64, reply string, doSa
 	if ackInPlace {
 		reply = _EMPTY_
 	}
-	// Update underlying store.
-	o.updateAcks(dseq, sseq, reply)
+	// Update underlying store. Client acks and terms are regular acks; a
+	// server-side removal of a deleted message is scoped as an explicit ack.
+	o.updateAcks(dseq, sseq, reply, explicit)
 	unlock()
 
 	if ackInPlace {
@@ -5138,7 +5166,7 @@ func (o *consumer) getNextMsg() (*jsPubMsg, uint64, error) {
 				pmsg.returnToPool()
 				pmsg = nil
 				if p, ok := o.pending[seq]; ok {
-					o.processTermLocked(seq, p.Sequence, dc-1, ackTermUnackedLimitsReason, _EMPTY_, false)
+					o.processTermLocked(seq, p.Sequence, dc-1, ackTermUnackedLimitsReason, _EMPTY_, false, true)
 				}
 				continue
 			}
@@ -5360,7 +5388,7 @@ func (o *consumer) checkAckFloor() {
 			o.mu.RUnlock()
 			// If it was pending for us, get rid of it.
 			if isPending {
-				o.processTerm(seq, p.Sequence, rdc, ackTermLimitsReason, _EMPTY_)
+				o.processTerm(seq, p.Sequence, rdc, ackTermLimitsReason, _EMPTY_, false)
 			}
 		}
 	} else if numPending > 0 {
@@ -5382,7 +5410,7 @@ func (o *consumer) checkAckFloor() {
 
 		for i := 0; i < len(toTerm); i += 3 {
 			seq, dseq, rdc := toTerm[i], toTerm[i+1], toTerm[i+2]
-			o.processTerm(seq, dseq, rdc, ackTermLimitsReason, _EMPTY_)
+			o.processTerm(seq, dseq, rdc, ackTermLimitsReason, _EMPTY_, false)
 		}
 	}
 
@@ -5993,7 +6021,7 @@ func (o *consumer) deliverMsg(dsubj, ackReply string, pmsg *jsPubMsg, dc uint64,
 		if mset != nil && mset.ackq != nil && (!o.isClustered() || o.direct) {
 			mset.ackq.push(seq)
 		} else {
-			o.updateAcks(dseq, seq, _EMPTY_)
+			o.updateAcks(dseq, seq, _EMPTY_, false)
 		}
 	}
 }
@@ -6787,34 +6815,34 @@ func (o *consumer) purge(sseq uint64, slseq uint64, isWider bool) {
 
 	if o.asflr < sseq {
 		o.asflr = sseq - 1
-		// We need to remove those no longer relevant from pending.
-		for seq, p := range o.pending {
-			if seq <= o.asflr {
-				if p.Sequence > o.adflr {
-					o.adflr = p.Sequence
-					if o.adflr > o.dseq {
-						o.dseq = o.adflr
-					}
+	}
+	// Walk pending regardless of whether the floor moved: a filtered purge can
+	// delete messages above the current floor, and those entries must be dropped
+	// here or a later failed redelivery will terminate them through the ack path.
+	for seq, p := range o.pending {
+		if seq <= o.asflr {
+			// We need to remove those no longer relevant from pending.
+			if p.Sequence > o.adflr {
+				o.adflr = p.Sequence
+				if o.adflr > o.dseq {
+					o.dseq = o.adflr
 				}
+			}
+			delete(o.pending, seq)
+			delete(o.rdc, seq)
+			o.updateAcks(p.Sequence, seq, _EMPTY_, false)
+			// rdq handled below.
+		} else if isWider && store != nil {
+			// Our filtered subject, which could be all, is wider than the underlying purge.
+			// We need to check if the pending items left are still valid.
+			var smv StoreMsg
+			if _, err := store.LoadMsg(seq, &smv); err == errDeletedMsg || err == ErrStoreMsgNotFound {
+				// The message is gone, so it will never be delivered again. Remove
+				// it with an explicit ack: only this sequence, never the ones below it.
 				delete(o.pending, seq)
 				delete(o.rdc, seq)
-				o.updateAcks(p.Sequence, seq, _EMPTY_)
-				// rdq handled below.
-			} else if isWider && store != nil {
-				// Our filtered subject, which could be all, is wider than the underlying purge.
-				// We need to check if the pending items left are still valid.
-				var smv StoreMsg
-				if _, err := store.LoadMsg(seq, &smv); err == errDeletedMsg || err == ErrStoreMsgNotFound {
-					if p.Sequence > o.adflr {
-						o.adflr = p.Sequence
-						if o.adflr > o.dseq {
-							o.dseq = o.adflr
-						}
-					}
-					delete(o.pending, seq)
-					delete(o.rdc, seq)
-					o.updateAcks(p.Sequence, seq, _EMPTY_)
-				}
+				o.moveAckFloor(p.Sequence, seq)
+				o.updateAcks(p.Sequence, seq, _EMPTY_, true)
 			}
 		}
 	}
@@ -7185,7 +7213,7 @@ func (o *consumer) decStreamPending(sseq uint64, subj string) {
 	} else if _, ok := o.rdc[sseq]; ok && o.isLeader() {
 		delete(o.rdc, sseq)
 		// Pass 0 as the delivered sequence to only remove the redelivered state.
-		o.updateAcks(0, sseq, _EMPTY_)
+		o.updateAcks(0, sseq, _EMPTY_, false)
 	}
 
 	o.mu.Unlock()
@@ -7194,7 +7222,9 @@ func (o *consumer) decStreamPending(sseq uint64, subj string) {
 	if wasPending {
 		// We could have the lock for the stream so do this in a go routine.
 		// TODO(dlc) - We should do this with ipq vs naked go routines.
-		go o.processTerm(sseq, p.Sequence, rdc, ackTermUnackedLimitsReason, _EMPTY_)
+		// The message is gone from the stream, so scope the term to this
+		// sequence only and never ack the pending entries below it.
+		go o.processTerm(sseq, p.Sequence, rdc, ackTermUnackedLimitsReason, _EMPTY_, true)
 	}
 }
 

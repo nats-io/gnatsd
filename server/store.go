@@ -440,7 +440,10 @@ type ConsumerStore interface {
 	Reset(sseq uint64) error
 	HasState() bool
 	UpdateDelivered(dseq, sseq, dc uint64, ts int64) error
-	UpdateAcks(dseq, sseq uint64) error
+	// explicit reports that this update acks sseq only, e.g. the message was
+	// deleted from the stream. Under AckAll/AckFlowControl an explicit ack
+	// must not ack messages below sseq like a regular ack would.
+	UpdateAcks(dseq, sseq uint64, explicit bool) error
 	RemoveRedeliveredBelow(seq uint64)
 	GetConfig() *ConsumerConfig
 	UpdateConfig(cfg *ConsumerConfig) error

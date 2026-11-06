@@ -9277,12 +9277,12 @@ func (js *jetStream) applyConsumerMsgOpLocked(o *consumer, buf []byte) (afterUnl
 			return nil, err
 		}
 	case updateAcksOp:
-		dseq, sseq, err := decodeAckUpdate(buf[1:])
+		dseq, sseq, explicit, err := decodeAckUpdate(buf[1:])
 		if err != nil {
 			logDecodeErr("ack")
 			return nil, err
 		}
-		mset, ackAllSeqs, err := o.processReplicatedAckLocked(dseq, sseq)
+		mset, ackAllSeqs, err := o.processReplicatedAckLocked(dseq, sseq, explicit)
 		if err == errConsumerClosed {
 			return nil, err
 		}
@@ -9397,12 +9397,14 @@ var errConsumerClosed = errors.New("consumer closed")
 // processReplicatedAckLocked stores a replicated ack.
 // Returns the stream if the acked messages must still be acked on it, after the lock is released.
 // Lock should be held.
-func (o *consumer) processReplicatedAckLocked(dseq, sseq uint64) (*stream, []uint64, error) {
+func (o *consumer) processReplicatedAckLocked(dseq, sseq uint64, explicit bool) (*stream, []uint64, error) {
 	// Update activity.
 	o.lat = time.Now()
 
 	var ackAllSeqs []uint64
-	if o.retention != LimitsPolicy && (o.cfg.AckPolicy == AckAll || o.cfg.AckPolicy == AckFlowControl) {
+	// An explicit ack is scoped to the message itself, so it does not collect
+	// the messages below it even under AckAll.
+	if !explicit && o.retention != LimitsPolicy && (o.cfg.AckPolicy == AckAll || o.cfg.AckPolicy == AckFlowControl) {
 		// Always use the store state, as o.asflr is skipped ahead already.
 		// Capture before updating store, which clears the pending below.
 		state, err := o.store.BorrowState()
@@ -9422,7 +9424,7 @@ func (o *consumer) processReplicatedAckLocked(dseq, sseq uint64) (*stream, []uin
 
 	// Do actual ack update to store.
 	// Always do this to have it recorded.
-	o.store.UpdateAcks(dseq, sseq)
+	o.store.UpdateAcks(dseq, sseq, explicit)
 
 	mset := o.mset
 	if o.closed || mset == nil {
@@ -9450,16 +9452,22 @@ var errBadDeliveredUpdate = errors.New("jetstream cluster bad replicated deliver
 var errBadSkipUpdate = errors.New("jetstream cluster bad replicated skip update")
 var errBadResetUpdate = errors.New("jetstream cluster bad replicated reset update")
 
-func decodeAckUpdate(buf []byte) (dseq, sseq uint64, err error) {
+func decodeAckUpdate(buf []byte) (dseq, sseq uint64, explicit bool, err error) {
 	var bi, n int
 	if dseq, n = binary.Uvarint(buf); n <= 0 {
-		return 0, 0, errBadAckUpdate
+		return 0, 0, false, errBadAckUpdate
 	}
 	bi += n
 	if sseq, n = binary.Uvarint(buf[bi:]); n <= 0 {
-		return 0, 0, errBadAckUpdate
+		return 0, 0, false, errBadAckUpdate
 	}
-	return dseq, sseq, nil
+	bi += n
+	// Optional trailing byte marks this ack as explicit. Versions that predate
+	// it stop after the two sequences and apply regular ack semantics.
+	if bi < len(buf) && buf[bi] == 1 {
+		explicit = true
+	}
+	return dseq, sseq, explicit, nil
 }
 
 func decodeDeliveredUpdate(buf []byte) (dseq, sseq, dc uint64, ts int64, err error) {

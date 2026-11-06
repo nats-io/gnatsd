@@ -3028,11 +3028,11 @@ func TestFileStoreConsumerRedeliveredLost(t *testing.T) {
 			t.Fatalf("Did not recover pending correctly")
 		}
 
-		o.UpdateAcks(7, 3)
-		o.UpdateAcks(6, 2)
+		o.UpdateAcks(7, 3, false)
+		o.UpdateAcks(6, 2, false)
 
 		restartConsumer()
-		o.UpdateAcks(4, 1)
+		o.UpdateAcks(4, 1, false)
 
 		state, _ := o.State()
 		if len(state.Pending) != 0 {
@@ -3080,7 +3080,7 @@ func TestFileStoreConsumerUpdateAcksFlushesRedelivered(t *testing.T) {
 		// Acking sseq 1 deletes it from Redelivered, but UpdateAcks bails out with
 		// ErrStoreMsgNotFound since it is no longer pending. The deletion must still
 		// be flushed.
-		require_Error(t, o.UpdateAcks(2, 1), ErrStoreMsgNotFound)
+		require_Error(t, o.UpdateAcks(2, 1, false), ErrStoreMsgNotFound)
 
 		restartConsumer()
 		defer o.Stop()
@@ -3164,7 +3164,7 @@ func TestFileStoreConsumerDeliveredUpdates(t *testing.T) {
 		testDelivered(5, 130)
 
 		// If we try to do an ack this should err since we are not configured with ack policy.
-		if err := o.UpdateAcks(1, 100); err != ErrNoAckPolicy {
+		if err := o.UpdateAcks(1, 100, false); err != ErrNoAckPolicy {
 			t.Fatalf("Expected a no ack policy error on update acks, got %v", err)
 		}
 		// Also if we do an update with a delivery count of anything but 1 here should also give same error.
@@ -3222,7 +3222,7 @@ func TestFileStoreConsumerDeliveredAndAckUpdates(t *testing.T) {
 
 		testBadAck := func(dseq, sseq uint64) {
 			t.Helper()
-			if err := o.UpdateAcks(dseq, sseq); err == nil {
+			if err := o.UpdateAcks(dseq, sseq, false); err == nil {
 				t.Fatalf("Expected error but got none")
 			}
 		}
@@ -3231,7 +3231,7 @@ func TestFileStoreConsumerDeliveredAndAckUpdates(t *testing.T) {
 
 		testAck := func(dseq, sseq, dflr, sflr uint64) {
 			t.Helper()
-			if err := o.UpdateAcks(dseq, sseq); err != nil {
+			if err := o.UpdateAcks(dseq, sseq, false); err != nil {
 				t.Fatalf("Unexpected error: %v", err)
 			}
 			pending--
