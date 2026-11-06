@@ -11455,3 +11455,153 @@ func TestMQTTQoS2UntrackedPubRecNotStored(t *testing.T) {
 	testMQTTSendPIPacket(mqttPacketPubComp, t, c, rpi)
 	testMQTTExpectNothing(t, r)
 }
+
+// https://github.com/nats-io/nats-server/issues/8790
+func TestMQTTQoS1RetainPubAckPipelineOrderAndPing(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	mcp, mpr := testMQTTConnect(t, &mqttConnInfo{clientID: "pub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mcp.Close()
+	testMQTTCheckConnAck(t, mpr, mqttConnAckRCConnectionAccepted, false)
+
+	// Send a burst of QoS 1 retained messages back-to-back without waiting for PUBACKs.
+	const numMsgs = 50
+	for pi := uint16(1); pi <= numMsgs; pi++ {
+		testMQTTSendPublishPacket(t, mcp, 1, false, true, "foo", pi, []byte(fmt.Sprintf("msg-%d", pi)))
+	}
+
+	// Send PINGREQ immediately after the burst: readLoop must not be blocked
+	// waiting for JetStream acks, and must promptly respond with PINGRESP.
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPacketPing)
+	w.WriteByte(0)
+	mcp.Write(w.Bytes())
+
+	// Read packets until we receive all PUBACKs in order and the PINGRESP.
+	var gotPingResp bool
+	var nextPI uint16 = 1
+	for nextPI <= numMsgs || !gotPingResp {
+		b, _ := testMQTTReadPacket(t, mpr)
+		switch pt := b & mqttPacketMask; pt {
+		case mqttPacketPubAck:
+			rpi, err := mpr.readUint16("packet identifier")
+			if err != nil {
+				t.Fatalf("Error reading packet identifier: %v", err)
+			}
+			if rpi != nextPI {
+				t.Fatalf("Expected PUBACK for pi=%v, got pi=%v (out of order)", nextPI, rpi)
+			}
+			nextPI++
+		case mqttPacketPingResp:
+			gotPingResp = true
+		default:
+			t.Fatalf("Unexpected packet type: %x", pt)
+		}
+	}
+	if !gotPingResp {
+		t.Fatal("Expected PINGRESP")
+	}
+
+	// Verify that a new subscriber receives the latest retained message with RETAIN=1.
+	mcs, msr := testMQTTConnect(t, &mqttConnInfo{clientID: "sub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mcs.Close()
+	testMQTTCheckConnAck(t, msr, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, mcs, msr, []*mqttFilter{{filter: "foo", qos: 1}}, []byte{1})
+
+	pflags, _ := testMQTTGetPubMsg(t, mcs, msr, "foo", []byte(fmt.Sprintf("msg-%d", numMsgs)))
+	if !mqttIsRetained(pflags) {
+		t.Fatalf("Expected retained flag on received message, got %v", pflags)
+	}
+}
+
+func TestMQTTQoS2RetainPubCompPipeline(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	mcp, mpr := testMQTTConnect(t, &mqttConnInfo{clientID: "pub2", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mcp.Close()
+	testMQTTCheckConnAck(t, mpr, mqttConnAckRCConnectionAccepted, false)
+
+	// Send QoS2 PUBLISH with RETAIN=1.
+	pi := uint16(42)
+	testMQTTSendPublishPacket(t, mcp, 2, false, true, "bar", pi, []byte("qos2-retained"))
+
+	// Receive PUBREC.
+	testMQTTReadPIPacket(mqttPacketPubRec, t, mpr, pi)
+
+	// Send PUBREL.
+	testMQTTSendPIPacket(mqttPacketPubRel|0x2, t, mcp, pi)
+
+	// Receive PUBCOMP (waited for delivery store, held delete, and retain store).
+	testMQTTReadPIPacket(mqttPacketPubComp, t, mpr, pi)
+
+	// Send PINGREQ to ensure readLoop is responsive.
+	testMQTTFlush(t, mcp, nil, mpr)
+
+	// Verify subscriber gets the retained message.
+	mcs, msr := testMQTTConnect(t, &mqttConnInfo{clientID: "sub2", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mcs.Close()
+	testMQTTCheckConnAck(t, msr, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, mcs, msr, []*mqttFilter{{filter: "bar", qos: 2}}, []byte{2})
+
+	pflags, _ := testMQTTGetPubMsg(t, mcs, msr, "bar", []byte("qos2-retained"))
+	if !mqttIsRetained(pflags) {
+		t.Fatalf("Expected retained flag, got %v", pflags)
+	}
+}
+
+func TestMQTTQoS0RetainPipelineNonBlocking(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	mcp, mpr := testMQTTConnect(t, &mqttConnInfo{clientID: "pub0", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mcp.Close()
+	testMQTTCheckConnAck(t, mpr, mqttConnAckRCConnectionAccepted, false)
+
+	// Send a burst of QoS 0 retained messages back-to-back.
+	const numMsgs = 50
+	for i := 1; i <= numMsgs; i++ {
+		testMQTTSendPublishPacket(t, mcp, 0, false, true, "baz", 0, []byte(fmt.Sprintf("msg-%d", i)))
+	}
+
+	// Send PINGREQ immediately after the burst: readLoop must not be blocked
+	// and must promptly respond with PINGRESP without emitting any PUBACKs.
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPacketPing)
+	w.WriteByte(0)
+	mcp.Write(w.Bytes())
+
+	b, _ := testMQTTReadPacket(t, mpr)
+	if pt := b & mqttPacketMask; pt != mqttPacketPingResp {
+		t.Fatalf("Expected PINGRESP, got packet type %x", pt)
+	}
+
+	// Wait for pipelined retain operations to finish storing in JetStream.
+	jsa := s.mqttGetJSAForAccount(globalAccountName)
+	if jsa == nil {
+		t.Fatal("no JSA for the global account")
+	}
+	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+		n := 0
+		jsa.replies.Range(func(_, _ any) bool { n++; return true })
+		if n > 0 {
+			return fmt.Errorf("%v in-flight JSA reply registrations remaining", n)
+		}
+		return nil
+	})
+
+	// Verify that a new subscriber receives the latest retained message with RETAIN=1.
+	mcs, msr := testMQTTConnect(t, &mqttConnInfo{clientID: "sub0", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mcs.Close()
+	testMQTTCheckConnAck(t, msr, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, mcs, msr, []*mqttFilter{{filter: "baz", qos: 0}}, []byte{0})
+
+	pflags, _ := testMQTTGetPubMsg(t, mcs, msr, "baz", []byte(fmt.Sprintf("msg-%d", numMsgs)))
+	if !mqttIsRetained(pflags) {
+		t.Fatalf("Expected retained flag on received message, got %v", pflags)
+	}
+}

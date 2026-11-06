@@ -426,6 +426,11 @@ type mqtt struct {
 	// Pipelines PUBACK/PUBREC/PUBCOMP for inbound QoS1/2 packets. readLoop-owned.
 	pipe *mqttAckPipeline
 
+	// Retained message pending pipeline submission. readLoop-owned.
+	rSubj string
+	rHdr  int
+	rMsg  []byte
+
 	// The source of truth for inbound QoS2 messages while the async
 	// JetStream operations are in flight: qos2Exchanges caches the pending
 	// ones, qos2Released the PIs whose PUBREL was processed. A PI missing
@@ -499,6 +504,7 @@ type mqttPublish struct {
 	sz      int
 	pi      uint16
 	flags   byte
+	isWill  bool
 }
 
 // When we re-encode incoming MQTT PUBLISH messages for NATS delivery, we add
@@ -4318,6 +4324,7 @@ func (s *Server) mqttHandleWill(c *client) {
 		sz:      len(will.message),
 		flags:   will.qos << 1,
 	}
+	pp.isWill = true
 	if will.retain {
 		pp.flags |= mqttPubFlagRetain
 	}
@@ -4601,7 +4608,7 @@ const mqttMaxPipelined = 1024
 // The most JetStream operations behind one pipelined response: a PUBCOMP's
 // delivery store and held-copy delete. An entry's done channel is
 // buffered for this many, so the reply processing never blocks on it.
-const mqttMaxPipelinedOps = 2
+const mqttMaxPipelinedOps = 3
 
 // Max QoS2 PUBLISH copies cached in memory per connection, between PUBREC
 // and PUBREL; past this the PUBREL loads from the stream.
@@ -4658,9 +4665,10 @@ type mqttPipelined struct {
 	// _EMPTY_ where there is no such operation, and the channel receiving
 	// one result per registration, buffered for mqttMaxPipelinedOps. Every
 	// give-up path must call abandon.
-	storeReply string
-	delReply   string
-	done       chan error
+	storeReply  string
+	delReply    string
+	retainReply string
+	done        chan error
 
 	// A PUBREC with a cached copy: where the hold store's outcome goes.
 	exchange *mqttQoS2Exchange
@@ -4700,6 +4708,9 @@ func (p *mqttPipelined) pending() int {
 	if p.delReply != _EMPTY_ {
 		n++
 	}
+	if p.retainReply != _EMPTY_ {
+		n++
+	}
 	return n
 }
 
@@ -4707,6 +4718,14 @@ func (p *mqttPipelined) pending() int {
 func (p *mqttPipelined) abandon(jsa *mqttJSA) {
 	jsa.replies.Delete(p.storeReply)
 	jsa.replies.Delete(p.delReply)
+	jsa.replies.Delete(p.retainReply)
+}
+
+// Registers the retain store's reply and submits it. readLoop only.
+func (p *mqttPipelined) submitRetain(jsa *mqttJSA, subject string, hdr int, msg []byte) {
+	p.retainReply = jsa.newReplySubject(mqttJSAMsgStore)
+	jsa.replies.Store(p.retainReply, p)
+	jsa.storeMsgAsync(subject, hdr, msg, _EMPTY_, p.retainReply)
 }
 
 // Registers the store's reply and submits it. readLoop only.
@@ -4747,6 +4766,7 @@ func (p *mqttPipelined) complete(pc *client, value any) {
 			}
 		case mqttPacketPubComp:
 			if err == nil && v.PubAck != nil && v.Duplicate {
+				// Retain stores use an empty msgId (no dedup window); duplicate acks only originate from delivery stores.
 				pc.Debugf("QoS2 delivery (pi=%v) suppressed as a duplicate of stream sequence %v", p.pi, v.Sequence)
 			}
 			// Note that JSStreamDuplicateMessageConflict ("duplicate message
@@ -4827,15 +4847,23 @@ func (s *Server) mqttAckLoop(c *client, pipe *mqttAckPipeline) {
 		case p := <-pipe.q:
 			if err := pipe.awaitAcks(p, t); err != nil {
 				if err != errMQTTAckPipelineStopped && err != ErrServerNotRunning {
-					c.Errorf("JetStream failed a pipelined QoS1/2 operation (pi=%v): %v; closing the connection", p.pi, err)
-					c.closeConnection(ProtocolViolation)
+					if p.resp != 0 {
+						c.Errorf("JetStream failed a pipelined QoS1/2 operation (pi=%v): %v; closing the connection", p.pi, err)
+						c.closeConnection(ProtocolViolation)
+						return
+					}
+					c.Errorf("JetStream failed a pipelined retain operation: %v", err)
+					p.returnToPool()
+					continue
 				}
 				return
 			}
-			c.mu.Lock()
-			trace := c.trace
-			c.mu.Unlock()
-			c.mqttEnqueuePubResponse(p.resp, p.pi, trace)
+			if p.resp != 0 {
+				c.mu.Lock()
+				trace := c.trace
+				c.mu.Unlock()
+				c.mqttEnqueuePubResponse(p.resp, p.pi, trace)
+			}
 			p.returnToPool()
 
 		case <-pipe.quitCh:
@@ -4847,11 +4875,27 @@ func (s *Server) mqttAckLoop(c *client, pipe *mqttAckPipeline) {
 	}
 }
 
+// Stores a QoS 0 retained message through the pipeline to preserve bounded
+// backpressure (mqttMaxPipelined). readLoop only.
+func (s *Server) mqttPipelineRetain(c *client, subject string, hdrLen int, natsMsg []byte) error {
+	jsa := c.mqtt.sess.jsa
+	p := newMQTTPipelined(0, 0)
+	p.submitRetain(jsa, subject, hdrLen, natsMsg)
+	c.mqtt.rSubj = _EMPTY_
+	c.mqtt.rMsg = nil
+	return s.mqttPipelinePush(c, jsa, p)
+}
+
 // Stores a QoS1 PUBLISH to $MQTT_msgs; PUBACK on its ack. readLoop only.
 func (s *Server) mqttPipelineStoreAndPubAck(c *client, pi uint16, subject string, hdrLen int, natsMsg []byte) error {
 	jsa := c.mqtt.sess.jsa
 	p := newMQTTPipelined(mqttPacketPubAck, pi)
 	p.submitStore(jsa, subject, hdrLen, natsMsg, _EMPTY_)
+	if c.mqtt.rSubj != _EMPTY_ {
+		p.submitRetain(jsa, c.mqtt.rSubj, c.mqtt.rHdr, c.mqtt.rMsg)
+		c.mqtt.rSubj = _EMPTY_
+		c.mqtt.rMsg = nil
+	}
 	return s.mqttPipelinePush(c, jsa, p)
 }
 
@@ -4886,6 +4930,11 @@ func (s *Server) mqttPipelineReleaseAndPubComp(c *client, pi uint16, heldSeq uin
 	p := newMQTTPipelined(mqttPacketPubComp, pi)
 	p.submitStore(jsa, subject, hdrLen, natsMsg, mqttQoS2DeliveryMsgId(heldSeq))
 	p.submitDelete(jsa, heldSeq)
+	if c.mqtt.rSubj != _EMPTY_ {
+		p.submitRetain(jsa, c.mqtt.rSubj, c.mqtt.rHdr, c.mqtt.rMsg)
+		c.mqtt.rSubj = _EMPTY_
+		c.mqtt.rMsg = nil
+	}
 	return s.mqttPipelinePush(c, jsa, p)
 }
 
@@ -5009,6 +5058,8 @@ func (s *Server) mqttInitiateMsgDelivery(c *client, pp *mqttPublish, heldSeq uin
 	c.pa.szb = []byte(strconv.FormatInt(int64(c.pa.size), 10))
 	defer func() {
 		c.mqtt.pp = prevPP
+		c.mqtt.rSubj = _EMPTY_
+		c.mqtt.rMsg = nil
 		c.pa.subject = nil
 		c.pa.mapped = nil
 		c.pa.reply = nil
@@ -5035,6 +5086,15 @@ func (s *Server) mqttInitiateMsgDelivery(c *client, pp *mqttPublish, heldSeq uin
 	// If QoS 0 messages don't need to be stored, other (1 and 2) do. Store them
 	// JetStream under "$MQTT.msgs.<delivery-subject>"
 	if qos := mqttGetQoS(pp.flags); qos == 0 {
+		if c.mqtt.rSubj != _EMPTY_ {
+			if pp.isWill {
+				_, err := c.mqtt.sess.jsa.storeMsg(c.mqtt.rSubj, c.mqtt.rHdr, c.mqtt.rMsg)
+				c.mqtt.rSubj = _EMPTY_
+				c.mqtt.rMsg = nil
+				return err
+			}
+			return s.mqttPipelineRetain(c, c.mqtt.rSubj, c.mqtt.rHdr, c.mqtt.rMsg)
+		}
 		return nil
 	}
 
@@ -5054,6 +5114,14 @@ func (s *Server) mqttInitiateMsgDelivery(c *client, pp *mqttPublish, heldSeq uin
 	}
 	if pp.owesPubAck() {
 		return s.mqttPipelineStoreAndPubAck(c, pp.pi, subject, headerLen, natsMsg)
+	}
+
+	if c.mqtt.rSubj != _EMPTY_ {
+		if _, err := c.mqtt.sess.jsa.storeMsg(c.mqtt.rSubj, c.mqtt.rHdr, c.mqtt.rMsg); err != nil {
+			return err
+		}
+		c.mqtt.rSubj = _EMPTY_
+		c.mqtt.rMsg = nil
 	}
 
 	_, err := c.mqtt.sess.jsa.storeMsg(subject, headerLen, natsMsg)
@@ -5370,14 +5438,9 @@ func (c *client) mqttHandlePubRetain() {
 	// $sparkplug subject for sparkB.
 	rm.Subject = key
 	rmBytes, hdr := mqttEncodeRetainedMessage(rm) // will copy the payload bytes
-	_, err := asm.jsa.storeMsg(mqttRetainedMsgsStreamSubject+key, hdr, rmBytes)
-	if err != nil {
-		c.mu.Lock()
-		acc := c.acc
-		c.mu.Unlock()
-		c.Errorf("unable to store retained message for account %q, subject %q: %v",
-			acc.GetName(), key, err)
-	}
+	c.mqtt.rSubj = mqttRetainedMsgsStreamSubject + key
+	c.mqtt.rHdr = hdr
+	c.mqtt.rMsg = rmBytes
 }
 
 // After a config reload, it is possible that the source of a publish retained
