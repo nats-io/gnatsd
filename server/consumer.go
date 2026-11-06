@@ -725,7 +725,9 @@ func setConsumerConfigDefaults(config *ConsumerConfig, streamCfg *StreamConfig, 
 	// Set default values for flow control policy.
 	if config.AckPolicy == AckFlowControl && !pedantic {
 		config.FlowControl = true
-		config.Heartbeat = sourceHealthHB
+		if config.Heartbeat == 0 {
+			config.Heartbeat = sourceHealthHB
+		}
 	}
 	return nil
 }
@@ -791,11 +793,8 @@ func checkConsumerCfg(
 		if !config.FlowControl {
 			return NewJSConsumerAckFCRequiresFCError()
 		}
-		// We currently limit using heartbeat of 1s, since those are used for ephemeral sourcing consumers as well.
-		// We could decide to relax this in the future, but need to be careful to not allow a heartbeat larger
-		// than the stalled source timeout.
-		if config.Heartbeat != sourceHealthHB {
-			return NewJSStreamInvalidConfigError(fmt.Errorf("flow control ack policy heartbeat needs to be 1s"))
+		if config.Heartbeat < sourceHealthHB || config.Heartbeat > sourceMaxHealthHB {
+			return NewJSStreamInvalidConfigError(fmt.Errorf("flow control ack policy heartbeat needs to be between %v and %v", sourceHealthHB, sourceMaxHealthHB))
 		}
 		if config.MaxAckPending <= 0 {
 			return NewJSConsumerAckFCRequiresMaxAckPendingError()
@@ -5550,6 +5549,15 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 	if hb != nil {
 		hbc = hb.C
 	}
+	// Sends flow control at the end of a burst when the idle heartbeat is longer than ackFlowControlEOSDelay.
+	var fcc <-chan time.Time
+	var fct *time.Timer
+	if o.cfg.AckPolicy == AckFlowControl && hbd > ackFlowControlEOSDelay {
+		fct = time.NewTimer(ackFlowControlEOSDelay)
+		fct.Stop()
+		defer fct.Stop()
+		fcc = fct.C
+	}
 	// Interest changes.
 	inch := o.inch
 	o.mu.Unlock()
@@ -5736,6 +5744,9 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 		if hb != nil {
 			hb.Reset(hbd)
 		}
+		if fct != nil {
+			fct.Reset(ackFlowControlEOSDelay)
+		}
 
 		o.mu.Unlock()
 		continue
@@ -5789,6 +5800,17 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 			}
 			// Reset our idle heartbeat timer.
 			hb.Reset(hbd)
+		case <-fcc:
+			if o.isActive() {
+				o.mu.Lock()
+				// Acknowledge the end of a burst without waiting for the (longer) idle heartbeat.
+				if len(o.pending) > 0 && o.fcid == _EMPTY_ {
+					o.sendFlowControl()
+					// Only report being stalled on this flow control after a full heartbeat interval.
+					hb.Reset(hbd)
+				}
+				o.mu.Unlock()
+			}
 		}
 	}
 }
@@ -6106,6 +6128,9 @@ func (o *consumer) fcReply() string {
 	sb.Write(b[:])
 	return sb.String()
 }
+
+// How long after the last delivery to send flow control to acknowledge the end of a burst.
+var ackFlowControlEOSDelay = time.Second
 
 // sendFlowControl will send a flow control packet to the consumer.
 // Lock should be held.

@@ -12636,8 +12636,17 @@ func TestJetStreamConsumerAckFlowControlBasics(t *testing.T) {
 		require_Error(t, err, NewJSConsumerAckFCRequiresFCError())
 
 		cfg.FlowControl = true
+		hbErr := NewJSStreamInvalidConfigError(fmt.Errorf("flow control ack policy heartbeat needs to be between 1s and 1m0s"))
 		_, err = jsConsumerCreate(t, nc, "TEST", cfg, true)
-		require_Error(t, err, NewJSStreamInvalidConfigError(fmt.Errorf("flow control ack policy heartbeat needs to be 1s")))
+		require_Error(t, err, hbErr)
+
+		cfg.Heartbeat = 500 * time.Millisecond
+		_, err = jsConsumerCreate(t, nc, "TEST", cfg, true)
+		require_Error(t, err, hbErr)
+
+		cfg.Heartbeat = time.Minute + time.Second
+		_, err = jsConsumerCreate(t, nc, "TEST", cfg, true)
+		require_Error(t, err, hbErr)
 
 		cfg.Heartbeat = time.Second
 		_, err = jsConsumerCreate(t, nc, "TEST", cfg, true)
@@ -12667,6 +12676,176 @@ func TestJetStreamConsumerAckFlowControlBasics(t *testing.T) {
 		t.Run(fmt.Sprintf("R%d", replicas), func(t *testing.T) {
 			test(replicas)
 		})
+	}
+}
+
+func TestJetStreamConsumerAckFlowControlEndOfBurst(t *testing.T) {
+	test := func(t *testing.T, eosDelay time.Duration) {
+		old := ackFlowControlEOSDelay
+		ackFlowControlEOSDelay = eosDelay
+		defer func() { ackFlowControlEOSDelay = old }()
+
+		s := RunBasicJetStreamServer(t)
+		defer s.Shutdown()
+
+		nc, js := jsClientConnect(t, s)
+		defer nc.Close()
+
+		_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}})
+		require_NoError(t, err)
+
+		sub, err := nc.SubscribeSync("deliver")
+		require_NoError(t, err)
+		defer sub.Unsubscribe()
+		require_NoError(t, nc.Flush())
+
+		_, err = jsConsumerCreate(t, nc, "TEST", ConsumerConfig{
+			Durable:        "CONSUMER",
+			DeliverSubject: "deliver",
+			AckPolicy:      AckFlowControl,
+		}, false)
+		require_NoError(t, err)
+
+		for range 3 {
+			_, err = js.Publish("foo", nil)
+			require_NoError(t, err)
+		}
+		for range 3 {
+			msg, err := sub.NextMsg(time.Second)
+			require_NoError(t, err)
+			require_Equal(t, msg.Header.Get("Status"), _EMPTY_)
+		}
+
+		next := func() *nats.Msg {
+			t.Helper()
+			msg, err := sub.NextMsg(2 * time.Second)
+			require_NoError(t, err)
+			require_Equal(t, msg.Header.Get("Status"), "100")
+			return msg
+		}
+
+		var fc *nats.Msg
+		if eosDelay >= time.Second {
+			// The idle heartbeat sends the flow control, so must not report being stalled on it.
+			msg := next()
+			require_Equal(t, msg.Header.Get("Description"), "Idle Heartbeat")
+			require_Equal(t, msg.Header.Get(JSConsumerStalled), _EMPTY_)
+			fc = next()
+			require_Equal(t, fc.Header.Get("Description"), "FlowControl Request")
+		} else {
+			// Flow control is sent before the idle heartbeat, and we don't reply to it yet.
+			fc = next()
+			require_Equal(t, fc.Header.Get("Description"), "FlowControl Request")
+			start := time.Now()
+
+			// Only a full heartbeat later we should be reported as stalled.
+			msg := next()
+			require_Equal(t, msg.Header.Get("Description"), "Idle Heartbeat")
+			require_Equal(t, msg.Header.Get(JSConsumerStalled), fc.Reply)
+			if elapsed := time.Since(start); elapsed < 800*time.Millisecond {
+				t.Fatalf("Expected stalled heartbeat a full interval after flow control, got %v", elapsed)
+			}
+		}
+
+		// Replying to the flow control acknowledges the burst.
+		reply := nats.NewMsg(fc.Reply)
+		reply.Header.Set(JSLastConsumerSeq, "3")
+		reply.Header.Set(JSLastStreamSeq, "3")
+		require_NoError(t, nc.PublishMsg(reply))
+
+		mset, err := s.globalAccount().lookupStream("TEST")
+		require_NoError(t, err)
+		o := mset.lookupConsumer("CONSUMER")
+		require_NotNil(t, o)
+		checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+			ci := o.info()
+			if ci.AckFloor.Stream != 3 || ci.NumAckPending != 0 {
+				return fmt.Errorf("expected ack floor 3 and no pending, got %d and %d", ci.AckFloor.Stream, ci.NumAckPending)
+			}
+			return nil
+		})
+	}
+
+	t.Run("Default", func(t *testing.T) { test(t, time.Second) })
+	t.Run("BeforeHeartbeat", func(t *testing.T) { test(t, 600*time.Millisecond) })
+}
+
+func TestJetStreamDurableStreamSourceHeartbeat(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := jsStreamCreate(t, nc, &StreamConfig{Name: "O", Subjects: []string{"foo"}, Storage: FileStorage})
+	require_NoError(t, err)
+
+	hb := 20 * time.Second
+	for _, name := range []string{"M", "S"} {
+		ci, err := jsConsumerCreate(t, nc, "O", ConsumerConfig{
+			Durable:        name,
+			DeliverSubject: fmt.Sprintf("deliver.%s", name),
+			AckPolicy:      AckFlowControl,
+			Heartbeat:      hb,
+		}, false)
+		require_NoError(t, err)
+		require_Equal(t, ci.Heartbeat, hb)
+	}
+
+	_, err = js.Publish("foo", nil)
+	require_NoError(t, err)
+
+	_, err = jsStreamCreate(t, nc, &StreamConfig{
+		Name:    "M",
+		Mirror:  &StreamSource{Name: "O", Consumer: &StreamConsumerSource{Name: "M", DeliverSubject: "deliver.M"}},
+		Storage: FileStorage,
+	})
+	require_NoError(t, err)
+	_, err = jsStreamCreate(t, nc, &StreamConfig{
+		Name:    "S",
+		Sources: []*StreamSource{{Name: "O", Consumer: &StreamConsumerSource{Name: "S", DeliverSubject: "deliver.S"}}},
+		Storage: FileStorage,
+	})
+	require_NoError(t, err)
+
+	// Wait for the first message to have been sourced.
+	for _, stream := range []string{"M", "S"} {
+		checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+			_, err := js.GetMsg(stream, 1)
+			return err
+		})
+	}
+
+	acc := s.globalAccount()
+	mirror, err := acc.lookupStream("M")
+	require_NoError(t, err)
+	source, err := acc.lookupStream("S")
+	require_NoError(t, err)
+
+	source.mu.RLock()
+	var ssi *sourceInfo
+	for _, si := range source.sources {
+		ssi = si
+	}
+	source.mu.RUnlock()
+	require_NotNil(t, ssi)
+
+	for _, tc := range []struct {
+		mset *stream
+		si   *sourceInfo
+	}{
+		{mirror, mirror.mirror},
+		{source, ssi},
+	} {
+		tc.mset.mu.Lock()
+		require_Equal(t, tc.si.hb, hb)
+		// The stalled threshold is derived from the heartbeat, not the health check interval.
+		tc.si.last.Store(time.Now().Add(-2 * sourceHealthCheckInterval).UnixNano())
+		require_False(t, tc.si.isStalled())
+		tc.si.last.Store(time.Now().Add(-sourceStalledHeartbeats*hb - time.Second).UnixNano())
+		require_True(t, tc.si.isStalled())
+		tc.si.last.Store(time.Now().UnixNano())
+		tc.mset.mu.Unlock()
 	}
 }
 

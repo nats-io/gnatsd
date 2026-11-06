@@ -723,6 +723,7 @@ type sourceInfo struct {
 	fcid  string              // The last flow control reply subject the consumer reported being stalled on.
 	fcsc  int                 // Consecutive heartbeats reporting the same stalled flow control reply subject.
 	last  atomic.Int64        // Time the consumer was created or of last message it received.
+	hb    time.Duration       // The heartbeat interval of the current consumer.
 	lreq  time.Time           // The last time setupMirrorConsumer/setupSourceConsumer was called.
 	qch   chan struct{}       // Quit channel.
 	sip   bool                // Setup in progress.
@@ -3388,12 +3389,9 @@ func (mset *stream) retryDisconnectedSyncConsumers() {
 	clientClosed := func(c *client) bool {
 		return c != nil && (c.flags.isSet(closeConnection) || c.flags.isSet(connMarkedClosed))
 	}
-	// Stale sources need to be reset: if not seen past the health check interval, it's stale.
-	stale := func(si *sourceInfo) bool {
-		return time.Since(time.Unix(0, si.last.Load())) > sourceHealthCheckInterval
-	}
 	shouldRetry := func(si *sourceInfo) bool {
-		if si != nil && !si.sip && (si.sub == nil || clientClosed(si.sub.client) || stale(si)) {
+		// Stalled sources need to be reset as well.
+		if si != nil && !si.sip && (si.sub == nil || clientClosed(si.sub.client) || si.isStalled()) {
 			// Skip if a recreate is already scheduled and we can't cancel it.
 			if t, ok := mset.sourceSetupSchedules[si.iname]; ok {
 				if !t.Stop() {
@@ -3425,9 +3423,18 @@ func (mset *stream) retryDisconnectedSyncConsumers() {
 const (
 	// Our consumer HB interval.
 	sourceHealthHB = 1 * time.Second
+	// Max HB interval of a durable consumer, below retryMaximum so its heartbeats can short-circuit retries.
+	sourceMaxHealthHB = 1 * time.Minute
 	// How often we check and our stalled interval.
 	sourceHealthCheckInterval = 10 * time.Second
+	// Number of missed heartbeats after which a consumer is considered stalled.
+	sourceStalledHeartbeats = 3
 )
+
+// isStalled returns whether we have not received anything from the consumer for too long.
+func (si *sourceInfo) isStalled() bool {
+	return time.Since(time.Unix(0, si.last.Load())) > max(sourceHealthCheckInterval, sourceStalledHeartbeats*si.hb)
+}
 
 // Will run as a Go routine to process mirror consumer messages.
 func (mset *stream) processMirrorMsgs(mirror *sourceInfo, ready *sync.WaitGroup) {
@@ -3485,7 +3492,7 @@ func (mset *stream) processMirrorMsgs(mirror *sourceInfo, ready *sync.WaitGroup)
 			mset.mu.RLock()
 			var stalled bool
 			if mset.mirror != nil {
-				stalled = time.Since(time.Unix(0, mset.mirror.last.Load())) > sourceHealthCheckInterval
+				stalled = mset.mirror.isStalled()
 			}
 			isLeader := mset.isLeader()
 			mset.mu.RUnlock()
@@ -4110,6 +4117,7 @@ func (mset *stream) setupMirrorConsumer() error {
 				mset.mu.Unlock()
 				return
 			}
+			mirror.hb = ccr.ConsumerInfo.Config.Heartbeat
 
 			// We can now unsubscribe.
 			mset.unsubscribe(crSub)
@@ -4651,6 +4659,7 @@ func (mset *stream) trySetupSourceConsumer(iname string, seq uint64, startTime t
 					mset.mu.Unlock()
 					return
 				}
+				si.hb = ccr.ConsumerInfo.Config.Heartbeat
 
 				// We can now unsubscribe.
 				mset.unsubscribe(crSub)
@@ -4779,7 +4788,7 @@ func (mset *stream) processAllSourceMsgs() {
 			var stalled []*sourceInfo
 			mset.mu.RLock()
 			for _, si := range mset.sources {
-				if time.Since(time.Unix(0, si.last.Load())) > sourceHealthCheckInterval {
+				if si.isStalled() {
 					stalled = append(stalled, si)
 				}
 			}
