@@ -4063,6 +4063,9 @@ func (fs *fileStore) filterIsAll(filters []string) bool {
 func (fs *fileStore) MultiLastSeqs(filters []string, maxSeq uint64, maxAllowed int) ([]uint64, error) {
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
+	if fs.isClosed() {
+		return nil, ErrStoreClosed
+	}
 	return fs.multiLastSeqsLocked(filters, maxSeq, maxAllowed)
 }
 
