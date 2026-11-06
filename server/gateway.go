@@ -2536,6 +2536,11 @@ var subPool = &sync.Pool{
 // regardless if it is a LEAF connection or not.
 // <Invoked from any client connection's readLoop>
 func (c *client) sendMsgToGateways(acc *Account, msg, subject, reply []byte, qgroups [][]byte, checkLeafQF bool) bool {
+	return c.sendMsgToGatewaysVia(acc, msg, subject, reply, qgroups, checkLeafQF, nil)
+}
+
+// sendMsgToGatewaysVia sends to all outbound gateways, or only to dst if set.
+func (c *client) sendMsgToGatewaysVia(acc *Account, msg, subject, reply []byte, qgroups [][]byte, checkLeafQF bool, dst *client) bool {
 	// We had some times when we were sending across a GW with no subject, and the other side would break
 	// due to parser error. These need to be fixed upstream but also double check here.
 	if len(subject) == 0 {
@@ -2550,7 +2555,9 @@ func (c *client) sendMsgToGateways(acc *Account, msg, subject, reply []byte, qgr
 	gw := srv.gateway
 	gw.RLock()
 	for i := 0; i < len(gw.outo); i++ {
-		gws = append(gws, gw.outo[i])
+		if dst == nil || gw.outo[i] == dst {
+			gws = append(gws, gw.outo[i])
+		}
 	}
 	thisClusterReplyPrefix := gw.replyPfx
 	gw.RUnlock()

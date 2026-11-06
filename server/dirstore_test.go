@@ -401,6 +401,48 @@ func TestMergeOnlyOnNewer(t *testing.T) {
 	require_Equal(t, newerJWT, fromStore)
 }
 
+func TestDirStoreMergeTieBreak(t *testing.T) {
+	accKey, err := nkeys.CreateAccount()
+	require_NoError(t, err)
+	pubKey, err := accKey.PublicKey()
+	require_NoError(t, err)
+
+	// Two different JWTs issued in the same second.
+	var jwt1, jwt2 string
+	for {
+		claim := jwt.NewAccountClaims(pubKey)
+		jwt1, err = claim.Encode(accKey)
+		require_NoError(t, err)
+		claim.Tags.Add("other")
+		jwt2, err = claim.Encode(accKey)
+		require_NoError(t, err)
+		c1, err := jwt.DecodeGeneric(jwt1)
+		require_NoError(t, err)
+		c2, err := jwt.DecodeGeneric(jwt2)
+		require_NoError(t, err)
+		if c1.IssuedAt == c2.IssuedAt {
+			break
+		}
+	}
+
+	// Each store merges the other's JWT, both must keep the same one.
+	a, err := NewExpiringDirJWTStore(t.TempDir(), false, true, NoDelete, 0, 0, true, 0, nil)
+	require_NoError(t, err)
+	defer a.Close()
+	b, err := NewExpiringDirJWTStore(t.TempDir(), false, true, NoDelete, 0, 0, true, 0, nil)
+	require_NoError(t, err)
+	defer b.Close()
+	require_NoError(t, a.SaveAcc(pubKey, jwt1))
+	require_NoError(t, b.SaveAcc(pubKey, jwt2))
+	require_NoError(t, a.Merge(fmt.Sprintf("%s|%s", pubKey, jwt2)))
+	require_NoError(t, b.Merge(fmt.Sprintf("%s|%s", pubKey, jwt1)))
+	fromA, err := a.LoadAcc(pubKey)
+	require_NoError(t, err)
+	fromB, err := b.LoadAcc(pubKey)
+	require_NoError(t, err)
+	require_Equal(t, fromA, fromB)
+}
+
 func createTestAccount(t *testing.T, dirStore *DirJWTStore, expSec int, accKey nkeys.KeyPair) string {
 	t.Helper()
 	pubKey, err := accKey.PublicKey()
@@ -899,7 +941,7 @@ func TestRemove(t *testing.T) {
 			require_NoError(t, err)
 			createTestAccount(t, dirStore, 0, accountKey)
 			require_OneJWT()
-			dirStore.delete(pubKey)
+			dirStore.delete(pubKey, time.Now().Unix(), nil)
 			if deleteType == NoDelete {
 				require_True(t, delPubKey == "")
 			} else {
@@ -1017,4 +1059,92 @@ func TestNotificationOnPackWalk(t *testing.T) {
 	for i := 0; i < storeCnt; i++ {
 		store[i].Close()
 	}
+}
+
+func TestDirStoreMergeKeepsDeleted(t *testing.T) {
+	newStore := func() *DirJWTStore {
+		store, err := NewExpiringDirJWTStore(t.TempDir(), false, true, RenameDeleted, 0, 0, true, 0, nil)
+		require_NoError(t, err)
+		store.deleted = func(string) {}
+		t.Cleanup(store.Close)
+		return store
+	}
+	merge := func(from, to *DirJWTStore) {
+		t.Helper()
+		require_NoError(t, from.packWalk(1, true, func(msg string) {
+			require_NoError(t, to.Merge(msg))
+		}))
+	}
+	live := func(store *DirJWTStore, pubKey string) bool {
+		_, err := os.Stat(filepath.Join(store.directory, pubKey+fileExtension))
+		return err == nil
+	}
+	a, b := newStore(), newStore()
+	accKey, err := nkeys.CreateAccount()
+	require_NoError(t, err)
+	pubKey, err := accKey.PublicKey()
+	require_NoError(t, err)
+	jwt1 := createTestAccount(t, a, 0, accKey)
+	require_NoError(t, b.SaveAcc(pubKey, jwt1))
+	// a gets an older JWT of a second account, b gets a newer one after the sleep below.
+	staleKey, err := nkeys.CreateAccount()
+	require_NoError(t, err)
+	stalePubKey, err := staleKey.PublicKey()
+	require_NoError(t, err)
+	createTestAccount(t, a, 0, staleKey)
+
+	// The delete only reaches a.
+	require_NoError(t, a.delete(pubKey, time.Now().Unix(), nil))
+	require_False(t, live(a, pubKey))
+
+	// The deleted JWT can't be saved again, it must be re-issued.
+	require_Error(t, a.SaveAcc(pubKey, jwt1))
+	require_False(t, live(a, pubKey))
+
+	// a must not take the deleted JWT back from b.
+	merge(b, a)
+	require_False(t, live(a, pubKey))
+
+	// b must apply the tombstone from a.
+	merge(a, b)
+	require_False(t, live(b, pubKey))
+	_, err = os.Stat(filepath.Join(b.directory, pubKey+fileExtension+deletedSuffix))
+	require_NoError(t, err)
+
+	// A newer JWT creates the account again. JWTs are issued with second precision.
+	time.Sleep(1100 * time.Millisecond)
+	jwt2 := createTestAccount(t, b, 0, accKey)
+	createTestAccount(t, b, 0, staleKey)
+	// The delete of the second account only reaches a, which has an older JWT than b.
+	require_NoError(t, a.delete(stalePubKey, time.Now().Unix(), nil))
+	merge(b, a)
+	theJWT, err := a.LoadAcc(pubKey)
+	require_NoError(t, err)
+	require_Equal(t, theJWT, jwt2)
+	require_False(t, live(a, stalePubKey))
+	merge(a, b)
+	require_False(t, live(b, stalePubKey))
+
+	// The delete only reaches b, which doesn't have the account.
+	thirdKey, err := nkeys.CreateAccount()
+	require_NoError(t, err)
+	thirdPubKey, err := thirdKey.PublicKey()
+	require_NoError(t, err)
+	createTestAccount(t, a, 0, thirdKey)
+	require_NoError(t, b.delete(thirdPubKey, time.Now().Unix(), nil))
+	merge(a, b)
+	require_False(t, live(b, thirdPubKey))
+	merge(b, a)
+	require_False(t, live(a, thirdPubKey))
+
+	// A delete issued before the local JWT is ignored, without a tombstone.
+	fourthKey, err := nkeys.CreateAccount()
+	require_NoError(t, err)
+	fourthPubKey, err := fourthKey.PublicKey()
+	require_NoError(t, err)
+	createTestAccount(t, a, 0, fourthKey)
+	require_Error(t, a.delete(fourthPubKey, time.Now().Unix()-10, nil), errJWTReissued)
+	require_True(t, live(a, fourthPubKey))
+	_, err = os.Stat(filepath.Join(a.directory, fourthPubKey+fileExtension+deletedSuffix))
+	require_True(t, os.IsNotExist(err))
 }

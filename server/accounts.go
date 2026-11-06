@@ -4438,8 +4438,9 @@ func handleDeleteRequest(store *DirJWTStore, s *Server, msg []byte, reply string
 	}
 	errs := []string{}
 	passCnt := 0
+	// The request's issue time is the delete time, a JWT issued later re-creates the account.
 	for _, acc := range accIds {
-		if err := store.delete(acc.(string)); err != nil {
+		if err := store.delete(acc.(string), gk.IssuedAt, nil); err != nil {
 			errs = append(errs, err.Error())
 		} else {
 			passCnt++
@@ -4710,10 +4711,11 @@ func (dr *DirAccResolver) Start(s *Server) error {
 			return
 		}
 		ourHash := dr.DirJWTStore.Hash()
+		// On a mismatch, also send tombstones, so peers that missed a delete apply it.
 		if bytes.Equal(theirHash, ourHash[:]) {
 			s.sendInternalMsgLocked(reply, _EMPTY_, nil, []byte{})
 			s.Debugf("DirResolver - Pack request matches hash %x", ourHash[:])
-		} else if err := dr.DirJWTStore.PackWalk(1, func(partialPackMsg string) {
+		} else if err := dr.DirJWTStore.packWalk(1, true, func(partialPackMsg string) {
 			s.sendInternalMsgLocked(reply, _EMPTY_, nil, []byte(partialPackMsg))
 		}); err != nil {
 			// let them timeout
@@ -4758,6 +4760,8 @@ func (dr *DirAccResolver) Start(s *Server) error {
 	s.startGoRoutine(func() {
 		defer s.grWG.Done()
 		ticker := time.NewTicker(dr.syncInterval)
+		var toGateway bool
+		var gws []*client
 		for {
 			select {
 			case <-quit:
@@ -4767,6 +4771,16 @@ func (dr *DirAccResolver) Start(s *Server) error {
 			}
 			ourHash := dr.DirJWTStore.Hash()
 			s.Debugf("DirResolver - Checking store state: %x", ourHash)
+			// Alternate with a remote cluster, so a cluster that missed updates also catches up.
+			toGateway = !toGateway && s.gateway.enabled
+			if toGateway {
+				// Ask a random remote cluster, not just the nearest one.
+				gws = gws[:0]
+				if s.getOutboundGatewayConnections(&gws); len(gws) > 0 {
+					s.sendInternalGatewayMsgLocked(gws[rand.IntN(len(gws))], accPackReqSubj, packRespIb, ourHash[:])
+					continue
+				}
+			}
 			s.sendInternalMsgLocked(accPackReqSubj, packRespIb, nil, ourHash[:])
 		}
 	})

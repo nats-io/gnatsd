@@ -3766,9 +3766,7 @@ func TestJWTAccountNATSResolverCrossClusterFetch(t *testing.T) {
 	dirBA := t.TempDir()
 	dirBB := t.TempDir()
 	// simulate a restart of the server by storing files in them
-	// Server AA & AB will completely sync
-	// Server BA & BB will completely sync
-	// Be aware that no syncing will occur between cluster
+	// The long sync interval keeps sync from copying them, so other servers must fetch them.
 	writeJWT(t, dirAA, apub, ajwt1)
 	writeJWT(t, dirBA, bpub, bjwt1)
 	// Create seed server A (using no_advertise to prevent fail over)
@@ -3780,7 +3778,7 @@ func TestJWTAccountNATSResolverCrossClusterFetch(t *testing.T) {
 		resolver: {
 			type: full
 			dir: '%s'
-			interval: "200ms"
+			interval: "1h"
 		}
 		gateway: {
 			name: "clust-A"
@@ -3803,7 +3801,7 @@ func TestJWTAccountNATSResolverCrossClusterFetch(t *testing.T) {
 		resolver: {
 			type: full
 			dir: '%s'
-			interval: "200ms"
+			interval: "1h"
 		}
 		gateway: {
 			name: "clust-A"
@@ -3829,7 +3827,7 @@ func TestJWTAccountNATSResolverCrossClusterFetch(t *testing.T) {
 		resolver: {
 			type: full
 			dir: '%s'
-			interval: "200ms"
+			interval: "1h"
 		}
 		gateway: {
 			name: "clust-B"
@@ -3855,7 +3853,7 @@ func TestJWTAccountNATSResolverCrossClusterFetch(t *testing.T) {
 		resolver: {
 			type: full
 			dir: '%s'
-			interval: "200ms"
+			interval: "1h"
 		}
 		cluster {
 			name: clust-B
@@ -3917,6 +3915,99 @@ func TestJWTAccountNATSResolverCrossClusterFetch(t *testing.T) {
 	require_JWTEqual(t, dirAB, bpub, bjwt2)           // assure that jwt got updated accordingly
 	require_JWTEqual(t, dirBA, apub, ajwt2)           // assure that jwt got updated accordingly
 	require_JWTEqual(t, dirBB, apub, ajwt2)           // assure that jwt got updated accordingly
+}
+
+func TestJWTAccountNATSResolverSyncAllRemoteClusters(t *testing.T) {
+	_, syspub := createKey(t)
+	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
+	_, accPub := createKey(t)
+	accClaim := jwt.NewAccountClaims(accPub)
+	accJwt1 := encodeClaim(t, accClaim, accPub)
+	// JWTs are issued with second precision.
+	time.Sleep(1100 * time.Millisecond)
+	accClaim.Tags.Add("updated")
+	accJwt2 := encodeClaim(t, accClaim, accPub)
+
+	dirA, dirB, dirC := t.TempDir(), t.TempDir(), t.TempDir()
+	for _, dir := range []string{dirA, dirB, dirC} {
+		writeJWT(t, dir, syspub, sysJwt)
+		writeJWT(t, dir, accPub, accJwt1)
+	}
+	conf := func(name, dir, gateways string) string {
+		return createConfFile(t, []byte(fmt.Sprintf(`
+			listen: 127.0.0.1:-1
+			server_name: %s
+			operator: %s
+			system_account: %s
+			resolver: {
+				type: full
+				dir: '%s'
+				allow_delete: true
+				interval: "200ms"
+			}
+			gateway {
+				name: %s
+				listen: 127.0.0.1:-1
+				%s
+			}
+		`, name, ojwt, syspub, dir, name, gateways)))
+	}
+	sA, _ := RunServerWithConfig(conf("A", dirA, _EMPTY_))
+	defer sA.Shutdown()
+	gateways := fmt.Sprintf(`gateways: [{name: "A", url: "nats://127.0.0.1:%d"}]`, sA.GatewayAddr().Port)
+	sB, _ := RunServerWithConfig(conf("B", dirB, gateways))
+	defer sB.Shutdown()
+	sC, _ := RunServerWithConfig(conf("C", dirC, gateways))
+	defer sC.Shutdown()
+	for _, s := range []*Server{sA, sB, sC} {
+		waitForOutboundGateways(t, s, 2, 5*time.Second)
+	}
+
+	// Make A and B the nearest to each other, after the first RTTs are measured.
+	for _, s := range []*Server{sA, sB} {
+		var gwcs []*client
+		s.getOutboundGatewayConnections(&gwcs)
+		checkFor(t, 5*time.Second, 50*time.Millisecond, func() error {
+			for _, gwc := range gwcs {
+				gwc.mu.Lock()
+				rtt := gwc.rtt
+				gwc.mu.Unlock()
+				if rtt == 0 {
+					return errors.New("RTT not measured yet")
+				}
+			}
+			return nil
+		})
+		gwcC := s.getOutboundGatewayConnection("C")
+		gwcC.mu.Lock()
+		gwcC.rtt = 10 * time.Second
+		gwcC.mu.Unlock()
+		s.gateway.orderOutboundConnections()
+	}
+
+	// Only C gets the newer JWT. A and B must still ask C, not just each other.
+	require_NoError(t, sC.AccountResolver().Store(accPub, accJwt2))
+	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+		for _, dir := range []string{dirA, dirB} {
+			if content, err := os.ReadFile(filepath.Join(dir, accPub+fileExtension)); err != nil {
+				return err
+			} else if string(content) != accJwt2 {
+				return errors.New("account JWT not updated yet")
+			}
+		}
+		return nil
+	})
+
+	// Only C gets the delete. A and B must apply it from C's tombstone.
+	require_NoError(t, sC.AccountResolver().(*DirAccResolver).DirJWTStore.delete(accPub, time.Now().Unix(), nil))
+	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+		for _, dir := range []string{dirA, dirB} {
+			if _, err := os.Stat(filepath.Join(dir, accPub+fileExtension)); err == nil {
+				return errors.New("account JWT not deleted yet")
+			}
+		}
+		return nil
+	})
 }
 
 func newTimeRange(start time.Time, dur time.Duration) jwt.TimeRange {
@@ -8447,5 +8538,93 @@ func TestJWTAccountMaxConnsStillReportedAsAccountLimit(t *testing.T) {
 		if strings.Contains(e, ErrAuthentication.Error()) {
 			t.Fatalf("account connection limit was reported as an authentication error: %q", e)
 		}
+	}
+}
+
+func TestJWTAccountNATSResolverSyncKeepsDeletedAccount(t *testing.T) {
+	sysKp, syspub := createKey(t)
+	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
+	sysCreds := newUser(t, sysKp)
+	accKp, accPub := createKey(t)
+	accJwt := encodeClaim(t, jwt.NewAccountClaims(accPub), accPub)
+	accCreds := newUser(t, accKp)
+
+	dirs := []string{t.TempDir(), t.TempDir(), t.TempDir()}
+	for _, dir := range dirs {
+		writeJWT(t, dir, syspub, sysJwt)
+		writeJWT(t, dir, accPub, accJwt)
+	}
+	conf := func(name, dir, routes string) string {
+		return createConfFile(t, []byte(fmt.Sprintf(`
+			listen: 127.0.0.1:-1
+			server_name: %s
+			operator: %s
+			system_account: %s
+			resolver: {
+				type: full
+				dir: '%s'
+				allow_delete: true
+				interval: "200ms"
+			}
+			cluster {
+				name: C
+				listen: 127.0.0.1:-1
+				%s
+			}
+		`, name, ojwt, syspub, dir, routes)))
+	}
+	s1, _ := RunServerWithConfig(conf("S1", dirs[0], _EMPTY_))
+	defer s1.Shutdown()
+	routes := fmt.Sprintf("routes: [nats-route://127.0.0.1:%d]", s1.ClusterAddr().Port)
+	s2, _ := RunServerWithConfig(conf("S2", dirs[1], routes))
+	defer s2.Shutdown()
+	conf3 := conf("S3", dirs[2], routes)
+	s3, _ := RunServerWithConfig(conf3)
+	checkClusterFormed(t, s1, s2, s3)
+
+	// S3 is down during the delete.
+	s3.Shutdown()
+	s3.WaitForShutdown()
+
+	nc := natsConnect(t, s1.ClientURL(), nats.UserCredentials(sysCreds))
+	defer nc.Close()
+	opPub, err := oKp.PublicKey()
+	require_NoError(t, err)
+	req := jwt.NewGenericClaims(opPub)
+	req.Data["accounts"] = []string{accPub}
+	reqJwt, err := req.Encode(oKp)
+	require_NoError(t, err)
+	resp, err := nc.Request(accDeleteReqSubj, []byte(reqJwt), time.Second)
+	require_NoError(t, err)
+	require_Contains(t, string(resp.Data), "deleted 1 accounts")
+
+	hasJWT := func(dir string) bool {
+		_, err := os.Stat(filepath.Join(dir, accPub+fileExtension))
+		return err == nil
+	}
+	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		if hasJWT(dirs[0]) || hasJWT(dirs[1]) {
+			return errors.New("account not deleted yet")
+		}
+		return nil
+	})
+
+	// S3 comes back with the deleted account still on disk.
+	s3, _ = RunServerWithConfig(conf3)
+	defer s3.Shutdown()
+	checkClusterFormed(t, s1, s2, s3)
+
+	// Sync must apply the delete on S3, and not bring the account back on S1 and S2.
+	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+		for i, dir := range dirs {
+			if hasJWT(dir) {
+				return fmt.Errorf("account JWT exists on S%d", i+1)
+			}
+		}
+		return nil
+	})
+	for _, s := range []*Server{s1, s2, s3} {
+		_, err = nats.Connect(s.ClientURL(), nats.UserCredentials(accCreds), nats.NoReconnect())
+		require_Error(t, err)
 	}
 }
