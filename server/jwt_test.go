@@ -8449,3 +8449,353 @@ func TestJWTAccountMaxConnsStillReportedAsAccountLimit(t *testing.T) {
 		}
 	}
 }
+
+func TestJWTAccountLimitsMaxPayloadAsyncInfo(t *testing.T) {
+	s := opTrustBasicSetup()
+	defer s.Shutdown()
+	buildMemAccResolver(s)
+
+	okp, _ := nkeys.FromSeed(oSeed)
+
+	fooKP, _ := nkeys.CreateAccount()
+	fooPub, _ := fooKP.PublicKey()
+	fooAC := jwt.NewAccountClaims(fooPub)
+	fooAC.Limits.Payload = 100
+	fooJWT, err := fooAC.Encode(okp)
+	require_NoError(t, err)
+	addAccountToMemResolver(s, fooPub, fooJWT)
+
+	connectClient := func(nuc *jwt.UserClaims, proto int) (*testAsyncClient, *bufio.Reader) {
+		nkp, _ := nkeys.CreateUser()
+		pub, _ := nkp.PublicKey()
+		if nuc == nil {
+			nuc = jwt.NewUserClaims(pub)
+		} else {
+			nuc.Subject = pub
+		}
+		uJWT, err := nuc.Encode(fooKP)
+		require_NoError(t, err)
+
+		c, cr, l := newClientForServer(s)
+		var info nonceInfo
+		require_NoError(t, json.Unmarshal([]byte(l[5:]), &info))
+		sigraw, _ := nkp.Sign([]byte(info.Nonce))
+		sig := base64.RawURLEncoding.EncodeToString(sigraw)
+
+		cs := fmt.Sprintf("CONNECT {\"jwt\":%q,\"sig\":%q,\"protocol\":%d}\r\nPING\r\n", uJWT, sig, proto)
+		c.parseAsync(cs)
+		pong, err := cr.ReadString('\n')
+		require_NoError(t, err)
+		if !strings.HasPrefix(pong, "PONG") {
+			t.Fatalf("Expected PONG, got %q", pong)
+		}
+		// Clients with protocol >= ClientProtoInfo also receive an initial connect INFO on first PING
+		if proto >= ClientProtoInfo {
+			connectInfo, err := cr.ReadString('\n')
+			require_NoError(t, err)
+			if !strings.HasPrefix(connectInfo, "INFO ") {
+				t.Fatalf("Expected initial connect INFO, got %q", connectInfo)
+			}
+		}
+		return c, cr
+	}
+
+	// Client 1: protocol=1, inherits account limit 100
+	c1, cr1 := connectClient(nil, ClientProtoInfo)
+	defer c1.close()
+
+	// Client 2: protocol=1, user limit = 50 (lower than account limit 100)
+	uc2 := jwt.NewUserClaims("temp")
+	uc2.Limits.Payload = 50
+	c2, cr2 := connectClient(uc2, ClientProtoInfo)
+	defer c2.close()
+
+	// Client 3: protocol=0 (legacy client, does not support async INFO)
+	c3, cr3 := connectClient(nil, 0)
+	defer c3.close()
+
+	// Verify initial effective limits
+	require_True(t, atomic.LoadInt32(&c1.client.mpay) == 100)
+	require_True(t, atomic.LoadInt32(&c2.client.mpay) == 50)
+	require_True(t, atomic.LoadInt32(&c3.client.mpay) == 100)
+
+	// Step 1: Raise account payload limit from 100 to 200
+	fooAC.Limits.Payload = 200
+	fooJWT, err = fooAC.Encode(okp)
+	require_NoError(t, err)
+	addAccountToMemResolver(s, fooPub, fooJWT)
+
+	acc, err := s.LookupAccount(fooPub)
+	require_NoError(t, err)
+	s.UpdateAccountClaims(acc, fooAC)
+
+	// Check client 1: limit updated 100 -> 200 and receives async INFO
+	require_True(t, atomic.LoadInt32(&c1.client.mpay) == 200)
+	line1, err := cr1.ReadString('\n')
+	require_NoError(t, err)
+	if !strings.HasPrefix(line1, "INFO ") {
+		t.Fatalf("Client 1 expected async INFO, got: %q", line1)
+	}
+	var parsedInfo Info
+	require_NoError(t, json.Unmarshal([]byte(line1[5:]), &parsedInfo))
+	if parsedInfo.MaxPayload != 200 {
+		t.Fatalf("Client 1 expected MaxPayload 200 in async INFO, got %d", parsedInfo.MaxPayload)
+	}
+
+	// Check client 2: user limit 50 < 200, so effective limit unchanged at 50, should NOT receive async INFO
+	require_True(t, atomic.LoadInt32(&c2.client.mpay) == 50)
+	// Check client 3: protocol=0, limit updated to 200, but should NOT receive async INFO
+	require_True(t, atomic.LoadInt32(&c3.client.mpay) == 200)
+
+	// Verify neither c2 nor c3 received async INFO by pinging them and expecting PONG directly
+	c2.parseAsync("PING\r\n")
+	pong2, err := cr2.ReadString('\n')
+	require_NoError(t, err)
+	if !strings.HasPrefix(pong2, "PONG") {
+		t.Fatalf("Client 2 expected direct PONG (no async INFO), got: %q", pong2)
+	}
+
+	c3.parseAsync("PING\r\n")
+	pong3, err := cr3.ReadString('\n')
+	require_NoError(t, err)
+	if !strings.HasPrefix(pong3, "PONG") {
+		t.Fatalf("Client 3 expected direct PONG (no async INFO), got: %q", pong3)
+	}
+
+	// Step 2: Lower account payload limit to 30 (< user limit 50)
+	fooAC.Limits.Payload = 30
+	fooJWT, err = fooAC.Encode(okp)
+	require_NoError(t, err)
+	addAccountToMemResolver(s, fooPub, fooJWT)
+	s.UpdateAccountClaims(acc, fooAC)
+
+	// Client 1: effective limit lowered to 30 -> receives async INFO
+	require_True(t, atomic.LoadInt32(&c1.client.mpay) == 30)
+	line1, err = cr1.ReadString('\n')
+	require_NoError(t, err)
+	if !strings.HasPrefix(line1, "INFO ") {
+		t.Fatalf("Client 1 expected async INFO, got: %q", line1)
+	}
+	require_NoError(t, json.Unmarshal([]byte(line1[5:]), &parsedInfo))
+	if parsedInfo.MaxPayload != 30 {
+		t.Fatalf("Client 1 expected MaxPayload 30 in async INFO, got %d", parsedInfo.MaxPayload)
+	}
+
+	// Client 2: effective limit lowered from 50 to 30 -> receives async INFO
+	require_True(t, atomic.LoadInt32(&c2.client.mpay) == 30)
+	line2, err := cr2.ReadString('\n')
+	require_NoError(t, err)
+	if !strings.HasPrefix(line2, "INFO ") {
+		t.Fatalf("Client 2 expected async INFO, got: %q", line2)
+	}
+	require_NoError(t, json.Unmarshal([]byte(line2[5:]), &parsedInfo))
+	if parsedInfo.MaxPayload != 30 {
+		t.Fatalf("Client 2 expected MaxPayload 30 in async INFO, got %d", parsedInfo.MaxPayload)
+	}
+
+	// Client 3: effective limit lowered to 30, but protocol 0 -> NO async INFO
+	require_True(t, atomic.LoadInt32(&c3.client.mpay) == 30)
+	c3.parseAsync("PING\r\n")
+	pong3, err = cr3.ReadString('\n')
+	require_NoError(t, err)
+	if !strings.HasPrefix(pong3, "PONG") {
+		t.Fatalf("Client 3 expected direct PONG, got: %q", pong3)
+	}
+}
+
+func TestReloadMaxPayloadAccountLimitsAndAsyncInfo(t *testing.T) {
+	s := opTrustBasicSetup()
+	defer s.Shutdown()
+	buildMemAccResolver(s)
+
+	okp, _ := nkeys.FromSeed(oSeed)
+
+	// Account Foo: Has account payload limit 500
+	fooKP, _ := nkeys.CreateAccount()
+	fooPub, _ := fooKP.PublicKey()
+	fooAC := jwt.NewAccountClaims(fooPub)
+	fooAC.Limits.Payload = 500
+	fooJWT, err := fooAC.Encode(okp)
+	require_NoError(t, err)
+	addAccountToMemResolver(s, fooPub, fooJWT)
+
+	// Account Bar: No account payload limit
+	barKP, _ := nkeys.CreateAccount()
+	barPub, _ := barKP.PublicKey()
+	barAC := jwt.NewAccountClaims(barPub)
+	barAC.Limits.Payload = jwt.NoLimit
+	barJWT, err := barAC.Encode(okp)
+	require_NoError(t, err)
+	addAccountToMemResolver(s, barPub, barJWT)
+
+	connectClient := func(akp nkeys.KeyPair, apub string) (*testAsyncClient, *bufio.Reader) {
+		nkp, _ := nkeys.CreateUser()
+		pub, _ := nkp.PublicKey()
+		nuc := jwt.NewUserClaims(pub)
+		uJWT, err := nuc.Encode(akp)
+		require_NoError(t, err)
+
+		c, cr, l := newClientForServer(s)
+		var info nonceInfo
+		require_NoError(t, json.Unmarshal([]byte(l[5:]), &info))
+		sigraw, _ := nkp.Sign([]byte(info.Nonce))
+		sig := base64.RawURLEncoding.EncodeToString(sigraw)
+
+		cs := fmt.Sprintf("CONNECT {\"jwt\":%q,\"sig\":%q,\"protocol\":1}\r\nPING\r\n", uJWT, sig)
+		c.parseAsync(cs)
+		pong, err := cr.ReadString('\n')
+		require_NoError(t, err)
+		if !strings.HasPrefix(pong, "PONG") {
+			t.Fatalf("Expected PONG, got %q", pong)
+		}
+		connectInfo, err := cr.ReadString('\n')
+		require_NoError(t, err)
+		if !strings.HasPrefix(connectInfo, "INFO ") {
+			t.Fatalf("Expected initial connect INFO, got %q", connectInfo)
+		}
+		return c, cr
+	}
+
+	// Client A: in Account Foo (limit 500)
+	cA, crA := connectClient(fooKP, fooPub)
+	defer cA.close()
+
+	// Client B: in Account Bar (unlimited)
+	cB, crB := connectClient(barKP, barPub)
+	defer cB.close()
+
+	s.mu.Lock()
+	s.clients[cA.cid] = cA.client
+	s.clients[cB.cid] = cB.client
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.clients, cA.cid)
+		delete(s.clients, cB.cid)
+		s.mu.Unlock()
+	}()
+
+	// Initial effective limits
+	require_True(t, atomic.LoadInt32(&cA.client.mpay) == 500)
+	oldMpayB := atomic.LoadInt32(&cB.client.mpay)
+
+	// Reload max_payload to 2048
+	newOpts := *s.getOpts()
+	newOpts.MaxPayload = 2048
+	s.setOpts(&newOpts)
+	mopt := &maxPayloadOption{newValue: 2048}
+	mopt.Apply(s)
+
+	// Client B limit changes to 2048 and receives async INFO
+	if oldMpayB != 2048 {
+		require_True(t, atomic.LoadInt32(&cB.client.mpay) == 2048)
+		lineB, err := crB.ReadString('\n')
+		require_NoError(t, err)
+		if !strings.HasPrefix(lineB, "INFO ") {
+			t.Fatalf("Client B expected async INFO, got: %q", lineB)
+		}
+		var parsedInfo Info
+		require_NoError(t, json.Unmarshal([]byte(lineB[5:]), &parsedInfo))
+		if parsedInfo.MaxPayload != 2048 {
+			t.Fatalf("Client B expected MaxPayload 2048 in async INFO, got %d", parsedInfo.MaxPayload)
+		}
+	}
+
+	// Client A limit was 500, minLimit(500, 2048) is STILL 500.
+	// Client A must NOT receive async INFO and mpay must remain 500.
+	require_True(t, atomic.LoadInt32(&cA.client.mpay) == 500)
+	cA.parseAsync("PING\r\n")
+	pongA, err := crA.ReadString('\n')
+	require_NoError(t, err)
+	if !strings.HasPrefix(pongA, "PONG") {
+		t.Fatalf("Client A expected direct PONG (no async INFO), got %q", pongA)
+	}
+
+	// Now reload max_payload to 250 (lower than Client A's account limit of 500)
+	newOpts2 := *s.getOpts()
+	newOpts2.MaxPayload = 250
+	s.setOpts(&newOpts2)
+	mopt2 := &maxPayloadOption{newValue: 250}
+	mopt2.Apply(s)
+
+	// Client A limit becomes 250 and receives async INFO
+	require_True(t, atomic.LoadInt32(&cA.client.mpay) == 250)
+	lineA, err := crA.ReadString('\n')
+	require_NoError(t, err)
+	if !strings.HasPrefix(lineA, "INFO ") {
+		t.Fatalf("Client A expected async INFO, got: %q", lineA)
+	}
+	var parsedInfoA Info
+	require_NoError(t, json.Unmarshal([]byte(lineA[5:]), &parsedInfoA))
+	if parsedInfoA.MaxPayload != 250 {
+		t.Fatalf("Client A expected MaxPayload 250 in async INFO, got %d", parsedInfoA.MaxPayload)
+	}
+
+	// Client B limit becomes 250 and receives async INFO
+	require_True(t, atomic.LoadInt32(&cB.client.mpay) == 250)
+	lineB, err := crB.ReadString('\n')
+	require_NoError(t, err)
+	if !strings.HasPrefix(lineB, "INFO ") {
+		t.Fatalf("Client B expected async INFO, got: %q", lineB)
+	}
+	var parsedInfoB Info
+	require_NoError(t, json.Unmarshal([]byte(lineB[5:]), &parsedInfoB))
+	if parsedInfoB.MaxPayload != 250 {
+		t.Fatalf("Client B expected MaxPayload 250 in async INFO, got %d", parsedInfoB.MaxPayload)
+	}
+}
+
+func TestApplyAccountLimitsDoesNotDisconnectAtExactSubsLimit(t *testing.T) {
+	s := opTrustBasicSetup()
+	defer s.Shutdown()
+	buildMemAccResolver(s)
+
+	okp, _ := nkeys.FromSeed(oSeed)
+
+	fooKP, _ := nkeys.CreateAccount()
+	fooPub, _ := fooKP.PublicKey()
+	fooAC := jwt.NewAccountClaims(fooPub)
+	fooAC.Limits.Subs = 1
+	fooJWT, err := fooAC.Encode(okp)
+	require_NoError(t, err)
+	addAccountToMemResolver(s, fooPub, fooJWT)
+
+	nkp, _ := nkeys.CreateUser()
+	pub, _ := nkp.PublicKey()
+	nuc := jwt.NewUserClaims(pub)
+	uJWT, err := nuc.Encode(fooKP)
+	require_NoError(t, err)
+
+	c, cr, l := newClientForServer(s)
+	defer c.close()
+	var info nonceInfo
+	require_NoError(t, json.Unmarshal([]byte(l[5:]), &info))
+	sigraw, _ := nkp.Sign([]byte(info.Nonce))
+	sig := base64.RawURLEncoding.EncodeToString(sigraw)
+
+	cs := fmt.Sprintf("CONNECT {\"jwt\":%q,\"sig\":%q,\"protocol\":1}\r\nPING\r\n", uJWT, sig)
+	c.parseAsync(cs)
+	pong, err := cr.ReadString('\n')
+	require_NoError(t, err)
+	if !strings.HasPrefix(pong, "PONG") {
+		t.Fatalf("Expected PONG, got %q", pong)
+	}
+	connectInfo, err := cr.ReadString('\n')
+	require_NoError(t, err)
+	if !strings.HasPrefix(connectInfo, "INFO ") {
+		t.Fatalf("Expected initial connect INFO, got %q", connectInfo)
+	}
+
+	c.parseAsync("SUB foo 1\r\n")
+
+	c.mu.Lock()
+	c.applyAccountLimits()
+	c.mu.Unlock()
+
+	time.Sleep(50 * time.Millisecond)
+
+	c.mu.Lock()
+	closed := c.isClosed()
+	c.mu.Unlock()
+	require_False(t, closed)
+}

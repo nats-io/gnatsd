@@ -998,7 +998,7 @@ func (c *client) applyAccountLimits() {
 	if minLimit(&c.msubs, mSubs) && !wasUnlimited {
 		c.Debugf("Max Subscriptions set to %d from server overrides account or user config", opts.MaxSubs)
 	}
-	if c.subsAtLimit() {
+	if c.msubs != jwt.NoLimit && len(c.subs) > int(c.msubs) {
 		go func() {
 			c.maxSubsExceeded()
 			time.Sleep(20 * time.Millisecond)
@@ -2794,6 +2794,19 @@ func (c *client) generateClientInfoJSON(info Info, includeClientIP bool) []byte 
 	}
 	info.WSConnectURLs = nil
 	return generateInfoJSON(&info)
+}
+
+// sendAsyncInfo will send an updated async INFO protocol message to the client
+// if the client supports async INFO and has completed its initial handshake.
+// Assume lock is held.
+func (c *client) sendAsyncInfo(info Info) {
+	if c.opts.Protocol >= ClientProtoInfo && c.flags.isSet(firstPongSent) {
+		if c.iproc && info.TLSRequired && !c.flags.isSet(didTLSFirst) {
+			info.TLSRequired = false
+			info.TLSAvailable = true
+		}
+		c.enqueueProto(c.generateClientInfoJSON(info, true))
+	}
 }
 
 func (c *client) sendErr(err string) {
