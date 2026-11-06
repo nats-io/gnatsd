@@ -432,6 +432,8 @@ type pubMsg struct {
 	oct  compressionType
 	echo bool
 	last bool
+	// Only send to this outbound gateway, skipping local interest.
+	gw *client
 }
 
 var pubMsgPool sync.Pool
@@ -449,7 +451,7 @@ func newPubMsg(c *client, sub, rply string, si *ServerInfo, hdr []byte,
 	// When getting something from a pool it is critical that all fields are
 	// initialized. Doing this way guarantees that if someone adds a field to
 	// the structure, the compiler will fail the build if this line is not updated.
-	(*m) = pubMsg{c, sub, rply, si, hdr, msg, oct, echo, last}
+	(*m) = pubMsg{c, sub, rply, si, hdr, msg, oct, echo, last, nil}
 	return m
 }
 
@@ -457,7 +459,7 @@ func (pm *pubMsg) returnToPool() {
 	if pm == nil {
 		return
 	}
-	pm.c, pm.sub, pm.rply, pm.si, pm.hdr, pm.msg = nil, _EMPTY_, _EMPTY_, nil, nil, nil
+	pm.c, pm.sub, pm.rply, pm.si, pm.hdr, pm.msg, pm.gw = nil, _EMPTY_, _EMPTY_, nil, nil, nil, nil
 	pubMsgPool.Put(pm)
 }
 
@@ -640,8 +642,12 @@ RESET:
 					c.traceMsg(b)
 				}
 
-				// Process like a normal inbound msg.
-				c.processInboundClientMsg(b)
+				if pm.gw != nil {
+					c.sendMsgToGatewaysVia(c.acc, b, c.pa.subject, c.pa.reply, nil, false, pm.gw)
+				} else {
+					// Process like a normal inbound msg.
+					c.processInboundClientMsg(b)
+				}
 
 				// Put echo back if needed.
 				if replaceEcho {
@@ -756,6 +762,20 @@ func (s *Server) sendInternalMsgLocked(subj, rply string, si *ServerInfo, msg an
 	s.mu.RLock()
 	s.sendInternalMsg(subj, rply, si, msg)
 	s.mu.RUnlock()
+}
+
+// This will queue up a message to be sent to one remote cluster only.
+// A queue group then gets the message in that cluster, even if it has local members.
+// Lock should not be held.
+func (s *Server) sendInternalGatewayMsgLocked(gw *client, subj, rply string, msg any) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.sys == nil || s.sys.sendq == nil {
+		return
+	}
+	pm := newPubMsg(nil, subj, rply, nil, nil, msg, noCompression, false, false)
+	pm.gw = gw
+	s.sys.sendq.push(pm)
 }
 
 // This will queue up a message to be sent.

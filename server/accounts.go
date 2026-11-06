@@ -4760,6 +4760,8 @@ func (dr *DirAccResolver) Start(s *Server) error {
 	s.startGoRoutine(func() {
 		defer s.grWG.Done()
 		ticker := time.NewTicker(dr.syncInterval)
+		var toGateway bool
+		var gws []*client
 		for {
 			select {
 			case <-quit:
@@ -4769,6 +4771,16 @@ func (dr *DirAccResolver) Start(s *Server) error {
 			}
 			ourHash := dr.DirJWTStore.Hash()
 			s.Debugf("DirResolver - Checking store state: %x", ourHash)
+			// Alternate with a remote cluster, so a cluster that missed updates also catches up.
+			toGateway = !toGateway && s.gateway.enabled
+			if toGateway {
+				// Ask a random remote cluster, not just the nearest one.
+				gws = gws[:0]
+				if s.getOutboundGatewayConnections(&gws); len(gws) > 0 {
+					s.sendInternalGatewayMsgLocked(gws[rand.IntN(len(gws))], accPackReqSubj, packRespIb, ourHash[:])
+					continue
+				}
+			}
 			s.sendInternalMsgLocked(accPackReqSubj, packRespIb, nil, ourHash[:])
 		}
 	})
