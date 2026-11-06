@@ -561,6 +561,10 @@ type Options struct {
 	// CheckConfig configuration file syntax test was successful and exit.
 	CheckConfig bool `json:"-"`
 
+	// CheckReloadTo is a config file to check, together with CheckConfig, whether
+	// a server running with these options can reload it or requires a restart.
+	CheckReloadTo string `json:"-"`
+
 	// DisableJetStreamBanner will not print the ascii art on startup for JetStream enabled servers
 	DisableJetStreamBanner bool `json:"-"`
 
@@ -6384,6 +6388,7 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 	fs.StringVar(&configFile, "c", _EMPTY_, "Configuration file.")
 	fs.StringVar(&configFile, "config", _EMPTY_, "Configuration file.")
 	fs.BoolVar(&opts.CheckConfig, "t", false, "Check configuration and exit.")
+	fs.StringVar(&opts.CheckReloadTo, "test_reload", _EMPTY_, "With -t, check whether this configuration file can be reloaded.")
 	fs.StringVar(&signal, "sl", "", "Send signal to nats-server process (ldm, stop, quit, term, reopen, reload).")
 	fs.StringVar(&signal, "signal", "", "Send signal to nats-server process (ldm, stop, quit, term, reopen, reload).")
 	fs.StringVar(&opts.PidFile, "P", "", "File to store process pid.")
@@ -6527,9 +6532,6 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 			}
 			// If we get here we only have warnings and can still continue
 			fmt.Fprint(os.Stderr, err)
-		} else if opts.CheckConfig {
-			// Report configuration file syntax test was successful and exit.
-			return opts, nil
 		}
 
 		// Call this again to override config file options with options from command line.
@@ -6606,6 +6608,29 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 	// have a routes override, we need to report misconfiguration.
 	if opts.RoutesStr != _EMPTY_ && opts.Cluster.ListenStr == _EMPTY_ && opts.Cluster.Host == _EMPTY_ && opts.Cluster.Port == 0 {
 		return nil, errors.New("solicited routes require cluster capabilities, e.g. --cluster")
+	}
+
+	// Validate the same way server startup does, on a copy to not change the options.
+	if opts.CheckConfig {
+		copts := opts.Clone()
+		setBaselineOptions(copts)
+		if err = validateOptions(copts); err != nil {
+			return nil, err
+		}
+		// Check whether a server running with these options can reload the config file.
+		if opts.CheckReloadTo != _EMPTY_ {
+			newOpts, err := ProcessConfigFile(opts.CheckReloadTo)
+			if err != nil {
+				return nil, err
+			}
+			// A running server doesn't have the options for checking the config.
+			copts.CheckConfig, copts.CheckReloadTo = false, _EMPTY_
+			if err = checkReload(copts, newOpts); err != nil {
+				return nil, err
+			}
+		}
+	} else if opts.CheckReloadTo != _EMPTY_ {
+		return nil, errors.New("--test_reload can only be used together with -t")
 	}
 
 	return opts, nil
