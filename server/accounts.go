@@ -4438,8 +4438,9 @@ func handleDeleteRequest(store *DirJWTStore, s *Server, msg []byte, reply string
 	}
 	errs := []string{}
 	passCnt := 0
+	// The request's issue time is the delete time, a JWT issued later re-creates the account.
 	for _, acc := range accIds {
-		if err := store.delete(acc.(string)); err != nil {
+		if err := store.delete(acc.(string), gk.IssuedAt, nil); err != nil {
 			errs = append(errs, err.Error())
 		} else {
 			passCnt++
@@ -4710,10 +4711,11 @@ func (dr *DirAccResolver) Start(s *Server) error {
 			return
 		}
 		ourHash := dr.DirJWTStore.Hash()
+		// On a mismatch, also send tombstones, so peers that missed a delete apply it.
 		if bytes.Equal(theirHash, ourHash[:]) {
 			s.sendInternalMsgLocked(reply, _EMPTY_, nil, []byte{})
 			s.Debugf("DirResolver - Pack request matches hash %x", ourHash[:])
-		} else if err := dr.DirJWTStore.PackWalk(1, func(partialPackMsg string) {
+		} else if err := dr.DirJWTStore.packWalk(1, true, func(partialPackMsg string) {
 			s.sendInternalMsgLocked(reply, _EMPTY_, nil, []byte(partialPackMsg))
 		}); err != nil {
 			// let them timeout

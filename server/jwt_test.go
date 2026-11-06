@@ -8449,3 +8449,91 @@ func TestJWTAccountMaxConnsStillReportedAsAccountLimit(t *testing.T) {
 		}
 	}
 }
+
+func TestJWTAccountNATSResolverSyncKeepsDeletedAccount(t *testing.T) {
+	sysKp, syspub := createKey(t)
+	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
+	sysCreds := newUser(t, sysKp)
+	accKp, accPub := createKey(t)
+	accJwt := encodeClaim(t, jwt.NewAccountClaims(accPub), accPub)
+	accCreds := newUser(t, accKp)
+
+	dirs := []string{t.TempDir(), t.TempDir(), t.TempDir()}
+	for _, dir := range dirs {
+		writeJWT(t, dir, syspub, sysJwt)
+		writeJWT(t, dir, accPub, accJwt)
+	}
+	conf := func(name, dir, routes string) string {
+		return createConfFile(t, []byte(fmt.Sprintf(`
+			listen: 127.0.0.1:-1
+			server_name: %s
+			operator: %s
+			system_account: %s
+			resolver: {
+				type: full
+				dir: '%s'
+				allow_delete: true
+				interval: "200ms"
+			}
+			cluster {
+				name: C
+				listen: 127.0.0.1:-1
+				%s
+			}
+		`, name, ojwt, syspub, dir, routes)))
+	}
+	s1, _ := RunServerWithConfig(conf("S1", dirs[0], _EMPTY_))
+	defer s1.Shutdown()
+	routes := fmt.Sprintf("routes: [nats-route://127.0.0.1:%d]", s1.ClusterAddr().Port)
+	s2, _ := RunServerWithConfig(conf("S2", dirs[1], routes))
+	defer s2.Shutdown()
+	conf3 := conf("S3", dirs[2], routes)
+	s3, _ := RunServerWithConfig(conf3)
+	checkClusterFormed(t, s1, s2, s3)
+
+	// S3 is down during the delete.
+	s3.Shutdown()
+	s3.WaitForShutdown()
+
+	nc := natsConnect(t, s1.ClientURL(), nats.UserCredentials(sysCreds))
+	defer nc.Close()
+	opPub, err := oKp.PublicKey()
+	require_NoError(t, err)
+	req := jwt.NewGenericClaims(opPub)
+	req.Data["accounts"] = []string{accPub}
+	reqJwt, err := req.Encode(oKp)
+	require_NoError(t, err)
+	resp, err := nc.Request(accDeleteReqSubj, []byte(reqJwt), time.Second)
+	require_NoError(t, err)
+	require_Contains(t, string(resp.Data), "deleted 1 accounts")
+
+	hasJWT := func(dir string) bool {
+		_, err := os.Stat(filepath.Join(dir, accPub+fileExtension))
+		return err == nil
+	}
+	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		if hasJWT(dirs[0]) || hasJWT(dirs[1]) {
+			return errors.New("account not deleted yet")
+		}
+		return nil
+	})
+
+	// S3 comes back with the deleted account still on disk.
+	s3, _ = RunServerWithConfig(conf3)
+	defer s3.Shutdown()
+	checkClusterFormed(t, s1, s2, s3)
+
+	// Sync must apply the delete on S3, and not bring the account back on S1 and S2.
+	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+		for i, dir := range dirs {
+			if hasJWT(dir) {
+				return fmt.Errorf("account JWT exists on S%d", i+1)
+			}
+		}
+		return nil
+	})
+	for _, s := range []*Server{s1, s2, s3} {
+		_, err = nats.Connect(s.ClientURL(), nats.UserCredentials(accCreds), nats.NoReconnect())
+		require_Error(t, err)
+	}
+}
