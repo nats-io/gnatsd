@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1592,6 +1593,7 @@ func TestWSParseOptions(t *testing.T) {
 		{"bad header type", `websocket: { headers: 123 }`, nil, "unsupported type"},
 		{"bad header type", `websocket: { headers: [] }`, nil, "unsupported type"},
 		{"bad header value", `websocket: { headers: { "key": 123 } }`, nil, "unsupported type"},
+		{"bad proxy protocol", `websocket: { proxy_protocol: "abc" }`, nil, "not bool"},
 		{"unknown field", `websocket: { this_does_not_exist: 123 }`, nil, "unknown"},
 		// Positive tests
 		{"listen port only", `websocket { listen: 1234 }`, func(wo *WebsocketOpts) error {
@@ -1686,6 +1688,17 @@ func TestWSParseOptions(t *testing.T) {
 			`, func(wo *WebsocketOpts) error {
 				if !wo.Compression {
 					return fmt.Errorf("Compression should have been set")
+				}
+				return nil
+			}, ""},
+		{"proxy protocol",
+			`
+			websocket {
+				proxy_protocol: true
+			}
+			`, func(wo *WebsocketOpts) error {
+				if !wo.ProxyProtocol {
+					return fmt.Errorf("ProxyProtocol should have been set")
 				}
 				return nil
 			}, ""},
@@ -1998,6 +2011,7 @@ type testWSClientOptions struct {
 	noTLS                bool
 	path                 string
 	extraResponseHeaders map[string]string
+	proxyHeader          []byte
 }
 
 func testNewWSClient(t testing.TB, o testWSClientOptions) (net.Conn, *bufio.Reader, []byte) {
@@ -2014,6 +2028,16 @@ func testNewWSClientWithError(t testing.TB, o testWSClientOptions) (net.Conn, *b
 	wsc, err := net.Dial("tcp", addr)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("Error creating ws connection: %v", err)
+	}
+	// Without TLS, the PROXY header is sent with the upgrade request, in
+	// a single write, as a load balancer may do.
+	var pre []byte
+	if len(o.proxyHeader) > 0 {
+		if o.noTLS {
+			pre = o.proxyHeader
+		} else if _, err := wsc.Write(o.proxyHeader); err != nil {
+			return nil, nil, nil, fmt.Errorf("Error sending PROXY header: %v", err)
+		}
 	}
 	if !o.noTLS {
 		wsc = tls.Client(wsc, &tls.Config{InsecureSkipVerify: true})
@@ -2043,7 +2067,12 @@ func testNewWSClientWithError(t testing.TB, o testWSClientOptions) (net.Conn, *b
 		}
 	}
 	req.URL, _ = url.Parse("wss://" + addr + o.path)
-	if err := req.Write(wsc); err != nil {
+	var reqBuf bytes.Buffer
+	reqBuf.Write(pre)
+	if err := req.Write(&reqBuf); err != nil {
+		return nil, nil, nil, fmt.Errorf("Error creating request: %v", err)
+	}
+	if _, err := wsc.Write(reqBuf.Bytes()); err != nil {
 		return nil, nil, nil, fmt.Errorf("Error sending request: %v", err)
 	}
 	br := bufio.NewReader(wsc)
@@ -5493,4 +5522,175 @@ func TestWSUpgradeMQTTOnlyWhenEnabled(t *testing.T) {
 			}
 		})
 	}
+}
+
+func testWSProxyProtoOptions(noTLS bool) *Options {
+	o := testWSOptions()
+	o.Websocket.ProxyProtocol = true
+	if noTLS {
+		o.Websocket.TLSConfig = nil
+		o.Websocket.NoTLS = true
+	}
+	return o
+}
+
+// testWSProxyProtoConnect creates a websocket client, sends CONNECT and PING,
+// waits for the PONG, and returns the server's client that was created for
+// the connection, which must have the expected host and port.
+func testWSProxyProtoConnect(t *testing.T, s *Server, o testWSClientOptions, host string, port uint16) net.Conn {
+	t.Helper()
+	wsc, br, _ := testNewWSClient(t, o)
+	wsmsg := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("CONNECT {\"verbose\":false,\"protocol\":1}\r\nPING\r\n"))
+	if _, err := wsc.Write(wsmsg); err != nil {
+		t.Fatalf("Error sending message: %v", err)
+	}
+	if msg := testWSReadFrame(t, br); !bytes.HasPrefix(msg, []byte("PONG\r\n")) {
+		t.Fatalf("Expected PONG, got %s", msg)
+	}
+	checkFor(t, time.Second, 15*time.Millisecond, func() error {
+		if findProxyProtoClient(t, s, host, port) == nil {
+			return fmt.Errorf("no client with address %s:%d", host, port)
+		}
+		return nil
+	})
+	return wsc
+}
+
+func TestWSProxyProto(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		header []byte
+		host   string
+		port   uint16
+	}{
+		{"v1 tcp4", buildProxyV1Header(t, "TCP4", "203.0.113.50", "127.0.0.1", 54321, 443), "203.0.113.50", 54321},
+		{"v1 tcp6", buildProxyV1Header(t, "TCP6", "2001:db8::1", "2001:db8::2", 54322, 443), "2001:db8::1", 54322},
+		{"v2 ipv4", buildProxyV2Header(t, "203.0.113.51", "127.0.0.1", 54323, 443, proxyProtoFamilyInet), "203.0.113.51", 54323},
+		{"v2 ipv6", buildProxyV2Header(t, "2001:db8::3", "2001:db8::4", 54324, 443, proxyProtoFamilyInet6), "2001:db8::3", 54324},
+	} {
+		for _, noTLS := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s no_tls=%v", test.name, noTLS), func(t *testing.T) {
+				s := RunServer(testWSProxyProtoOptions(noTLS))
+				defer s.Shutdown()
+
+				o := s.getOpts().Websocket
+				wsc := testWSProxyProtoConnect(t, s, testWSClientOptions{
+					host:        o.Host,
+					port:        o.Port,
+					noTLS:       noTLS,
+					proxyHeader: test.header,
+				}, test.host, test.port)
+				defer wsc.Close()
+			})
+		}
+	}
+}
+
+func TestWSProxyProtoNotProxied(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		header []byte
+	}{
+		{"no header", nil},
+		{"v1 unknown", []byte("PROXY UNKNOWN\r\n")},
+		{"v2 local", buildProxyV2LocalHeader()},
+	} {
+		for _, noTLS := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s no_tls=%v", test.name, noTLS), func(t *testing.T) {
+				s := RunServer(testWSProxyProtoOptions(noTLS))
+				defer s.Shutdown()
+
+				o := s.getOpts().Websocket
+				wsc, br, _ := testNewWSClient(t, testWSClientOptions{
+					host:        o.Host,
+					port:        o.Port,
+					noTLS:       noTLS,
+					proxyHeader: test.header,
+				})
+				defer wsc.Close()
+				wsmsg := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("CONNECT {\"verbose\":false,\"protocol\":1}\r\nPING\r\n"))
+				if _, err := wsc.Write(wsmsg); err != nil {
+					t.Fatalf("Error sending message: %v", err)
+				}
+				if msg := testWSReadFrame(t, br); !bytes.HasPrefix(msg, []byte("PONG\r\n")) {
+					t.Fatalf("Expected PONG, got %s", msg)
+				}
+				// The client must have the address of the actual peer.
+				_, lport, err := net.SplitHostPort(wsc.LocalAddr().String())
+				require_NoError(t, err)
+				port, err := strconv.ParseUint(lport, 10, 16)
+				require_NoError(t, err)
+				checkFor(t, time.Second, 15*time.Millisecond, func() error {
+					if findProxyProtoClient(t, s, "127.0.0.1", uint16(port)) == nil {
+						return fmt.Errorf("no client with address 127.0.0.1:%d", port)
+					}
+					return nil
+				})
+			})
+		}
+	}
+}
+
+func TestWSProxyProtoInvalidHeader(t *testing.T) {
+	for _, noTLS := range []bool{false, true} {
+		t.Run(fmt.Sprintf("no_tls=%v", noTLS), func(t *testing.T) {
+			s := RunServer(testWSProxyProtoOptions(noTLS))
+			defer s.Shutdown()
+
+			o := s.getOpts().Websocket
+			_, _, _, err := testNewWSClientWithError(t, testWSClientOptions{
+				host:        o.Host,
+				port:        o.Port,
+				noTLS:       noTLS,
+				proxyHeader: []byte("PROXY TCP4 not-an-ip 127.0.0.1 1234 443\r\n"),
+			})
+			require_Error(t, err)
+
+			// Other connections must not be affected.
+			wsc := testWSProxyProtoConnect(t, s, testWSClientOptions{
+				host:        o.Host,
+				port:        o.Port,
+				noTLS:       noTLS,
+				proxyHeader: buildProxyV1Header(t, "TCP4", "203.0.113.50", "127.0.0.1", 54321, 443),
+			}, "203.0.113.50", 54321)
+			defer wsc.Close()
+		})
+	}
+}
+
+func TestWSProxyProtoSlowClientDoesNotBlockAccept(t *testing.T) {
+	s := RunServer(testWSProxyProtoOptions(false))
+	defer s.Shutdown()
+
+	o := s.getOpts().Websocket
+	// This connection does not send anything, so the server is waiting
+	// for the PROXY header (or the TLS handshake) on it.
+	slow, err := net.Dial("tcp", net.JoinHostPort(o.Host, strconv.Itoa(o.Port)))
+	require_NoError(t, err)
+	defer slow.Close()
+
+	// testNewWSClient fails if the TLS handshake takes more than a second,
+	// which is less than the time allowed to send the PROXY header.
+	wsc := testWSProxyProtoConnect(t, s, testWSClientOptions{
+		host:        o.Host,
+		port:        o.Port,
+		proxyHeader: buildProxyV2Header(t, "203.0.113.50", "127.0.0.1", 54321, 443, proxyProtoFamilyInet),
+	}, "203.0.113.50", 54321)
+	defer wsc.Close()
+}
+
+func TestWSProxyProtoDisabled(t *testing.T) {
+	o := testWSOptions()
+	o.Websocket.TLSConfig = nil
+	o.Websocket.NoTLS = true
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	_, _, _, err := testNewWSClientWithError(t, testWSClientOptions{
+		host:        o.Websocket.Host,
+		port:        s.getOpts().Websocket.Port,
+		noTLS:       true,
+		proxyHeader: buildProxyV1Header(t, "TCP4", "203.0.113.50", "127.0.0.1", 54321, 443),
+	})
+	require_Error(t, err)
 }

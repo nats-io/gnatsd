@@ -21,6 +21,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -108,6 +109,111 @@ type proxyConn struct {
 // RemoteAddr returns the original client address extracted from PROXY protocol
 func (pc *proxyConn) RemoteAddr() net.Addr {
 	return pc.remoteAddr
+}
+
+// proxyProtoListener wraps a net.Listener so that accepted connections
+// consume an optional PROXY protocol header before any other data is read.
+// It is used for listeners served by an http.Server (websocket), where the
+// connection is handed to the HTTP (and possibly TLS) layer as soon as it is
+// accepted, so the header cannot be read the way createClientEx() does it.
+type proxyProtoListener struct {
+	net.Listener
+	s *Server
+}
+
+// Accept does not read the PROXY protocol header, since that would block the
+// accept loop of the http.Server. The header is read by the returned
+// connection the first time it is used, which happens in the goroutine
+// that the http.Server dedicates to that connection.
+func (l *proxyProtoListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &proxyProtoConn{Conn: conn, s: l.s}, nil
+}
+
+// proxyProtoConn reads an optional PROXY protocol header on first use. If a
+// header with a PROXY command is found, RemoteAddr() returns the address that
+// it carries. If no header is found, the bytes read during detection are
+// replayed to the next layer and the connection is used as-is.
+type proxyProtoConn struct {
+	net.Conn
+	s          *Server
+	once       sync.Once
+	remoteAddr net.Addr
+	pre        []byte
+	err        error
+
+	mu  sync.Mutex
+	rdl time.Time // Read deadline set by the upper layer, restored after the header is read.
+}
+
+func (c *proxyProtoConn) readHeader() {
+	addr, pre, err := readProxyProtoHeader(c.Conn)
+	// readProxyProtoHeader() cleared the read deadline, put back the one
+	// that may have been set by the upper layer before we got here.
+	c.mu.Lock()
+	c.Conn.SetReadDeadline(c.rdl)
+	c.mu.Unlock()
+	if err != nil && err != errProxyProtoUnrecognized {
+		// Do not warn for connections closed before sending anything,
+		// which is what load balancer TCP health checks do.
+		if !errors.Is(err, io.EOF) {
+			c.s.Warnf("Error reading PROXY protocol header from %s: %v", c.Conn.RemoteAddr(), err)
+		}
+		c.err = err
+		c.Conn.Close()
+		return
+	}
+	// On errProxyProtoUnrecognized, pre holds the bytes consumed while
+	// trying to detect the header. If addr is nil, it was a LOCAL/UNKNOWN
+	// command (health check), so we keep the original remote address.
+	c.pre = pre
+	if addr != nil {
+		c.remoteAddr = addr
+	}
+}
+
+// Read implements net.Conn. It replays the bytes read past the header (if
+// any) before reading from the underlying connection.
+func (c *proxyProtoConn) Read(b []byte) (int, error) {
+	c.once.Do(c.readHeader)
+	if c.err != nil {
+		return 0, c.err
+	}
+	if len(c.pre) > 0 {
+		n := copy(b, c.pre)
+		c.pre = c.pre[n:]
+		return n, nil
+	}
+	return c.Conn.Read(b)
+}
+
+// RemoteAddr implements net.Conn. It returns the address extracted from the
+// PROXY protocol header, if any, otherwise the address of the peer.
+func (c *proxyProtoConn) RemoteAddr() net.Addr {
+	c.once.Do(c.readHeader)
+	if c.remoteAddr != nil {
+		return c.remoteAddr
+	}
+	return c.Conn.RemoteAddr()
+}
+
+// SetDeadline implements net.Conn.
+func (c *proxyProtoConn) SetDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rdl = t
+	return c.Conn.SetDeadline(t)
+}
+
+// SetReadDeadline implements net.Conn.
+func (c *proxyProtoConn) SetReadDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rdl = t
+	return c.Conn.SetReadDeadline(t)
 }
 
 // detectProxyProtoVersion reads the first bytes and determines protocol version.

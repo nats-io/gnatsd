@@ -1308,6 +1308,11 @@ func (s *Server) startWebsocketServer() {
 		s.Fatalf("Unable to listen for websocket connections: %v", err)
 		return
 	}
+	// The PROXY protocol header is sent in plaintext before the TLS
+	// handshake, so this must wrap the TCP listener, not the TLS one.
+	if o.ProxyProtocol {
+		hl = &proxyProtoListener{Listener: hl, s: s}
+	}
 	if config != nil {
 		hl = tls.NewListener(hl, config)
 	}
@@ -1317,6 +1322,9 @@ func (s *Server) startWebsocketServer() {
 	s.Noticef("Listening for websocket clients on %s://%s:%d", proto, o.Host, o.Port)
 	if proto == wsSchemePrefix {
 		s.Warnf("Websocket not configured with TLS. DO NOT USE IN PRODUCTION!")
+	}
+	if o.ProxyProtocol {
+		s.Noticef("PROXY protocol enabled for websocket connections")
 	}
 
 	// These 3 are immutable and will be accessed without lock by the client

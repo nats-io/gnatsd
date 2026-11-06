@@ -715,6 +715,12 @@ type WebsocketOpts struct {
 	// Useful for adding custom headers like Strict-Transport-Security.
 	Headers map[string]string
 
+	// If true, the server will accept an optional PROXY protocol (v1 or v2)
+	// header at the start of websocket connections, sent by a load balancer
+	// in front of the server, and use the client address that it carries.
+	// Connections without the header are still accepted.
+	ProxyProtocol bool
+
 	// Snapshot of configured TLS options.
 	tlsConfigOpts *TLSConfigOpts
 }
@@ -5730,6 +5736,8 @@ func parseWebsocket(v any, o *Options, errors *[]error, warnings *[]error) error
 			}
 		case "ping_interval":
 			o.Websocket.PingInterval = parseDuration("ping_interval", tk, mv, errors, warnings)
+		case "proxy_protocol":
+			o.Websocket.ProxyProtocol = mv.(bool)
 		default:
 			if !tk.IsUsedVariable() {
 				err := &unknownConfigFieldErr{

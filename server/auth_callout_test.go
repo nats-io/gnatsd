@@ -3310,6 +3310,140 @@ func TestAuthCalloutWSClientTLSCerts(t *testing.T) {
 	require_Equal(t, userInfo.Account, "FOO")
 }
 
+// testProxyProtoDialer acts like an L4 proxy doing TLS passthrough: it writes a
+// PROXY protocol header on the raw TCP connection, before the client starts
+// the TLS handshake and the websocket upgrade.
+type testProxyProtoDialer struct {
+	header []byte
+}
+
+func (d *testProxyProtoDialer) Dial(network, address string) (net.Conn, error) {
+	conn, err := net.DialTimeout(network, address, 2*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	if len(d.header) > 0 {
+		if _, err := conn.Write(d.header); err != nil {
+			conn.Close()
+			return nil, err
+		}
+	}
+	return conn, nil
+}
+
+// Websocket clients with mTLS behind a proxy that sends a PROXY protocol
+// header. The auth callout must see the client address from the header in
+// client_info.host, and must still get the client certificate. The callout
+// uses the address to tell internal services from external devices.
+func TestAuthCalloutWSProxyProtoClientInfoHost(t *testing.T) {
+	conf := `
+		server_name: T
+		listen: "localhost:-1"
+
+		tls {
+			cert_file = "../test/configs/certs/tlsauth/server.pem"
+			key_file = "../test/configs/certs/tlsauth/server-key.pem"
+			ca_file = "../test/configs/certs/tlsauth/ca.pem"
+			verify = true
+		}
+
+		websocket: {
+			listen: "localhost:-1"
+			proxy_protocol: true
+			tls {
+				cert_file = "../test/configs/certs/tlsauth/server.pem"
+				key_file = "../test/configs/certs/tlsauth/server-key.pem"
+				ca_file = "../test/configs/certs/tlsauth/ca.pem"
+				verify = true
+			}
+		}
+
+		accounts {
+			AUTH { users [ {user: "auth", password: "pwd"} ] }
+			FOO {}
+		}
+		authorization {
+			timeout: 1s
+			auth_callout {
+				issuer: "ABJHLOVMPA4CI6R5KLNGOB4GSLNIY7IOUPAJC4YFNDLQVIOBYQGUWVLA"
+				account: AUTH
+				auth_users: [ auth ]
+			}
+		}
+	`
+	_, internalNet, err := net.ParseCIDR("10.0.0.0/8")
+	require_NoError(t, err)
+
+	type calloutReq struct {
+		host     string
+		verified int
+	}
+	reqs := make(chan calloutReq, 10)
+
+	handler := func(m *nats.Msg) {
+		user, si, ci, _, ctls := decodeAuthRequest(t, m.Data)
+		verified := 0
+		if ctls != nil {
+			verified = len(ctls.VerifiedChains)
+		}
+		reqs <- calloutReq{host: ci.Host, verified: verified}
+
+		// The decision a callout service would make on the source address.
+		name := "factory-device"
+		if ip := net.ParseIP(ci.Host); ip != nil && internalNet.Contains(ip) {
+			name = "internal-service"
+		}
+		ujwt := createAuthUser(t, user, name, "FOO", "", nil, 0, nil)
+		m.Respond(serviceResponse(t, user, si.ID, ujwt, "", 0))
+	}
+
+	ac := NewAuthTest(t, conf, handler,
+		nats.UserInfo("auth", "pwd"),
+		nats.ClientCert("../test/configs/certs/tlsauth/client2.pem", "../test/configs/certs/tlsauth/client2-key.pem"),
+		nats.RootCAs("../test/configs/certs/tlsauth/ca.pem"))
+	defer ac.Cleanup()
+
+	for _, test := range []struct {
+		name     string
+		header   []byte
+		wantHost string
+		wantUser string
+	}{
+		{"internal v1", buildProxyV1Header(t, "TCP4", "10.1.2.3", "10.0.0.1", 40000, 443), "10.1.2.3", "internal-service"},
+		{"external v2", buildProxyV2Header(t, "203.0.113.50", "10.0.0.1", 40001, 443, proxyProtoFamilyInet), "203.0.113.50", "factory-device"},
+		// Proxy not sending the header: the callout sees the peer address.
+		{"no header", nil, "127.0.0.1", "factory-device"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			nc := ac.WSConnect(
+				nats.SetCustomDialer(&testProxyProtoDialer{header: test.header}),
+				nats.ClientCert("../test/configs/certs/tlsauth/client2.pem", "../test/configs/certs/tlsauth/client2-key.pem"),
+				nats.RootCAs("../test/configs/certs/tlsauth/ca.pem"),
+			)
+			defer nc.Close()
+
+			select {
+			case r := <-reqs:
+				t.Logf("callout client_info.host=%q, verified chains=%d", r.host, r.verified)
+				require_Equal(t, r.host, test.wantHost)
+				// mTLS is still terminated by the server.
+				require_Equal(t, r.verified, 1)
+			case <-time.After(2 * time.Second):
+				t.Fatal("auth callout not invoked")
+			}
+
+			resp, err := nc.Request(userDirectInfoSubj, nil, time.Second)
+			require_NoError(t, err)
+			response := ServerAPIResponse{Data: &UserInfo{}}
+			require_NoError(t, json.Unmarshal(resp.Data, &response))
+			userInfo := response.Data.(*UserInfo)
+			t.Logf("connected as %q in account %q", userInfo.UserID, userInfo.Account)
+			require_Equal(t, userInfo.UserID, test.wantUser)
+			require_Equal(t, userInfo.Account, "FOO")
+		})
+	}
+}
+
 func testConfClientClose(t *testing.T, respondNil bool) {
 	conf := `
 		listen: "127.0.0.1:-1"
