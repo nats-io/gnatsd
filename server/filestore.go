@@ -7143,7 +7143,7 @@ func (fs *fileStore) startAgeChk() {
 
 // Lock should be held.
 func (fs *fileStore) resetAgeChk(delta int64) {
-	if fs.recovering || fs.isClosed() {
+	if fs.isClosed() {
 		return
 	}
 	// If we're already expiring messages, it will make sure to reset.
@@ -7229,7 +7229,7 @@ func (fs *fileStore) expireMsgs() {
 	var sm *StoreMsg
 
 	fs.mu.Lock()
-	if fs.recovering || fs.isClosed() {
+	if fs.isClosed() {
 		fs.cancelAgeChk()
 		fs.mu.Unlock()
 		return

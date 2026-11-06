@@ -2654,8 +2654,8 @@ func (s *Server) jsLeaderServerStreamMoveRequest(sub *subscription, c *client, _
 		return
 	}
 	// The config of an unsupported stream may only be partially decoded.
-	if osa.unsupported != nil {
-		resp.Error = NewJSStreamOfflineReasonError(errors.New(osa.unsupported.reason))
+	if sa.unsupported != nil {
+		resp.Error = NewJSStreamOfflineReasonError(errors.New(sa.unsupported.reason))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -2807,8 +2807,8 @@ func (s *Server) jsLeaderServerStreamCancelMoveRequest(sub *subscription, c *cli
 		return
 	}
 	// Reject operations on an unsupported stream.
-	if osa.unsupported != nil {
-		resp.Error = NewJSStreamOfflineReasonError(errors.New(osa.unsupported.reason))
+	if sa.unsupported != nil {
+		resp.Error = NewJSStreamOfflineReasonError(errors.New(sa.unsupported.reason))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}

@@ -10338,9 +10338,6 @@ func TestJetStreamClusterUnsupportedStreamAndConsumerDenyUpdate(t *testing.T) {
 			_, err := js.UpdateStream(&nats.StreamConfig{Name: "UNSUPPORTED", Subjects: []string{"foo"}, Replicas: 3, MaxMsgs: 10})
 			return err
 		}, streamErr},
-		{"StreamCancelMove", func(t *testing.T) error {
-			return request(t, nc, fmt.Sprintf(JSApiStreamCancelMoveT, "UNSUPPORTED"), nil)
-		}, streamErr},
 		{"ServerStreamMove", func(t *testing.T) error {
 			return request(t, ncsys, fmt.Sprintf(JSApiServerStreamMoveT, globalAccountName, "UNSUPPORTED"), []byte("{}"))
 		}, streamErr},

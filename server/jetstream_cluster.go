@@ -9966,7 +9966,7 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 	// The config of an unsupported stream may only be partially decoded.
 	if sa.unsupported != nil {
 		resp.Error = NewJSStreamOfflineReasonError(errors.New(sa.unsupported.reason))
-		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
 		return
 	}
 
@@ -10050,7 +10050,7 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 			// The config of an unsupported consumer may only be partially decoded.
 			if ca.unsupported != nil {
 				resp.Error = NewJSConsumerOfflineReasonError(errors.New(ca.unsupported.reason))
-				s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+				s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
 				return
 			}
 			// Provided config might miss metadata, copy from existing config.

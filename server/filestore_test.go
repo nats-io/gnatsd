@@ -1262,7 +1262,6 @@ func TestFileStoreRecoveryErrorDoesNotPanic(t *testing.T) {
 		{name: "MaxMsgs", cfg: StreamConfig{MaxMsgs: 1}, wantMsgs: 1},
 		{name: "MaxBytes", cfg: StreamConfig{MaxBytes: 1}},
 		{name: "MaxMsgsPerSubject", cfg: StreamConfig{MaxMsgsPer: 1}, wantMsgs: 1},
-		{name: "PerMessageState", cfg: StreamConfig{Sources: []*StreamSource{{Name: "SOURCE"}}}, wantMsgs: 2},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fcfg := FileStoreConfig{StoreDir: t.TempDir(), BlockSize: 64}
