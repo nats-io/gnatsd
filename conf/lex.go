@@ -54,6 +54,7 @@ const (
 	itemCommentStart
 	itemVariable
 	itemInclude
+	itemIncludeOptional
 )
 
 const (
@@ -108,6 +109,10 @@ type lexer struct {
 
 	// ilstart is the start position of the line from the current item.
 	ilstart int
+
+	// includeType is the item emitted for the include being lexed:
+	// itemInclude for include, itemIncludeOptional for include?.
+	includeType itemType
 }
 
 type item struct {
@@ -480,7 +485,11 @@ func lexQuotedKey(lx *lexer) stateFn {
 func (lx *lexer) keyCheckKeyword(fallThrough, push stateFn) stateFn {
 	key := strings.ToLower(lx.input[lx.start:lx.pos])
 	switch key {
-	case "include":
+	case "include", "include?":
+		lx.includeType = itemInclude
+		if key == "include?" {
+			lx.includeType = itemIncludeOptional
+		}
 		lx.ignore()
 		if push != nil {
 			lx.push(push)
@@ -509,7 +518,7 @@ func lexIncludeQuotedString(lx *lexer) stateFn {
 	switch {
 	case r == sqStringEnd:
 		lx.backup()
-		lx.emit(itemInclude)
+		lx.emit(lx.includeType)
 		lx.next()
 		lx.ignore()
 		return lx.pop()
@@ -527,7 +536,7 @@ func lexIncludeDubQuotedString(lx *lexer) stateFn {
 	switch {
 	case r == dqStringEnd:
 		lx.backup()
-		lx.emit(itemInclude)
+		lx.emit(lx.includeType)
 		lx.next()
 		lx.ignore()
 		return lx.pop()
@@ -543,11 +552,11 @@ func lexIncludeString(lx *lexer) stateFn {
 	switch {
 	case isNL(r) || r == eof || r == optValTerm || r == mapEnd || isWhitespace(r):
 		lx.backup()
-		lx.emit(itemInclude)
+		lx.emit(lx.includeType)
 		return lx.pop()
 	case r == sqStringEnd:
 		lx.backup()
-		lx.emit(itemInclude)
+		lx.emit(lx.includeType)
 		lx.next()
 		lx.ignore()
 		return lx.pop()
@@ -1304,6 +1313,8 @@ func (itype itemType) String() string {
 		return "Variable"
 	case itemInclude:
 		return "Include"
+	case itemIncludeOptional:
+		return "IncludeOptional"
 	}
 	panic(fmt.Sprintf("BUG: Unknown type '%s'.", itype.String()))
 }

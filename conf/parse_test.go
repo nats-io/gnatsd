@@ -408,6 +408,79 @@ func TestIncludes(t *testing.T) {
 	}
 }
 
+func TestOptionalIncludes(t *testing.T) {
+	writeConf := func(t *testing.T, dir, name, content string) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	for _, parse := range []struct {
+		name string
+		fn   func(string) (map[string]any, error)
+	}{
+		{"ParseFile", ParseFile},
+		{"ParseFileWithChecks", ParseFileWithChecks},
+	} {
+		t.Run(parse.name, func(t *testing.T) {
+			t.Run("missing file is skipped", func(t *testing.T) {
+				dir := t.TempDir()
+				fp := writeConf(t, dir, "nats.conf", "port: 4222\ninclude? ./missing.conf\n")
+				m, err := parse.fn(fp)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if len(m) != 1 || m["port"] == nil {
+					t.Fatalf("expected only port, got %+v", m)
+				}
+			})
+
+			t.Run("existing file is included", func(t *testing.T) {
+				dir := t.TempDir()
+				writeConf(t, dir, "cluster.conf", "cluster { name: c1 }\n")
+				fp := writeConf(t, dir, "nats.conf", "port: 4222\ninclude? ./cluster.conf\n")
+				m, err := parse.fn(fp)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if m["cluster"] == nil {
+					t.Fatalf("expected the included cluster block, got %+v", m)
+				}
+			})
+
+			t.Run("parse error in existing file is reported", func(t *testing.T) {
+				dir := t.TempDir()
+				writeConf(t, dir, "broken.conf", "cluster {\n")
+				fp := writeConf(t, dir, "nats.conf", "include? ./broken.conf\n")
+				if _, err := parse.fn(fp); err == nil {
+					t.Fatal("expected an error for an invalid optional include")
+				}
+			})
+
+			t.Run("missing required include inside it is reported", func(t *testing.T) {
+				dir := t.TempDir()
+				writeConf(t, dir, "optional.conf", "include ./required.conf\n")
+				fp := writeConf(t, dir, "nats.conf", "include? ./optional.conf\n")
+				_, err := parse.fn(fp)
+				if err == nil || !strings.Contains(err.Error(), "required.conf") {
+					t.Fatalf("expected an error naming required.conf, got %v", err)
+				}
+			})
+
+			t.Run("missing regular include is still an error", func(t *testing.T) {
+				dir := t.TempDir()
+				fp := writeConf(t, dir, "nats.conf", "include ./missing.conf\n")
+				if _, err := parse.fn(fp); err == nil {
+					t.Fatal("expected an error for a missing regular include")
+				}
+			})
+		})
+	}
+}
+
 var varIncludedVariablesSample = `
 authorization {
 
