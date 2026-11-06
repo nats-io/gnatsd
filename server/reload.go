@@ -672,7 +672,13 @@ func (m *maxPayloadOption) Apply(server *Server) {
 	server.mu.Lock()
 	server.info.MaxPayload = m.newValue
 	info := server.copyInfo()
+	clients := make([]*client, 0, len(server.clients))
 	for _, client := range server.clients {
+		clients = append(clients, client)
+	}
+	server.mu.Unlock()
+
+	for _, client := range clients {
 		client.mu.Lock()
 		oldMpay := atomic.LoadInt32(&client.mpay)
 		if client.acc != nil {
@@ -685,7 +691,6 @@ func (m *maxPayloadOption) Apply(server *Server) {
 		}
 		client.mu.Unlock()
 	}
-	server.mu.Unlock()
 	server.Noticef("Reloaded: max_payload = %d", m.newValue)
 }
 
