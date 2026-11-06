@@ -26597,6 +26597,82 @@ func TestJetStreamMirrorRetriesOnSeqAlreadySeenMismatch(t *testing.T) {
 	}
 }
 
+// https://github.com/nats-io/nats-server/issues/8825
+func TestJetStreamMirrorDiscardNewSkipsRefusedMessages(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	// Origin: one message per subject, no count limit.
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:            "ORIGIN",
+		Subjects:        []string{"o.>"},
+		MaxMsgsPerSubject: 1,
+		Discard:         nats.DiscardNew,
+	})
+	require_NoError(t, err)
+
+	for i := 0; i < 40; i++ {
+		_, err := js.Publish(fmt.Sprintf("o.k%d", i), []byte("first"))
+		require_NoError(t, err)
+	}
+	for i := 0; i < 10; i++ {
+		_, err := js.Publish(fmt.Sprintf("o.new%d", i), []byte("first"))
+		require_NoError(t, err)
+	}
+
+	// Mirror: at most 40 messages, one per subject, discard new.
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:            "MIRROR",
+		Mirror:          &nats.StreamSource{Name: "ORIGIN"},
+		MaxMsgsPerSubject: 1,
+		Discard:         nats.DiscardNew,
+		MaxMsgs:         40,
+	})
+	require_NoError(t, err)
+
+	// Wait for the mirror to fill to 40 messages.
+	js2, err := nc.JetStream(nats.MaxWait(500 * time.Millisecond))
+	require_NoError(t, err)
+	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+		si, err := js2.StreamInfo("MIRROR")
+		require_NoError(t, err)
+		if si.State.Msgs != 40 {
+			return fmt.Errorf("Expected 40 msgs, got state: %+v", si.State)
+		}
+		return nil
+	})
+
+	// Re-puts of a subject the mirror holds: each replaces that subject's
+	// message, so they fit under the mirror's limits.
+	for i := 1; i <= 5; i++ {
+		_, err := js.Publish("o.k0", []byte(fmt.Sprintf("again %d", i)))
+		require_NoError(t, err)
+	}
+
+	// The mirror should store the re-puts even though they arrive behind
+	// messages it refuses for being new subjects at its MaxMsgs limit.
+	checkFor(t, 15*time.Second, 100*time.Millisecond, func() error {
+		m, err := js2.GetLastMsg("MIRROR", "o.k0")
+		require_NoError(t, err)
+		if string(m.Data) != "again 5" {
+			return fmt.Errorf("Expected o.k0 to be %q, got %q", "again 5", string(m.Data))
+		}
+		return nil
+	})
+
+	si, err := js2.StreamInfo("MIRROR")
+	require_NoError(t, err)
+	if si.State.Msgs != 40 {
+		t.Fatalf("Expected 40 msgs, got state: %+v", si.State)
+	}
+	if si.Mirror.Lag != 0 {
+		t.Fatalf("Expected mirror lag 0, got %d", si.Mirror.Lag)
+	}
+}
+
 // Must be run with -race.
 func TestJetStreamHealthzConsumerCheckConcurrentMapRace(t *testing.T) {
 	s := RunBasicJetStreamServer(t)

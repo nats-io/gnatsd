@@ -3665,6 +3665,14 @@ func (mset *stream) processInboundMirrorMsg(m *inMsg) bool {
 			return false
 		}
 		if err != errLastSeqMismatch {
+			// A discard new refusal is expected when the mirror is at a
+			// limit, and the message was already accounted for: the mirror
+			// sequence was advanced before the store call and the refusal
+			// bumped clfs. Skip it and continue with the rest of the batch
+			// instead of giving the batch up and retrying at this message.
+			if errors.Is(err, ErrMaxMsgs) || errors.Is(err, ErrMaxBytes) || errors.Is(err, ErrMaxMsgsPerSubject) {
+				return true
+			}
 			mset.mu.RLock()
 			accName, sname := mset.acc.Name, mset.cfg.Name
 			mset.mu.RUnlock()
