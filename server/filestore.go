@@ -3095,7 +3095,7 @@ func (mb *msgBlock) firstMatchingMulti(sl *gsl.SimpleSublist, start uint64, sm *
 	// then use intersection instead as likely going to be cheaper. This will
 	// often be the case with high numbers of deletes, as well as a smaller
 	// number of subjects in the block.
-	useIndex := uint64(mb.fss.Size()) < lseq-start
+	useIndex := uint64(mb.fss.Size()) < min(mb.msgs, lseq-start)
 	if useIndex {
 		// If there are no subject matches then this is effectively no-op.
 		fseq = uint64(math.MaxUint64)
@@ -3349,7 +3349,7 @@ func (mb *msgBlock) prevMatchingMulti(sl *gsl.SimpleSublist, start uint64, sm *S
 	// then use intersection instead as likely going to be cheaper. This will
 	// often be the case with high numbers of deletes, as well as a smaller
 	// number of subjects in the block.
-	useIndex := uint64(mb.fss.Size()) < start-lseq
+	useIndex := uint64(mb.fss.Size()) < min(mb.msgs, start-lseq)
 	if useIndex {
 		// If there are no subject matches then this is effectively no-op.
 		end = 0
