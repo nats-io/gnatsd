@@ -194,6 +194,7 @@ type fileStore struct {
 	fcfg        FileStoreConfig
 	syncAlways  atomic.Bool // Effective SyncAlways behavior for lock-free reads.
 	syncOnFlush atomic.Bool // Effective sync on flush behavior. True only if SyncAlways and replicas > 1.
+	logBacked   bool        // Writes are backed by the stream's Raft log, which relaxes SyncAlways and allows async flush.
 	prf         keyGen
 	oldprf      keyGen
 	aek         cipher.AEAD
@@ -467,16 +468,19 @@ func newFileStoreWithCreatedAndMode(fcfg FileStoreConfig, cfg StreamConfig, crea
 	}
 	fs.syncAlways.Store(fcfg.SyncAlways && !fcfg.SyncOnFlush)
 	fs.syncOnFlush.Store(fcfg.SyncOnFlush)
+	// A replicated stream is created clustered, the stream updates it when its write mode changes.
+	fs.logBacked = cfg.Replicas > 1
 
 	// Register with access time service.
 	ats.Register()
 
 	// If we error before completion make sure to cleanup.
-	defer func() {
+	defer func(fs *fileStore) {
 		if err != nil {
-			ats.Unregister()
+			// The state flusher has not started, and recovery may be incomplete.
+			fs.stop(false, false)
 		}
-	}()
+	}(fs)
 
 	// Set flush in place to AsyncFlush which by default is false.
 	fs.fip = !fcfg.AsyncFlush
@@ -561,15 +565,14 @@ func newFileStoreWithCreatedAndMode(fcfg FileStoreConfig, cfg StreamConfig, crea
 	// Use defer to ensure the lock is released if any of the enforcement operations
 	// run into issues to avoid potential deadlocks on exit.
 	unlocked := false
-	defer func() {
+	defer func(fs *fileStore) {
 		if !unlocked {
 			fs.mu.Unlock()
 		}
-	}()
+	}(fs)
 
 	// Recover per-message state like TTLs and schedules.
 	if err = fs.recoverPerMessageState(); err != nil {
-		fs.mu.Unlock()
 		return nil, err
 	}
 
@@ -683,6 +686,14 @@ func (fs *fileStore) setCreatedTime(created time.Time) {
 	fs.mu.Unlock()
 }
 
+// setLogBackedLocked sets whether writes are backed by a Raft log.
+// Lock should be held.
+func (fs *fileStore) setLogBackedLocked(logBacked bool) error {
+	fs.logBacked = logBacked
+	fs.resetDurabilitySettingsLocked()
+	return fs.updateAsyncFlushLocked()
+}
+
 func (fs *fileStore) updateDurabilitySettingsLocked(syncOnFlush bool) {
 	if !fs.fcfg.SyncAlways {
 		return
@@ -701,10 +712,11 @@ func (fs *fileStore) updateDurabilitySettingsLocked(syncOnFlush bool) {
 }
 
 func (fs *fileStore) resetDurabilitySettingsLocked() {
-	fs.updateDurabilitySettingsLocked(fs.cfg.Replicas > 1)
+	fs.updateDurabilitySettingsLocked(fs.logBacked)
 }
 
-// updateAsyncFlushLocked enables or disables async flush based on replication and persist mode.
+// updateAsyncFlushLocked enables or disables async flush based on whether
+// writes are backed by a Raft log and the persist mode.
 // Lock should be held.
 func (fs *fileStore) updateAsyncFlushLocked() error {
 	lmb := fs.lmb
@@ -712,7 +724,7 @@ func (fs *fileStore) updateAsyncFlushLocked() error {
 		return nil
 	}
 	// Enable/disable async flush depending on if it's supported and already initialized.
-	supportsAsyncFlush := !fs.fcfg.SyncAlways && fs.cfg.Replicas > 1
+	supportsAsyncFlush := !fs.fcfg.SyncAlways && fs.logBacked
 
 	// Async persist mode opts in to async flushing,
 	// sync always would also be disabled if it was configured.
@@ -733,6 +745,8 @@ func (fs *fileStore) updateAsyncFlushLocked() error {
 			close(lmb.qch)
 			lmb.qch = nil
 		}
+		// A new flush loop can spin up before the old one exits.
+		lmb.fch, lmb.flusher = nil, false
 		_, err := lmb.flushPendingMsgsLocked()
 		lmb.mu.Unlock()
 		if err != nil {
@@ -2368,6 +2382,8 @@ func (fs *fileStore) recoverPerMessageState() error {
 			if err := fs.recoverSourcesBackwardScan(sourcesSeq, sourcesScan); err != nil {
 				return err
 			}
+			// Persist the recovered state, so the next start doesn't scan again.
+			fs.dirty++
 		}
 		return nil
 	}
@@ -2473,6 +2489,8 @@ func (fs *fileStore) recoverPerMessageState() error {
 			mb.finishedWithCache()
 			mb.mu.Unlock()
 		}
+		// Persist the recovered state, so the next start doesn't scan again.
+		fs.dirty++
 	}
 	return nil
 }
@@ -3113,6 +3131,7 @@ func (mb *msgBlock) firstMatchingMulti(sl *gsl.SimpleSublist, start uint64, sm *
 		sm = new(StoreMsg)
 	}
 
+	var scanMsg StoreMsg
 	for seq := fseq; seq <= lseq; seq++ {
 		if mb.dmap.Exists(seq) {
 			// Optimisation to avoid calling cacheLookup which hits time.Now().
@@ -3121,14 +3140,15 @@ func (mb *msgBlock) firstMatchingMulti(sl *gsl.SimpleSublist, start uint64, sm *
 			continue
 		}
 		llseq := mb.llseq
-		fsm, err := mb.cacheLookup(seq, sm)
+		fsm, err := mb.cacheLookupNoCopy(seq, &scanMsg)
 		if err != nil {
 			continue
 		}
 		expireOk := !useIndex && seq == lseq && mb.llseq != llseq && mb.llseq == seq
 		updateLLTS = false // cacheLookup already updated it.
 		if sl.HasInterest(fsm.subj) {
-			return fsm, expireOk, nil
+			fsm.deepCopy(sm)
+			return sm, expireOk, nil
 		}
 		// If we are here we did not match, so put the llseq back.
 		mb.llseq = llseq
@@ -3258,6 +3278,10 @@ func (mb *msgBlock) firstMatching(filter string, wc bool, start uint64, sm *Stor
 		sm = new(StoreMsg)
 	}
 
+	fsm := sm
+	if !isAll {
+		fsm = &StoreMsg{}
+	}
 	for seq := fseq; seq <= lseq; seq++ {
 		if mb.dmap.Exists(seq) {
 			// Optimisation to avoid calling cacheLookup which hits time.Now().
@@ -3266,7 +3290,7 @@ func (mb *msgBlock) firstMatching(filter string, wc bool, start uint64, sm *Stor
 			continue
 		}
 		llseq := mb.llseq
-		fsm, err := mb.cacheLookup(seq, sm)
+		_, err := mb.cacheLookupEx(seq, fsm, isAll)
 		if err != nil {
 			if err == errPartialCache || err == errNoCache {
 				return nil, false, err
@@ -3276,12 +3300,11 @@ func (mb *msgBlock) firstMatching(filter string, wc bool, start uint64, sm *Stor
 		updateLLTS = false // cacheLookup already updated it.
 		expireOk := seq == lseq && mb.llseq != llseq && mb.llseq == seq
 		if isAll {
-			return fsm, expireOk, nil
+			return sm, expireOk, nil
 		}
-		if wc && isMatch(sm.subj) {
-			return fsm, expireOk, nil
-		} else if !wc && fsm.subj == filter {
-			return fsm, expireOk, nil
+		if (wc && isMatch(fsm.subj)) || (!wc && fsm.subj == filter) {
+			fsm.deepCopy(sm)
+			return sm, expireOk, nil
 		}
 		// If we are here we did not match, so put the llseq back.
 		mb.llseq = llseq
@@ -3362,6 +3385,7 @@ func (mb *msgBlock) prevMatchingMulti(sl *gsl.SimpleSublist, start uint64, sm *S
 		sm = new(StoreMsg)
 	}
 
+	var scanMsg StoreMsg
 	for seq := end; seq >= lseq; seq-- {
 		if mb.dmap.Exists(seq) {
 			// Optimisation to avoid calling cacheLookup which hits time.Now().
@@ -3370,14 +3394,15 @@ func (mb *msgBlock) prevMatchingMulti(sl *gsl.SimpleSublist, start uint64, sm *S
 			continue
 		}
 		llseq := mb.llseq
-		fsm, err := mb.cacheLookup(seq, sm)
+		fsm, err := mb.cacheLookupNoCopy(seq, &scanMsg)
 		if err != nil {
 			continue
 		}
 		expireOk := !useIndex && seq == lseq && mb.llseq != llseq && mb.llseq == seq
 		updateLLTS = false // cacheLookup already updated it.
 		if sl.HasInterest(fsm.subj) {
-			return fsm, expireOk, nil
+			fsm.deepCopy(sm)
+			return sm, expireOk, nil
 		}
 		// If we are here we did not match, so put the llseq back.
 		mb.llseq = llseq
@@ -3681,6 +3706,62 @@ func (fs *fileStore) selectSkipFirstBlock(bi int, start, stop uint32) (int, erro
 	}
 	// Otherwise just bump to the next one.
 	return bi + 1, nil
+}
+
+// This is used to see if we can selectively jump back blocks based on filter subject and a starting block index.
+// Will return -1 and ErrStoreEOF if no matches at all or no more from where we are.
+func (fs *fileStore) checkSkipLastBlock(filter string, wc bool, bi int) (int, error) {
+	// If we match everything, just move to previous blk.
+	if filter == _EMPTY_ || filter == fwcs {
+		return bi - 1, nil
+	}
+	if wc && fs.psim.Size() > highCardinalityThreshold {
+		return bi - 1, nil
+	}
+	start, stop := fs.filteredBlockRange(filter, wc)
+	if stop == 0 {
+		return -1, ErrStoreEOF
+	}
+	return fs.selectSkipLastBlock(bi, start, stop)
+}
+
+// This is used to see if we can selectively jump back blocks based on filter subjects and a starting block index.
+// Will return -1 and ErrStoreEOF if no matches at all or no more from where we are.
+func (fs *fileStore) checkSkipLastBlockMulti(sl *gsl.SimpleSublist, bi int) (int, error) {
+	// Don't bother if full wildcard.
+	if sl.MatchesFullWildcard() || fs.psim.Size() > highCardinalityThreshold {
+		return bi - 1, nil
+	}
+	// Move through psim to gather start and stop bounds.
+	// Only subjects with msgs before bi can move stop, since we missed searching bi.
+	mbi, guard := fs.blks[bi].getIndex(), fs.blks[bi-1].getIndex()
+	start, stop := uint32(math.MaxUint32), uint32(0)
+	stree.IntersectGSL(fs.psim, sl, func(_ []byte, psi *psi) bool {
+		start = min(start, psi.fblk)
+		if psi.fblk < mbi {
+			stop = max(stop, psi.lblk)
+		}
+		// One of the subjects matches the previous block, so there's no point in carrying on trying to skip.
+		return stop < guard
+	})
+	return fs.selectSkipLastBlock(bi, start, stop)
+}
+
+func (fs *fileStore) selectSkipLastBlock(bi int, start, stop uint32) (int, error) {
+	// All matching msgs are behind us.
+	// Greater than AND equal is important because we were called because we missed searching bi.
+	if start >= fs.blks[bi].getIndex() {
+		return -1, ErrStoreEOF
+	}
+	// If stop is < previous index return dereference of fs.blks index.
+	if stop < fs.blks[bi-1].getIndex() {
+		if mb := fs.bim[stop]; mb != nil {
+			ni, _ := fs.selectMsgBlockWithIndex(atomic.LoadUint64(&mb.last.seq))
+			return ni, nil
+		}
+	}
+	// Otherwise just bump to the previous one.
+	return bi - 1, nil
 }
 
 // Optimized way for getting all num pending matching a filter subject.
@@ -6786,14 +6867,13 @@ func (mb *msgBlock) kickFlusher() {
 	kickFlusher(mb.fch)
 }
 
-func (mb *msgBlock) setInFlusher() {
+func (mb *msgBlock) clearInFlusher(fch chan struct{}) {
 	mb.mu.Lock()
-	mb.flusher = true
-	mb.mu.Unlock()
-}
-
-func (mb *msgBlock) clearInFlusher() {
-	mb.mu.Lock()
+	// A newer flush loop took over after ours was stopped.
+	if mb.fch != fch {
+		mb.mu.Unlock()
+		return
+	}
 	mb.flusher = false
 	if mb.qch != nil {
 		close(mb.qch)
@@ -6808,8 +6888,7 @@ func (mb *msgBlock) clearInFlusher() {
 
 // flushLoop watches for messages, index info, or recently closed msg block updates.
 func (mb *msgBlock) flushLoop(fch, qch chan struct{}) {
-	mb.setInFlusher()
-	defer mb.clearInFlusher()
+	defer mb.clearInFlusher(fch)
 
 	for {
 		select {
@@ -7277,7 +7356,7 @@ func (fs *fileStore) startAgeChk() {
 
 // Lock should be held.
 func (fs *fileStore) resetAgeChk(delta int64) {
-	if fs.recovering {
+	if fs.recovering || fs.isClosed() {
 		return
 	}
 	// If we're already expiring messages, it will make sure to reset.
@@ -7363,7 +7442,7 @@ func (fs *fileStore) expireMsgs() {
 	var sm *StoreMsg
 
 	fs.mu.Lock()
-	if fs.recovering {
+	if fs.recovering || fs.isClosed() {
 		fs.cancelAgeChk()
 		fs.mu.Unlock()
 		return
@@ -9722,6 +9801,10 @@ func (fs *fileStore) LoadNextMsgMulti(sl *gsl.SimpleSublist, start uint64, smp *
 			} else if err != ErrStoreMsgNotFound {
 				return nil, 0, err
 			} else {
+				// Check if we can expire.
+				if expireOk {
+					mb.tryForceExpireCache()
+				}
 				// Nothing found in this block. We missed, if first block (bi) check psim.
 				// Similar to above if start <= first seq.
 				// TODO(dlc) - For v2 track these by filter subject since they will represent filtered consumers.
@@ -9737,12 +9820,8 @@ func (fs *fileStore) LoadNextMsgMulti(sl *gsl.SimpleSublist, start uint64, smp *
 					// Right now we can only spin on first, so if we have interior sparseness need to favor checking per block fss if loaded.
 					// For v2 will track all blocks that have matches for psim.
 					if nbi > i {
-						i = nbi - 1 // For the iterator condition i++
+						i = nbi - 1 // Offset the loop's i++
 					}
-				}
-				// Check if we can expire.
-				if expireOk {
-					mb.tryForceExpireCache()
 				}
 			}
 		}
@@ -9795,6 +9874,10 @@ func (fs *fileStore) LoadNextMsg(filter string, wc bool, start uint64, sm *Store
 			} else if err != ErrStoreMsgNotFound {
 				return nil, 0, err
 			} else {
+				// Check if we can expire.
+				if expireOk {
+					mb.tryForceExpireCache()
+				}
 				// Nothing found in this block. We missed, if first block (bi) check psim.
 				// Similar to above if start <= first seq.
 				// TODO(dlc) - For v2 track these by filter subject since they will represent filtered consumers.
@@ -9812,12 +9895,8 @@ func (fs *fileStore) LoadNextMsg(filter string, wc bool, start uint64, sm *Store
 					// Right now we can only spin on first, so if we have interior sparseness need to favor checking per block fss if loaded.
 					// For v2 will track all blocks that have matches for psim.
 					if nbi > i {
-						i = nbi - 1 // For the iterator condition i++
+						i = nbi - 1 // Offset the loop's i++
 					}
-				}
-				// Check if we can expire.
-				if expireOk {
-					mb.tryForceExpireCache()
 				}
 			}
 		}
@@ -9945,13 +10024,17 @@ func (mb *msgBlock) prevMatching(filter string, wc bool, start uint64, sm *Store
 		sm = new(StoreMsg)
 	}
 
+	fsm := sm
+	if !isAll {
+		fsm = &StoreMsg{}
+	}
 	for seq := end; seq >= lseq; seq-- {
 		if mb.dmap.Exists(seq) {
 			updateLLTS = true
 			continue
 		}
 		llseq := mb.llseq
-		fsm, err := mb.cacheLookup(seq, sm)
+		_, err := mb.cacheLookupEx(seq, fsm, isAll)
 		if err != nil {
 			if err == errPartialCache || err == errNoCache {
 				return nil, false, err
@@ -9961,12 +10044,11 @@ func (mb *msgBlock) prevMatching(filter string, wc bool, start uint64, sm *Store
 		updateLLTS = false
 		expireOk := seq == lseq && mb.llseq != llseq && mb.llseq == seq
 		if isAll {
-			return fsm, expireOk, nil
+			return sm, expireOk, nil
 		}
-		if wc && isMatch(sm.subj) {
-			return fsm, expireOk, nil
-		} else if !wc && fsm.subj == filter {
-			return fsm, expireOk, nil
+		if (wc && isMatch(fsm.subj)) || (!wc && fsm.subj == filter) {
+			fsm.deepCopy(sm)
+			return sm, expireOk, nil
 		}
 		mb.llseq = llseq
 	}
@@ -10001,8 +10083,24 @@ func (fs *fileStore) LoadPrevMsg(filter string, wc bool, start uint64, smp *Stor
 				return sm, sm.seq, nil
 			} else if err != ErrStoreMsgNotFound {
 				return nil, 0, err
-			} else if expireOk {
-				mb.tryForceExpireCache()
+			} else {
+				if expireOk {
+					mb.tryForceExpireCache()
+				}
+				// Nothing found in this block. We missed, if first block (bi) check psim.
+				// We should not do this at all if we are already on the first block.
+				// Nor if the previous block is the first one, since we can simply skip to it.
+				if i == bi && i > 1 {
+					nbi, err := fs.checkSkipLastBlock(filter, wc, bi)
+					// Nothing available.
+					if err == ErrStoreEOF {
+						return nil, fs.state.FirstSeq, ErrStoreEOF
+					}
+					// See if we can jump back here.
+					if nbi < i {
+						i = nbi + 1 // Offset the loop's i--
+					}
+				}
 			}
 		}
 	}
@@ -10047,8 +10145,24 @@ func (fs *fileStore) loadPrevMsgMultiLocked(sl *gsl.SimpleSublist, start uint64,
 				return sm, sm.seq, nil
 			} else if err != ErrStoreMsgNotFound {
 				return nil, 0, err
-			} else if expireOk {
-				mb.tryForceExpireCache()
+			} else {
+				if expireOk {
+					mb.tryForceExpireCache()
+				}
+				// Nothing found in this block. We missed, if first block (bi) check psim.
+				// We should not do this at all if we are already on the first block.
+				// Nor if the previous block is the first one, since we can simply skip to it.
+				if i == bi && i > 1 {
+					nbi, err := fs.checkSkipLastBlockMulti(sl, bi)
+					// Nothing available.
+					if err == ErrStoreEOF {
+						return nil, fs.state.FirstSeq, ErrStoreEOF
+					}
+					// See if we can jump back here.
+					if nbi < i {
+						i = nbi + 1 // Offset the loop's i--
+					}
+				}
 			}
 		}
 	}
@@ -13869,8 +13983,12 @@ func (o *consumerFileStore) UpdateAcks(dseq, sseq uint64) error {
 		kick = true
 	}
 
+	// Check for AckAll (or AckFlowControl which functions like AckAll).
+	ackAll := o.cfg.AckPolicy == AckAll || o.cfg.AckPolicy == AckFlowControl
+
 	// On restarts the old leader may get a replay from the raft logs that are old.
-	if dseq <= o.state.AckFloor.Consumer {
+	// AckAll checks the stream sequence, since older servers could set the delivery floor above pending messages.
+	if (ackAll && sseq <= o.state.AckFloor.Stream) || (!ackAll && dseq <= o.state.AckFloor.Consumer) {
 		return nil
 	}
 
@@ -13881,8 +13999,11 @@ func (o *consumerFileStore) UpdateAcks(dseq, sseq uint64) error {
 	// Done with the consistency checks, we'll always kick for below updates.
 	kick = true
 
-	// Check for AckAll here (or AckFlowControl which functions like AckAll).
-	if o.cfg.AckPolicy == AckAll || o.cfg.AckPolicy == AckFlowControl {
+	if ackAll {
+		// Use the original delivery sequence.
+		if p := o.state.Pending[sseq]; dseq > p.Sequence && p.Sequence > 0 {
+			dseq = p.Sequence
+		}
 		sgap := sseq - o.state.AckFloor.Stream
 		o.state.AckFloor.Consumer = dseq
 		o.state.AckFloor.Stream = sseq
@@ -13898,6 +14019,11 @@ func (o *consumerFileStore) UpdateAcks(dseq, sseq uint64) error {
 				delete(o.state.Pending, seq)
 				delete(o.state.Redelivered, seq)
 			}
+		}
+		// Nothing pending, so move the floor up to the last delivered message.
+		if len(o.state.Pending) == 0 {
+			o.state.AckFloor.Consumer = o.state.Delivered.Consumer
+			o.state.AckFloor.Stream = o.state.Delivered.Stream
 		}
 		return nil
 	}

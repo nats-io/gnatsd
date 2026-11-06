@@ -60,6 +60,13 @@ an inflight batch. It must be acquired before the stream lock, never while holdi
 
     isolateMu -> stream
 
+The "writeMu" lock is held for reading while a write decides between storing locally and proposing.
+Switching between local R1 and replicated writes holds it for writing, and applies the log meanwhile.
+It must be acquired before any other JetStream lock, and never again while holding it for reading.
+
+    writeMu -> jetStream
+    writeMu -> isolateMu -> stream
+
 The "eventIdsMu" lock protects the server's event ID generator. It may be acquired
 while holding the Server lock, but the Server lock must not be acquired while
 holding eventIdsMu.
