@@ -9315,13 +9315,14 @@ func (js *jetStream) applyConsumerMsgOpLocked(o *consumer, buf []byte) (afterUnl
 		if err != nil {
 			return nil, err
 		}
-		recalcPending := o.resetLocalStartingSeq(sseq)
-		if o.store != nil {
+		// A lookup failure rejects the reset, but must not fail application of the committed entry.
+		recalcPending, resetErr := o.resetLocalStartingSeq(sseq)
+		if resetErr == nil && o.store != nil {
 			o.store.Reset(sseq - 1)
 		}
 		// Cleanup messages that lost interest, once our lock is released.
 		var checkInterest func()
-		if o.retention == InterestPolicy {
+		if resetErr == nil && o.retention == InterestPolicy {
 			if mset := o.mset; mset != nil {
 				checkInterest = func() {
 					ss := mset.state()
@@ -9335,7 +9336,9 @@ func (js *jetStream) applyConsumerMsgOpLocked(o *consumer, buf []byte) (afterUnl
 			if recalcPending {
 				o.streamNumPending()
 			}
-			o.signalNewMessages()
+			if resetErr == nil {
+				o.signalNewMessages()
+			}
 			if rr, ok := o.rsm[reply]; ok && reply != _EMPTY_ {
 				delete(o.rsm, reply)
 				s, a := o.srv, o.acc
@@ -9346,7 +9349,10 @@ func (js *jetStream) applyConsumerMsgOpLocked(o *consumer, buf []byte) (afterUnl
 						a = nil
 					}
 					var resp = JSApiConsumerResetResponse{ApiResponse: ApiResponse{Type: JSApiConsumerResetResponseType}}
-					if resp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.resetInfo(sseq)); resp.ConsumerInfo == nil {
+					if resetErr != nil {
+						resp.Error = NewJSConsumerInvalidResetError(resetErr)
+						s.sendInternalAccountMsg(a, reply, s.jsonResponse(&resp))
+					} else if resp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.resetInfo(sseq)); resp.ConsumerInfo == nil {
 						// The consumer was closed before we could respond.
 						resp.Error = NewJSConsumerInvalidResetError(errConsumerClosed)
 						s.sendInternalAccountMsg(a, reply, s.jsonResponse(&resp))
@@ -9361,6 +9367,9 @@ func (js *jetStream) applyConsumerMsgOpLocked(o *consumer, buf []byte) (afterUnl
 					}
 				}
 			}
+		}
+		if resetErr != nil && respond == nil {
+			o.srv.Warnf("Consumer '%s > %s > %s' reset failed: %v", o.acc.Name, o.stream, o.name, resetErr)
 		}
 		if checkInterest == nil && respond == nil {
 			return nil, nil

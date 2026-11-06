@@ -14151,6 +14151,164 @@ func TestJetStreamConsumerEphemeralPullDefaultInactiveThresholdAfterRestart(t *t
 	})
 }
 
+func TestJetStreamConsumerResetLastPerSubjectLeaderChange(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo.*"}, Replicas: 3})
+	require_NoError(t, err)
+	for _, subject := range []string{"foo.a", "foo.a", "foo.b", "foo.b", "foo.c", "foo.c", "foo.d", "foo.d"} {
+		_, err = js.Publish(subject, nil)
+		require_NoError(t, err)
+	}
+	sub, err := js.PullSubscribe("foo.*", "CONSUMER", nats.DeliverLastPerSubject(), nats.AckWait(time.Hour))
+	require_NoError(t, err)
+	fetch := func(streamSeq, consumerSeq uint64) {
+		t.Helper()
+		msgs, err := sub.Fetch(1, nats.MaxWait(time.Second))
+		require_NoError(t, err)
+		require_Len(t, len(msgs), 1)
+		meta, err := msgs[0].Metadata()
+		require_NoError(t, err)
+		require_Equal(t, meta.Sequence.Stream, streamSeq)
+		require_Equal(t, meta.Sequence.Consumer, consumerSeq)
+		require_Equal(t, meta.NumDelivered, uint64(1))
+		require_NoError(t, msgs[0].AckSync())
+	}
+	fetch(2, 1)
+	msg, err := nc.Request(fmt.Sprintf(JSApiConsumerResetT, "TEST", "CONSUMER"), nil, 2*time.Second)
+	require_NoError(t, err)
+	var resp JSApiConsumerResetResponse
+	require_NoError(t, json.Unmarshal(msg.Data, &resp))
+	require_True(t, resp.Error == nil)
+	require_Equal(t, resp.NumPending, uint64(3))
+
+	for i, seq := range []uint64{4, 6, 8} {
+		fetch(seq, uint64(i+1))
+		s := c.consumerLeader(globalAccountName, "TEST", "CONSUMER")
+		mset, err := s.globalAccount().lookupStream("TEST")
+		require_NoError(t, err)
+		o := mset.lookupConsumer("CONSUMER")
+		o.mu.RLock()
+		node := o.node
+		o.mu.RUnlock()
+		require_NoError(t, node.StepDown())
+		c.waitOnConsumerLeader(globalAccountName, "TEST", "CONSUMER")
+		require_True(t, c.consumerLeader(globalAccountName, "TEST", "CONSUMER") != s)
+	}
+	_, err = js.Publish("foo.a", nil)
+	require_NoError(t, err)
+	fetch(9, 4)
+}
+
+func TestJetStreamConsumerResetLastPerSubjectError(t *testing.T) {
+	for _, replicas := range []int{1, 3} {
+		t.Run(fmt.Sprintf("R%d", replicas), func(t *testing.T) {
+			c := createJetStreamClusterExplicit(t, "R3S", 3)
+			defer c.shutdown()
+			nc, js := jsClientConnect(t, c.randomServer())
+			defer nc.Close()
+			_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo.*"}, Replicas: replicas})
+			require_NoError(t, err)
+			for _, subject := range []string{"foo.a", "foo.a", "foo.b", "foo.b"} {
+				_, err = js.Publish(subject, nil)
+				require_NoError(t, err)
+			}
+			sub, err := js.PullSubscribe("foo.*", "CONSUMER", nats.DeliverLastPerSubject(), nats.AckWait(time.Hour))
+			require_NoError(t, err)
+			_, err = sub.Fetch(1, nats.MaxWait(time.Second))
+			require_NoError(t, err)
+			s := c.consumerLeader(globalAccountName, "TEST", "CONSUMER")
+			mset, err := s.globalAccount().lookupStream("TEST")
+			require_NoError(t, err)
+			o := mset.lookupConsumer("CONSUMER")
+			o.mu.RLock()
+			sseq, dseq, lss := o.sseq, o.dseq, o.lss
+			o.mu.RUnlock()
+			require_NoError(t, mset.store.Stop())
+
+			msg, err := nc.Request(fmt.Sprintf(JSApiConsumerResetT, "TEST", "CONSUMER"), nil, 2*time.Second)
+			require_NoError(t, err)
+			var resp JSApiConsumerResetResponse
+			require_NoError(t, json.Unmarshal(msg.Data, &resp))
+			require_Error(t, resp.Error, NewJSConsumerInvalidResetError(ErrStoreClosed))
+			o.mu.RLock()
+			sseqAfter, dseqAfter, lssAfter := o.sseq, o.dseq, o.lss
+			writeErr, resets := o.werr, len(o.rsm)
+			o.mu.RUnlock()
+			require_Equal(t, sseqAfter, sseq)
+			require_Equal(t, dseqAfter, dseq)
+			require_Equal(t, lssAfter, lss)
+			require_NoError(t, writeErr)
+			require_Equal(t, resets, 0)
+		})
+	}
+}
+
+func TestJetStreamConsumerResetLastPerSubject(t *testing.T) {
+	for _, replicas := range []int{1, 3} {
+		for _, delivered := range []int{1, 3} {
+			t.Run(fmt.Sprintf("R%d/Delivered%d", replicas, delivered), func(t *testing.T) {
+				c := createJetStreamClusterExplicit(t, "R3S", 3)
+				defer c.shutdown()
+				nc, js := jsClientConnect(t, c.randomServer())
+				defer nc.Close()
+				_, err := js.AddStream(&nats.StreamConfig{
+					Name: "TEST", Subjects: []string{"foo.*"}, Replicas: replicas,
+				})
+				require_NoError(t, err)
+				for _, subject := range []string{"foo.a", "foo.a", "foo.b", "foo.b", "foo.c", "foo.c"} {
+					_, err = js.Publish(subject, nil)
+					require_NoError(t, err)
+				}
+				sub, err := js.PullSubscribe("foo.*", "CONSUMER", nats.DeliverLastPerSubject(), nats.AckExplicit(), nats.AckWait(time.Hour))
+				require_NoError(t, err)
+				msgs, err := sub.Fetch(delivered, nats.MaxWait(time.Second))
+				require_NoError(t, err)
+				require_Len(t, len(msgs), delivered)
+				for i, msg := range msgs {
+					meta, err := msg.Metadata()
+					require_NoError(t, err)
+					require_Equal(t, meta.Sequence.Stream, uint64((i+1)*2))
+				}
+				require_NoError(t, msgs[0].AckSync())
+				ci, err := js.ConsumerInfo("TEST", "CONSUMER")
+				require_NoError(t, err)
+				resetSeq := ci.AckFloor.Stream + 1
+				_, err = js.Publish("foo.b", nil)
+				require_NoError(t, err)
+				for range 2 {
+					msg, err := nc.Request(fmt.Sprintf(JSApiConsumerResetT, "TEST", "CONSUMER"), nil, 2*time.Second)
+					require_NoError(t, err)
+					var resp JSApiConsumerResetResponse
+					require_NoError(t, json.Unmarshal(msg.Data, &resp))
+					require_True(t, resp.Error == nil)
+					require_Equal(t, resp.ResetSeq, resetSeq)
+					require_Equal(t, resp.NumPending, uint64(2))
+					msgs, err := sub.Fetch(2, nats.MaxWait(time.Second))
+					require_NoError(t, err)
+					require_Len(t, len(msgs), 2)
+					for i, seq := range []uint64{6, 7} {
+						meta, err := msgs[i].Metadata()
+						require_NoError(t, err)
+						require_Equal(t, meta.Sequence.Stream, seq)
+						require_Equal(t, meta.Sequence.Consumer, uint64(i+1))
+					}
+				}
+				_, err = js.Publish("foo.a", nil)
+				require_NoError(t, err)
+				msgs, err = sub.Fetch(1, nats.MaxWait(time.Second))
+				require_NoError(t, err)
+				require_Len(t, len(msgs), 1)
+				meta, err := msgs[0].Metadata()
+				require_NoError(t, err)
+				require_Equal(t, meta.Sequence.Stream, uint64(8))
+			})
+		}
+	}
+}
+
 func TestJetStreamConsumerResetResponseReportsResetSeq(t *testing.T) {
 	test := func(t *testing.T, replicas int) {
 		c := createJetStreamClusterExplicit(t, "R3S", 3)
