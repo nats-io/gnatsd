@@ -3037,6 +3037,47 @@ func TestJetStreamRestoreLastMsgIDPastDedupeWindow(t *testing.T) {
 	require_Equal(t, pa.Sequence, 2)
 }
 
+func TestJetStreamRestoreV2RebuildsDedupeState(t *testing.T) {
+	for _, storage := range []nats.StorageType{nats.MemoryStorage, nats.FileStorage} {
+		t.Run(storage.String(), func(t *testing.T) {
+			s := RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+
+			nc, js := jsClientConnect(t, s)
+			defer nc.Close()
+
+			_, err := js.AddStream(&nats.StreamConfig{
+				Name:       "TEST",
+				Subjects:   []string{"foo"},
+				Storage:    storage,
+				Duplicates: 2 * time.Minute,
+			})
+			require_NoError(t, err)
+
+			pa, err := js.Publish("foo", nil, nats.MsgId("id1"))
+			require_NoError(t, err)
+			require_Equal(t, pa.Sequence, 1)
+
+			mset, err := s.GlobalAccount().lookupStream("TEST")
+			require_NoError(t, err)
+			sc, ss, snapshot := performStreamBackup(t, nc, "TEST")
+			require_NoError(t, mset.delete())
+			require_True(t, performStreamRestore(t, nc, sc, ss, snapshot))
+
+			pa, err = js.Publish("foo", nil, nats.MsgId("id1"))
+			require_NoError(t, err)
+			require_True(t, pa.Duplicate)
+			require_Equal(t, pa.Sequence, 1)
+
+			msg := nats.NewMsg("foo")
+			msg.Header.Set(JSExpectedLastMsgId, "id1")
+			pa, err = js.PublishMsg(msg)
+			require_NoError(t, err)
+			require_Equal(t, pa.Sequence, 2)
+		})
+	}
+}
+
 func TestJetStreamRedeliveryAfterServerRestart(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()

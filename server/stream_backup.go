@@ -402,6 +402,19 @@ func (a *Account) RestoreStreamV2(ncfg *StreamConfig, r io.Reader) (retMset *str
 		mset.store.FastState(&state)
 		mset.mu.Lock()
 		mset.lseq = state.LastSeq
+		// The stream was created before its messages were restored, so the
+		// dedupe state built at creation time is empty and must be rebuilt.
+		mset.ddMu.Lock()
+		if mset.ddtmr != nil {
+			mset.ddtmr.Stop()
+			mset.ddtmr = nil
+		}
+		mset.ddmap = nil
+		mset.ddarr = nil
+		mset.ddindex = 0
+		mset.lmsgId = _EMPTY_
+		mset.rebuildDedupe()
+		mset.ddMu.Unlock()
 		mset.mu.Unlock()
 		if err := mset.completeRestore(); err != nil {
 			if err = fmt.Errorf("failed to activate stream %q: %w", cfg.Name, err); retErr == nil {
