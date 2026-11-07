@@ -9591,6 +9591,48 @@ func Benchmark_FileStoreSyncDeletedPartialBlocks(b *testing.B) {
 	}
 }
 
+// Measures loading a full block from disk back into the cache, which happens
+// whenever a message is read or removed from a block whose cache was released.
+func Benchmark_FileStoreLoadBlockWithHeaders(b *testing.B) {
+	msgID := genHeader(nil, JSMsgId, "c2b5a1f0-6f0e-4c1b-9a4e-3b2f1d0e9c8a")
+	trace := genHeader(msgID, "traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+	trace = genHeader(trace, "tracestate", "rojo=00f067aa0ba902b7,congo=t61rcWkgMzE")
+	for _, bc := range []struct {
+		name string
+		hdr  []byte
+	}{
+		{"NoHeaders", nil},
+		{"MsgId", msgID},
+		{"MsgIdAndTrace", trace},
+		{"TTL", genHeader(nil, JSMessageTTL, "1h")},
+	} {
+		b.Run(bc.name, func(b *testing.B) {
+			fs, err := newFileStore(
+				FileStoreConfig{StoreDir: b.TempDir(), BlockSize: defaultMediumBlockSize},
+				StreamConfig{Name: "zzz", Storage: FileStorage, Subjects: []string{"foo"}})
+			require_NoError(b, err)
+			defer fs.Stop()
+
+			msg := make([]byte, 64)
+			for fs.numMsgBlocks() < 2 {
+				_, _, err = fs.StoreMsg("foo", bc.hdr, msg, 0)
+				require_NoError(b, err)
+			}
+			require_NoError(b, fs.FlushAllPending())
+
+			mb := fs.getFirstBlock()
+			mb.mu.Lock()
+			defer mb.mu.Unlock()
+			for b.Loop() {
+				mb.clearCacheAndOffset()
+				if err := mb.loadMsgsWithLock(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 // Based on TestNoRaceJetStreamConsumerFileStoreConcurrentDiskIO, a test that
 // was introduced together with the disk IO semaphore "dios".
 func BenchmarkFileStoreConsumerStoreConcurrentDiskIO(b *testing.B) {
@@ -15706,6 +15748,91 @@ func TestFileStoreRecoverTTLAndScheduleStateAndCounters(t *testing.T) {
 		require_Equal(t, ttls, 1)
 		require_Equal(t, schedules, 1)
 	})
+}
+
+func TestFileStoreHasTTLAndScheduleHeaders(t *testing.T) {
+	check := func(t *testing.T, hdr []byte) {
+		t.Helper()
+		hasTTL, hasSchedule := hasTTLAndScheduleHeaders(hdr)
+		require_Equal(t, hasTTL, len(sliceHeader(JSMessageTTL, hdr)) > 0)
+		require_Equal(t, hasSchedule, len(sliceHeader(JSSchedulePattern, hdr)) > 0)
+	}
+	for i, hdr := range []string{
+		"",
+		"NATS/1.0\r\n\r\n",
+		"NATS/1.0\r\nNats-Msg-Id: abc\r\n\r\n",
+		"NATS/1.0\r\nNats-TTL: 5s\r\n\r\n",
+		"NATS/1.0\r\nNats-TTL:5s\r\n\r\n",
+		"NATS/1.0\r\nNats-TTL:   \r\n\r\n",
+		"NATS/1.0\r\nNats-TTL:\r\nNats-TTL: 5s\r\n\r\n",
+		"NATS/1.0\r\nNats-Schedule: @every 1s\r\n\r\n",
+		"NATS/1.0\r\nNats-Schedule-TTL: 5s\r\nNats-Schedule-Target: foo\r\n\r\n",
+		"NATS/1.0\r\nNats-Msg-Id: Nats-TTL: 5s\r\n\r\n",
+		"NATS/1.0\r\nnats-ttl: 5s\r\n\r\n",
+		"NATS/1.0\r\nX-Nats-TTL: 5s\r\n\r\n",
+		"NATS/1.0\r\nNats-Schedule: @every 1s\r\nNats-Msg-Id: abc\r\nNats-TTL: 5s\r\n\r\n",
+		"NATS/1.0\r\nNats-TTL: 5s",
+		"NATS/1.0\r\nNats-TTL: \r",
+		"NATS/1.0\r\nNats-TTL:",
+		"NATS/1.0\r\nNats-TTL",
+		"NATS/1.0\r\nNats-",
+		"NATS/1.0\r\nNats-TTLNats-TTL\r\nNats-TTL: 5s\r\n\r\n",
+		"NATS/1.0\r\nNats-TTLxNats-TTL\r\nNats-TTL: 5s\r\n\r\n",
+		"NATS/1.0\r\nNats-ScheduleNats-Schedule\r\nNats-Schedule: @every 1s\r\n\r\n",
+	} {
+		t.Run(strconv.Itoa(i), func(t *testing.T) { check(t, []byte(hdr)) })
+	}
+
+	// Random headers built from the pieces that matter for matching.
+	parts := []string{"\r\n", "\r", "\n", "N", "Nats-", "TTL", "Schedule", "Nats-TTL", "Nats-Schedule", "-Target", ":", " ", "5s", "x"}
+	r := rand.New(rand.NewPCG(1, 2))
+	var hdr []byte
+	for range 20_000 {
+		hdr = append(hdr[:0], "NATS/1.0"...)
+		for range r.IntN(16) {
+			hdr = append(hdr, parts[r.IntN(len(parts))]...)
+		}
+		check(t, hdr)
+	}
+}
+
+func TestFileStoreIndexCacheBufCountsTTLAndScheduleHeaders(t *testing.T) {
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: t.TempDir()},
+		StreamConfig{Name: "zzz", Storage: FileStorage, Subjects: []string{"foo"}})
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	ttl := genHeader(nil, JSMessageTTL, "5s")
+	schedule := genHeader(nil, JSSchedulePattern, "@every 1s")
+	both := genHeader(genHeader(genHeader(nil, JSMsgId, "a"), JSSchedulePattern, "@every 1s"), JSMessageTTL, "5s")
+	msgID := genHeader(nil, JSMsgId, "b")
+	for _, hdr := range [][]byte{nil, ttl, schedule, both, msgID, ttl} {
+		_, _, err = fs.StoreMsg("foo", hdr, []byte("hello"), 0)
+		require_NoError(t, err)
+	}
+	require_NoError(t, fs.FlushAllPending())
+
+	mb := fs.getFirstBlock()
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	mb.clearCacheAndOffset()
+	require_NoError(t, mb.loadMsgsWithLock())
+	require_Equal(t, mb.ttls, 3)
+	require_Equal(t, mb.schedules, 2)
+
+	// A record whose header length runs past its end is no longer counted.
+	buf, err := os.ReadFile(mb.mfn)
+	require_NoError(t, err)
+	le := binary.LittleEndian
+	second := le.Uint32(buf) &^ hbit
+	slen := uint32(le.Uint16(buf[second+20:]))
+	le.PutUint32(buf[second+msgHdrSize+slen:], math.MaxUint32)
+	require_NoError(t, os.WriteFile(mb.mfn, buf, defaultFilePerms))
+	mb.clearCacheAndOffset()
+	require_NoError(t, mb.loadMsgsWithLock())
+	require_Equal(t, mb.ttls, 2)
+	require_Equal(t, mb.schedules, 2)
 }
 
 func TestFileStoreCorruptionSetsHbitWithoutHeaders(t *testing.T) {

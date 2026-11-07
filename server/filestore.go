@@ -8641,6 +8641,40 @@ func (fs *fileStore) selectMsgBlockForStart(minTime time.Time) *msgBlock {
 	return nil
 }
 
+// Every Nats-* header key starts with this.
+var natsHeaderKeyPrefix = []byte("Nats-")
+
+// hasTTLAndScheduleHeaders reports the same as len(sliceHeader(JSMessageTTL, hdr)) > 0
+// and len(sliceHeader(JSSchedulePattern, hdr)) > 0. Indexing a block does this for every
+// message with headers, and most have neither key, so a single pass over hdr looks for
+// lines that could hold them before sliceHeader is asked for the actual answer.
+func hasTTLAndScheduleHeaders(hdr []byte) (hasTTL, hasSchedule bool) {
+	var maybeTTL, maybeSchedule bool
+	for i := 0; !maybeTTL || !maybeSchedule; {
+		// Search for the key rather than the CRLF before it, since every
+		// header line ends with a CRLF.
+		n := bytes.Index(hdr[i:], natsHeaderKeyPrefix)
+		if n < 0 {
+			break
+		}
+		k := i + n
+		i = k + len(natsHeaderKeyPrefix)
+		if k < 2 || hdr[k-2] != '\r' || hdr[k-1] != '\n' {
+			continue
+		}
+		maybeTTL = maybeTTL || isHeaderKey(hdr[k:], JSMessageTTL)
+		maybeSchedule = maybeSchedule || isHeaderKey(hdr[k:], JSSchedulePattern)
+	}
+	hasTTL = maybeTTL && len(sliceHeader(JSMessageTTL, hdr)) > 0
+	hasSchedule = maybeSchedule && len(sliceHeader(JSSchedulePattern, hdr)) > 0
+	return hasTTL, hasSchedule
+}
+
+// isHeaderKey reports whether b starts with key followed by a colon.
+func isHeaderKey(b []byte, key string) bool {
+	return len(b) > len(key) && b[len(key)] == ':' && string(b[:len(key)]) == key
+}
+
 // Index a raw msg buffer.
 // Lock should be held.
 func (mb *msgBlock) indexCacheBuf(buf []byte) error {
@@ -8699,7 +8733,6 @@ func (mb *msgBlock) indexCacheBuf(buf []byte) error {
 
 	lbuf := uint32(len(buf))
 	var seq, ttls, schedules uint64
-	var sm StoreMsg // Used for finding headers
 
 	// To ensure the sequence keeps moving up. As well as confirming our index
 	// is aligned with the mb's first and last sequence.
@@ -8796,13 +8829,17 @@ func (mb *msgBlock) indexCacheBuf(buf []byte) error {
 			}
 
 			// Count how many TTLs/schedules we think are in this message block.
-			// TODO(nat): Not terribly optimal...
+			// The headers follow the subject and their 4 byte length. The sanity checks
+			// above keep that length field inside the record, the length is checked here.
 			if hasHeaders {
-				if fsm, err := mb.msgFromBufNoCopy(buf[index:], &sm, nil); err == nil && fsm != nil {
-					if ttl := sliceHeader(JSMessageTTL, fsm.hdr); len(ttl) > 0 {
+				data := buf[index+msgHdrSize : index+rl-recordHashSize]
+				hdrs := data[slen+4:]
+				if hl := le.Uint32(data[slen:]); uint64(hl) <= uint64(len(hdrs)) {
+					hasTTL, hasSchedule := hasTTLAndScheduleHeaders(hdrs[:hl])
+					if hasTTL {
 						ttls++
 					}
-					if sched := sliceHeader(JSSchedulePattern, fsm.hdr); len(sched) > 0 {
+					if hasSchedule {
 						schedules++
 					}
 				}
