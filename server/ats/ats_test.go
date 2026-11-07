@@ -57,7 +57,6 @@ func TestRegisterAndUnregister(t *testing.T) {
 	if r := refs.Load(); r != 0 {
 		t.Fatalf("Expected refs to be 0, got %d", r)
 	}
-	time.Sleep(TickInterval)
 
 	at = AccessTime()
 	time.Sleep(2 * TickInterval)

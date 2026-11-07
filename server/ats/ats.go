@@ -17,6 +17,7 @@
 package ats
 
 import (
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -29,23 +30,28 @@ var (
 	utime atomic.Int64
 	// How may registered users do we have, controls lifetime of Go routine.
 	refs atomic.Int64
+	// Serializes worker startup and shutdown so a new worker cannot consume a
+	// previous worker's stop signal.
+	lifecycleMu sync.Mutex
 	// To signal the shutdown of the Go routine.
-	done chan struct{}
+	done     chan struct{}
+	workerWG sync.WaitGroup
 )
-
-func init() {
-	// Initialize our done chan.
-	done = make(chan struct{}, 1)
-}
 
 // Register usage. This will happen on filestore creation.
 func Register() {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+
 	if v := refs.Add(1); v == 1 {
 		// This is the first to register (could also go up and down),
 		// so spin up Go routine and grab initial time.
 		utime.Store(time.Now().UnixNano())
+		done = make(chan struct{})
+		workerWG.Add(1)
 
-		go func() {
+		go func(done <-chan struct{}) {
+			defer workerWG.Done()
 			ticker := time.NewTicker(TickInterval)
 			defer ticker.Stop()
 			for {
@@ -56,14 +62,19 @@ func Register() {
 					return
 				}
 			}
-		}()
+		}(done)
 	}
 }
 
 // Unregister usage. We will shutdown the go routine if no more registered users.
 func Unregister() {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+
 	if v := refs.Add(-1); v == 0 {
-		done <- struct{}{}
+		close(done)
+		workerWG.Wait()
+		done = nil
 	} else if v < 0 {
 		refs.Store(0)
 		panic("unbalanced unregister for access time state")
